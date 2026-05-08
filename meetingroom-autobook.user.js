@@ -696,8 +696,8 @@
       #mr-panel .item .left{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       #mr-panel .item .x{color:#ff3b30;cursor:pointer;padding:2px 8px;font-size:16px;line-height:1;border-radius:6px;font-weight:300}
       #mr-panel .item .x:hover{background:rgba(255,59,48,0.1)}
-      /* 房间网格 5 列 */
-      #mr-panel .rooms-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:5px;margin-bottom:8px}
+      /* 房间网格 4 列 */
+      #mr-panel .rooms-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:5px;margin-bottom:8px}
       #mr-panel .room-cell{display:flex;justify-content:space-between;align-items:center;padding:6px 7px;
         border:0.5px solid rgba(0,0,0,0.08);border-radius:8px;background:rgba(255,255,255,0.7);
         font-size:11px;overflow:hidden;transition:all .15s;font-weight:500}
