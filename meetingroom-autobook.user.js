@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         会议室自动抢订
 // @namespace    meetingroom-autobook
-// @version      0.6.0
+// @version      0.7.0
 // @description  在系统开放预订时刻自动抢订会议室。带并发限制的工作队列 / 提前连续重试 / 精确对时 / GUI 配置 / 固定高度浮窗。
 // @author       Lucas
 // @match        https://inner.welink.huawei.com/meetingroom/*
@@ -313,15 +313,16 @@
       return { type: 'RATE_LIMIT', tip: `⏱ 请求频率限制 · 自动重试中`, retry: true, retryDelayMs: 200 };
     }
     // 超过提前预订天数 - 当 daysAhead<=7 时,这是"尚未滚动到第7天",必须持续重试
+    // 注意: 80ms 太快会触发服务器限流 (10 任务 × 38 req/s = 限流爆炸), 用 150ms 平衡
     if (m.includes('exceed_booking_advance') || m.includes('exceed_advance')) {
       if (CONFIG.timing.daysAhead <= 7) {
-        return { type: 'NOT_OPEN', tip: `⏳ 尚未开放 (advance limit) · 持续尝试`, retry: true, retryDelayMs: 80 };
+        return { type: 'NOT_OPEN', tip: `⏳ 尚未开放 (advance limit) · 持续尝试`, retry: true, retryDelayMs: 150 };
       }
       return { type: 'OUT_OF_RANGE', tip: `📅 超出可预订范围 · 提前天数 ${CONFIG.timing.daysAhead} > 7`, retry: false };
     }
     // 尚未到开放时刻 - 持续重试直到放开
     if (m.includes('尚未') || m.includes('未开放') || m.includes('未到') || m.includes('not_open') || m.includes('not open')) {
-      return { type: 'NOT_OPEN', tip: `⏳ 尚未开放预订 · 持续尝试中`, retry: true, retryDelayMs: 80 };
+      return { type: 'NOT_OPEN', tip: `⏳ 尚未开放预订 · 持续尝试中`, retry: true, retryDelayMs: 150 };
     }
     // 时间冲突 (与他人预订冲突 OR 与自己已有预订重叠)
     if (m.includes('冲突') || m.includes('占用') || m.includes('被预订') || m.includes('已订') || m.includes('overlap') || m.includes('已有预订') || m.includes('span_in_use') || m.includes('in_use')) {
@@ -443,6 +444,7 @@
         attempts: 0,
         result: null,
         nextEarliestAt: 0,  // 下一次可尝试的最早时刻 (用于错误退避)
+        consecutiveRateLimit: 0,  // 连续被限流次数, 用于指数退避
       };
     });
 
@@ -491,12 +493,21 @@
         if (result.success) {
           state.status = 'success';
           state.result = result;
+          state.consecutiveRateLimit = 0;
           log(`✅ ${state.label} 第 ${state.attempts} 次成功 (${result.elapsed}ms)`, 'success');
           if (result.orderId) log(`   订单号: ${result.orderId}`, 'debug');
         } else if (result.retriable && Date.now() < deadline && state.attempts < maxAttempts) {
           // 排回队列, 设置最早重试时刻
           state.status = 'pending';
-          state.nextEarliestAt = Date.now() + (result.retryDelayMs || 200);
+          // 指数退避: 连续被限流时退避时间翻倍 (200→350→500→700→800ms 上限)
+          if (result.type === 'RATE_LIMIT') {
+            state.consecutiveRateLimit++;
+            const backoff = Math.min(200 + 150 * (state.consecutiveRateLimit - 1), 800);
+            state.nextEarliestAt = Date.now() + backoff;
+          } else {
+            state.consecutiveRateLimit = 0;
+            state.nextEarliestAt = Date.now() + (result.retryDelayMs || 200);
+          }
           // 重要错误首 3 次都显示, 之后每 5 次显示一次, 避免刷屏
           if (state.attempts <= 3 || state.attempts % 5 === 0) {
             log(`⏳ ${state.label} 第 ${state.attempts} 次: ${result.tip}`, 'warn');
@@ -618,98 +629,128 @@
   function buildUI() {
     const style = document.createElement('style');
     style.textContent = `
-      #mr-panel{position:fixed;bottom:20px;right:20px;width:400px;background:#fff;
-        border:1px solid #e0e0e0;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,0.12);
-        font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:12px;
-        z-index:99999;color:#333;line-height:1.5}
+      /* ── Apple Human Interface 风格 ── */
+      #mr-panel{position:fixed;bottom:20px;right:20px;width:420px;
+        background:rgba(255,255,255,0.92);
+        backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px);
+        border:0.5px solid rgba(0,0,0,0.08);border-radius:14px;
+        box-shadow:0 10px 40px rgba(0,0,0,0.12),0 1px 3px rgba(0,0,0,0.04);
+        font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Helvetica Neue","Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+        font-size:12px;z-index:99999;color:#1d1d1f;line-height:1.5;letter-spacing:-0.01em}
       #mr-panel *{box-sizing:border-box}
       #mr-panel .h{display:flex;justify-content:space-between;align-items:center;
-        padding:10px 14px;border-bottom:1px solid #f0f0f0;cursor:move;user-select:none;background:#fafafa;border-radius:8px 8px 0 0}
-      #mr-panel .tt{font-weight:500;font-size:13px}
-      #mr-panel .tg{cursor:pointer;color:#999;font-size:18px;line-height:1;padding:0 4px}
-      #mr-panel .tg:hover{color:#333}
-      #mr-panel .body{padding:10px 14px}
+        padding:11px 16px;border-bottom:0.5px solid rgba(0,0,0,0.08);cursor:move;user-select:none;
+        background:transparent;border-radius:14px 14px 0 0}
+      #mr-panel .tt{font-weight:600;font-size:13px;letter-spacing:-0.02em;color:#1d1d1f}
+      #mr-panel .tg{cursor:pointer;color:#86868b;font-size:18px;line-height:1;padding:0 4px;font-weight:300}
+      #mr-panel .tg:hover{color:#1d1d1f}
+      #mr-panel .body{padding:12px 16px}
       #mr-panel .body.col{display:none}
-      #mr-panel .st{padding:6px 10px;background:#f5f5f5;border-radius:4px;font-size:11px;margin-bottom:8px;text-align:center}
-      #mr-panel .st.armed{background:#e8f5e9;color:#2e7d32}
-      #mr-panel .st.firing{background:#fff3e0;color:#e65100}
-      #mr-panel .st.warn{background:#fff8e1;color:#f57f17}
-      #mr-panel .st.idle{background:#e8f5e9;color:#2e7d32}
-      #mr-panel .st.error{background:#ffebee;color:#c62828}
-      #mr-panel .st.done{background:#e8f5e9;color:#2e7d32}
-      #mr-panel .st.partial{background:#fff3e0;color:#e65100}
-      #mr-panel .cd{font-family:Consolas,monospace;font-size:26px;text-align:center;
-        margin:8px 0 2px;font-weight:500;letter-spacing:1px}
-      #mr-panel .sync{font-size:10px;color:#999;text-align:center;margin-bottom:8px}
-      #mr-panel .sync.precise{color:#2e7d32}
-      #mr-panel .sync.coarse{color:#e65100}
-      #mr-panel .sync.none{color:#c62828}
-      #mr-panel .info{font-size:11px;color:#666;text-align:center;margin-bottom:8px;line-height:1.7}
-      #mr-panel .btns{display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-bottom:6px}
-      #mr-panel .btns2{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:8px}
+      #mr-panel .st{padding:8px 12px;background:rgba(142,142,147,0.12);border-radius:9px;font-size:12px;
+        margin-bottom:10px;text-align:center;font-weight:500}
+      #mr-panel .st.armed{background:rgba(48,209,88,0.15);color:#248a3d}
+      #mr-panel .st.firing{background:rgba(255,159,10,0.15);color:#c93400}
+      #mr-panel .st.warn{background:rgba(255,204,0,0.18);color:#9a7400}
+      #mr-panel .st.idle{background:rgba(48,209,88,0.15);color:#248a3d}
+      #mr-panel .st.error{background:rgba(255,59,48,0.15);color:#d70015}
+      #mr-panel .st.done{background:rgba(48,209,88,0.18);color:#248a3d}
+      #mr-panel .st.partial{background:rgba(255,159,10,0.15);color:#c93400}
+      #mr-panel .cd{font-family:"SF Mono","Menlo","Consolas",monospace;font-size:30px;text-align:center;
+        margin:6px 0 4px;font-weight:300;letter-spacing:-0.02em;color:#1d1d1f;font-variant-numeric:tabular-nums}
+      #mr-panel .sync{font-size:11px;color:#86868b;text-align:center;margin-bottom:10px}
+      #mr-panel .sync.precise{color:#248a3d}
+      #mr-panel .sync.coarse{color:#c93400}
+      #mr-panel .sync.none{color:#d70015}
+      #mr-panel .info{font-size:12px;color:#3a3a3c;text-align:center;margin-bottom:10px;line-height:1.7}
+      #mr-panel .btns{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:6px}
+      #mr-panel .btns2{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px}
+      /* 表单控件 */
       #mr-panel button,#mr-panel input[type=text],#mr-panel input[type=number],
-      #mr-panel input[type=time],#mr-panel select{padding:5px 8px;font-size:11px;border:1px solid #d0d0d0;
-        background:#fff;border-radius:4px;font-family:inherit;color:#333}
-      #mr-panel button{cursor:pointer;transition:all .15s}
-      #mr-panel button:hover{background:#f5f5f5;border-color:#999}
-      #mr-panel button.pri{background:#1976d2;color:#fff;border-color:#1976d2}
-      #mr-panel button.pri:hover{background:#1565c0}
-      #mr-panel button.sec{color:#888}
-      #mr-panel .tabs{display:flex;border-bottom:1px solid #e0e0e0;margin:0 -14px 8px}
-      #mr-panel .tab{flex:1;padding:6px 4px;text-align:center;cursor:pointer;font-size:11px;
-        border-bottom:2px solid transparent;color:#666;transition:all .15s}
-      #mr-panel .tab.active{color:#1976d2;border-bottom-color:#1976d2;background:#f5f9ff}
-      #mr-panel .tab:hover:not(.active){background:#fafafa}
-      #mr-panel .pane{display:none;height:320px;overflow-y:auto;padding-right:2px}
+      #mr-panel input[type=time],#mr-panel select{padding:7px 10px;font-size:12px;
+        border:0.5px solid rgba(0,0,0,0.12);background:rgba(255,255,255,0.85);border-radius:8px;
+        font-family:inherit;color:#1d1d1f;outline:none;transition:all .15s}
+      #mr-panel input:focus{border-color:#0071e3;box-shadow:0 0 0 3px rgba(0,113,227,0.15)}
+      #mr-panel button{cursor:pointer;font-weight:500}
+      #mr-panel button:hover{background:rgba(0,0,0,0.04);border-color:rgba(0,0,0,0.18)}
+      #mr-panel button.pri{background:#0071e3;color:#fff;border-color:#0071e3;font-weight:500}
+      #mr-panel button.pri:hover{background:#0077ed;border-color:#0077ed}
+      #mr-panel button.sec{color:#86868b}
+      #mr-panel .tabs{display:flex;border-bottom:0.5px solid rgba(0,0,0,0.08);margin:0 -16px 10px;padding:0 4px}
+      #mr-panel .tab{flex:1;padding:8px 4px;text-align:center;cursor:pointer;font-size:12px;font-weight:500;
+        border-bottom:2px solid transparent;color:#86868b;transition:all .15s}
+      #mr-panel .tab.active{color:#0071e3;border-bottom-color:#0071e3}
+      #mr-panel .tab:hover:not(.active){color:#3a3a3c}
+      #mr-panel .pane{display:none;height:340px;overflow-y:auto;padding-right:2px}
       #mr-panel .pane.active{display:block}
       #mr-panel .pane#pane-log.active{display:flex;flex-direction:column}
+      /* 任务条 */
       #mr-panel .task-header{display:flex;justify-content:space-between;align-items:center;
-        padding:4px 8px;margin-bottom:6px;font-size:11px;background:#f5f5f5;border-radius:4px}
-      #mr-panel .task-clear-btn{cursor:pointer;color:#c62828;padding:2px 6px;border-radius:3px;font-size:11px}
-      #mr-panel .task-clear-btn:hover{background:#ffebee}
-      #mr-panel .empty{text-align:center;color:#999;padding:20px 8px;font-size:11px}
-      #mr-panel .item{display:flex;justify-content:space-between;align-items:center;padding:6px 8px;
-        border:1px solid #eee;border-radius:4px;margin-bottom:4px;background:#fafafa;font-size:11px}
+        padding:6px 10px;margin-bottom:8px;font-size:12px;background:rgba(142,142,147,0.08);border-radius:8px}
+      #mr-panel .task-clear-btn{cursor:pointer;color:#ff3b30;padding:3px 8px;border-radius:6px;font-size:11px;font-weight:500}
+      #mr-panel .task-clear-btn:hover{background:rgba(255,59,48,0.1)}
+      #mr-panel .empty{text-align:center;color:#86868b;padding:24px 8px;font-size:12px}
+      #mr-panel .item{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;
+        border:0.5px solid rgba(0,0,0,0.06);border-radius:8px;margin-bottom:5px;
+        background:rgba(255,255,255,0.6);font-size:12px;transition:all .15s}
+      #mr-panel .item:hover{background:rgba(255,255,255,0.9);border-color:rgba(0,0,0,0.12)}
       #mr-panel .item .left{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-      #mr-panel .item .x{color:#c62828;cursor:pointer;padding:0 6px;font-size:14px;line-height:1}
-      #mr-panel .item .x:hover{background:#ffebee;border-radius:3px}
-      #mr-panel .rooms-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-bottom:6px}
-      #mr-panel .room-cell{display:flex;justify-content:space-between;align-items:center;padding:5px 6px;
-        border:1px solid #eee;border-radius:4px;background:#fafafa;font-size:11px;overflow:hidden}
+      #mr-panel .item .x{color:#ff3b30;cursor:pointer;padding:2px 8px;font-size:16px;line-height:1;border-radius:6px;font-weight:300}
+      #mr-panel .item .x:hover{background:rgba(255,59,48,0.1)}
+      /* 房间网格 5 列 */
+      #mr-panel .rooms-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:5px;margin-bottom:8px}
+      #mr-panel .room-cell{display:flex;justify-content:space-between;align-items:center;padding:6px 7px;
+        border:0.5px solid rgba(0,0,0,0.08);border-radius:8px;background:rgba(255,255,255,0.7);
+        font-size:11px;overflow:hidden;transition:all .15s;font-weight:500}
+      #mr-panel .room-cell:hover{background:rgba(255,255,255,0.95);border-color:rgba(0,0,0,0.16)}
       #mr-panel .room-cell .rn{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-      #mr-panel .room-cell .x{color:#c62828;cursor:pointer;padding:0 4px;font-size:13px;line-height:1;flex-shrink:0}
-      #mr-panel .room-cell .x:hover{background:#ffebee;border-radius:3px}
-      #mr-panel .add-btn{width:100%;padding:6px;border:1px dashed #ccc;background:#fff;border-radius:4px;
-        cursor:pointer;color:#666;font-size:11px;margin-bottom:6px}
-      #mr-panel .add-btn:hover{background:#f5f5f5;border-color:#999}
-      #mr-panel .form{background:#f9f9f9;border:1px solid #e0e0e0;padding:8px;border-radius:4px;margin-bottom:6px}
-      #mr-panel .form-row{display:flex;align-items:center;gap:6px;margin-bottom:6px}
-      #mr-panel .form-row label{font-size:11px;color:#666;min-width:50px;flex-shrink:0}
+      #mr-panel .room-cell .x{color:#ff3b30;cursor:pointer;padding:0 4px;font-size:13px;line-height:1;flex-shrink:0;font-weight:300}
+      #mr-panel .room-cell .x:hover{background:rgba(255,59,48,0.1);border-radius:4px}
+      #mr-panel .add-btn{width:100%;padding:9px;border:1px dashed rgba(0,0,0,0.18);
+        background:rgba(255,255,255,0.5);border-radius:9px;
+        cursor:pointer;color:#86868b;font-size:12px;margin-bottom:6px;font-weight:500;transition:all .15s}
+      #mr-panel .add-btn:hover{background:rgba(255,255,255,0.85);border-color:rgba(0,113,227,0.4);color:#0071e3}
+      #mr-panel .form{background:rgba(142,142,147,0.06);border:0.5px solid rgba(0,0,0,0.06);
+        padding:12px;border-radius:10px;margin-bottom:8px}
+      #mr-panel .form-row{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+      #mr-panel .form-row label{font-size:12px;color:#3a3a3c;min-width:54px;flex-shrink:0;font-weight:500}
       #mr-panel .form-row input,#mr-panel .form-row select{flex:1}
-      #mr-panel .preset-row{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px}
-      #mr-panel .preset-btn{padding:4px 8px;font-size:11px;background:#fff;border:1px solid #d0d0d0;
-        border-radius:4px;cursor:pointer}
-      #mr-panel .preset-btn:hover{background:#f5f5f5}
-      #mr-panel .preset-btn.on{background:#1976d2;color:#fff;border-color:#1976d2}
-      #mr-panel .form-buttons{display:flex;gap:6px;margin-top:6px}
-      #mr-panel .form-buttons button{flex:1;padding:5px;font-size:11px}
-      #mr-panel .form-buttons button.save{background:#1976d2;color:#fff;border-color:#1976d2}
-      #mr-panel .checkbox-list{max-height:120px;overflow-y:auto;border:1px solid #e0e0e0;border-radius:4px;background:#fff;padding:4px}
-      #mr-panel .checkbox-list label{display:flex;align-items:center;padding:3px 6px;cursor:pointer;font-size:11px}
-      #mr-panel .checkbox-list label:hover{background:#f5f5f5}
-      #mr-panel .checkbox-list input{margin-right:6px}
-      #mr-panel .ll{font-size:11px;color:#999;margin-bottom:4px;display:flex;justify-content:space-between;flex-shrink:0}
-      #mr-panel .clr{cursor:pointer}
-      #mr-panel .clr:hover{color:#333}
-      #mr-panel .log{background:#fafafa;border:1px solid #eee;border-radius:4px;padding:6px 8px;
-        flex:1;min-height:0;overflow-y:auto;font-family:Consolas,monospace;font-size:11px;line-height:1.5}
-      #mr-panel .log .l-info{color:#555}
-      #mr-panel .log .l-debug{color:#888}
-      #mr-panel .log .l-success{color:#2e7d32;font-weight:500}
-      #mr-panel .log .l-warn{color:#e65100}
-      #mr-panel .log .l-error{color:#c62828;font-weight:500}
-      #mr-panel .help{font-size:10px;color:#999;line-height:1.6;padding:6px 0}
-      #mr-panel .warn-text{color:#e65100;font-size:10px;margin-top:4px}
+      #mr-panel .preset-row{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:8px}
+      #mr-panel .preset-btn{padding:5px 10px;font-size:11px;background:rgba(255,255,255,0.85);
+        border:0.5px solid rgba(0,0,0,0.1);border-radius:7px;cursor:pointer;font-weight:500}
+      #mr-panel .preset-btn:hover{background:#fff}
+      #mr-panel .preset-btn.on{background:#0071e3;color:#fff;border-color:#0071e3}
+      #mr-panel .form-buttons{display:flex;gap:6px;margin-top:8px}
+      #mr-panel .form-buttons button{flex:1;padding:7px;font-size:12px}
+      #mr-panel .form-buttons button.save{background:#0071e3;color:#fff;border-color:#0071e3;font-weight:500}
+      #mr-panel .form-buttons button.save:hover{background:#0077ed}
+      /* 房间多选 5 列网格 */
+      #mr-panel .checkbox-list{display:grid;grid-template-columns:repeat(5,1fr);gap:4px;
+        max-height:120px;overflow-y:auto;border:0.5px solid rgba(0,0,0,0.08);
+        border-radius:8px;background:rgba(255,255,255,0.7);padding:6px}
+      #mr-panel .checkbox-list label{display:flex;align-items:center;padding:4px 6px;cursor:pointer;
+        font-size:11px;border-radius:6px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      #mr-panel .checkbox-list label:hover{background:rgba(0,113,227,0.08)}
+      #mr-panel .checkbox-list input{margin-right:5px;flex-shrink:0;accent-color:#0071e3}
+      /* 日志 */
+      #mr-panel .ll{font-size:11px;color:#86868b;margin-bottom:6px;display:flex;
+        justify-content:space-between;flex-shrink:0;font-weight:500}
+      #mr-panel .clr{cursor:pointer;color:#0071e3}
+      #mr-panel .clr:hover{text-decoration:underline}
+      #mr-panel .log{background:rgba(0,0,0,0.03);border:0.5px solid rgba(0,0,0,0.06);
+        border-radius:8px;padding:8px 10px;flex:1;min-height:0;overflow-y:auto;
+        font-family:"SF Mono","Menlo","Consolas",monospace;font-size:11px;line-height:1.55}
+      #mr-panel .log .l-info{color:#3a3a3c}
+      #mr-panel .log .l-debug{color:#86868b}
+      #mr-panel .log .l-success{color:#248a3d;font-weight:500}
+      #mr-panel .log .l-warn{color:#c93400}
+      #mr-panel .log .l-error{color:#d70015;font-weight:500}
+      #mr-panel .help{font-size:11px;color:#86868b;line-height:1.6;padding:8px 0}
+      #mr-panel .warn-text{color:#c93400;font-size:11px;margin-top:6px;font-weight:500}
+      /* 滚动条美化 (Apple 风格) */
+      #mr-panel ::-webkit-scrollbar{width:6px;height:6px}
+      #mr-panel ::-webkit-scrollbar-track{background:transparent}
+      #mr-panel ::-webkit-scrollbar-thumb{background:rgba(0,0,0,0.18);border-radius:3px}
+      #mr-panel ::-webkit-scrollbar-thumb:hover{background:rgba(0,0,0,0.3)}
     `;
     document.head.appendChild(style);
 
@@ -717,7 +758,7 @@
     panel.id = 'mr-panel';
     panel.innerHTML = `
       <div class="h">
-        <span class="tt">📅 会议室自动抢订 v0.6</span>
+        <span class="tt">📅 会议室自动抢订 v0.7</span>
         <span class="tg" id="tg">−</span>
       </div>
       <div class="body" id="body">
@@ -1070,7 +1111,8 @@
       </div>
       <div class="form-row">
         <label>提前天数</label>
-        <input type="number" id="set-days" value="${CONFIG.timing.daysAhead}" min="0" max="30">
+        <input type="number" id="set-days" value="${CONFIG.timing.daysAhead}" min="0" max="7">
+        <span style="font-size:11px;color:#666">系统上限 7</span>
       </div>
       <div class="form-row">
         <label>提前ms</label>
@@ -1085,7 +1127,7 @@
       <div class="form-row">
         <label>并发</label>
         <input type="number" id="set-conc" value="${CONFIG.advanced.concurrency}" min="1" max="10" step="1">
-        <span style="font-size:11px;color:#666">≤4 (避免限流)</span>
+        <span style="font-size:11px;color:#666">建议 3-4</span>
       </div>
       <div class="form-buttons" style="margin-top:8px">
         <button id="set-save" class="save">保存设置</button>
@@ -1108,6 +1150,7 @@
       const warn = document.getElementById('set-warn');
       if (!subject) { warn.style.display = 'block'; warn.textContent = '⚠️ 主题不能为空'; return; }
       if (!open.match(/^\d{2}:\d{2}:\d{2}$/)) { warn.style.display = 'block'; warn.textContent = '⚠️ 开抢时刻格式应为 HH:MM:SS'; return; }
+      if (isNaN(days) || days < 0 || days > 7) { warn.style.display = 'block'; warn.textContent = '⚠️ 提前天数必须在 0~7 之间 (系统硬上限)'; return; }
       if (isNaN(pretrig) || pretrig < 0 || pretrig > 60000) { warn.style.display = 'block'; warn.textContent = '⚠️ 提前ms应在 0~60000 之间'; return; }
       if (isNaN(maxdur) || maxdur < 10) { warn.style.display = 'block'; warn.textContent = '⚠️ 持续时长太短'; return; }
       if (isNaN(conc) || conc < 1 || conc > 10) { warn.style.display = 'block'; warn.textContent = '⚠️ 并发数应在 1~10 之间'; return; }
@@ -1313,7 +1356,7 @@
       return;
     }
     buildUI();
-    log('✅ 会议室自动抢订 v0.6.0 已加载');
+    log('✅ 会议室自动抢订 v0.7.0 已加载');
     log(`📋 已配置 ${CONFIG.bookings.length} 个任务 / ${CONFIG.rooms.length} 个房间`);
 
     setTimeout(() => {
