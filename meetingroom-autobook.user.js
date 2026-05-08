@@ -1,13 +1,12 @@
 // ==UserScript==
 // @name         会议室自动抢订
 // @namespace    meetingroom-autobook
-// @version      0.4.0
-// @description  在系统开放预订时刻自动抢订会议室。带并发限制的工作队列 / 提前连续重试 / 精确对时 / GUI 配置。
+// @version      0.5.0
+// @description  在系统开放预订时刻自动抢订会议室。带并发限制的工作队列 / 提前连续重试 / 精确对时 / GUI 配置 / 固定高度浮窗。
 // @author       Lucas
 // @match        https://inner.welink.huawei.com/meetingroom/*
 // @grant        none
 // @run-at       document-start
-// 把下面两行的 URL 替换成实际托管地址(以 .user.js 结尾),粘贴时去掉前面的 //
 // @updateURL    https://raw.githubusercontent.com/lucassu2012/meetingroom-autobook/main/meetingroom-autobook.user.js
 // @downloadURL  https://raw.githubusercontent.com/lucassu2012/meetingroom-autobook/main/meetingroom-autobook.user.js
 // ==/UserScript==
@@ -24,7 +23,7 @@
     timing: {
       bookingOpenTime: '08:30:00',
       daysAhead: 7,
-      preTriggerSeconds: 5,         // 提前 N 秒开始尝试 (8:30:00 减 5s = 8:29:55 开始)
+      preTriggerMs: 1000,           // 提前 N 毫秒开始尝试 (默认 1 秒)
       maxAttemptDurationSec: 90,    // 最长持续重试 90 秒
     },
     meeting: {
@@ -46,10 +45,10 @@
     ],
     bookings: [],
     advanced: {
-      concurrency: 4,               // 同时最多 N 个请求 (服务器约 4 并发上限,留 1 余量)
-      interReqDelayMs: 80,          // 同一 worker 两次请求间最小间隔
-      retryDelayMs: 200,            // 普通重试延迟
-      maxAttemptsPerTask: 30,       // 单任务最多尝试次数
+      concurrency: 3,               // 同时最多 N 个请求 (服务器约 4 并发上限,留 1 余量)
+      interReqDelayMs: 80,
+      retryDelayMs: 200,
+      maxAttemptsPerTask: 30,
     },
   };
 
@@ -72,6 +71,13 @@
         if (cfg.timing && 'triggerOffsetMs' in cfg.timing) delete cfg.timing.triggerOffsetMs;
         if (cfg.advanced && 'retryAttempts' in cfg.advanced) delete cfg.advanced.retryAttempts;
         if (cfg.advanced && 'retryIntervalMs' in cfg.advanced) delete cfg.advanced.retryIntervalMs;
+        // v0.4 → v0.5 迁移: preTriggerSeconds → preTriggerMs
+        if (cfg.timing && 'preTriggerSeconds' in cfg.timing) {
+          if (!('preTriggerMs' in cfg.timing) || cfg.timing.preTriggerMs === DEFAULTS.timing.preTriggerMs) {
+            cfg.timing.preTriggerMs = cfg.timing.preTriggerSeconds * 1000;
+          }
+          delete cfg.timing.preTriggerSeconds;
+        }
         return cfg;
       }
     } catch (e) { /* fall through */ }
@@ -260,8 +266,8 @@
     if (target.getTime() <= serverNow.getTime()) {
       target.setDate(target.getDate() + 1);
     }
-    // 提前 preTriggerSeconds 秒开始尝试 (正好踩 8:30 太晚, 早 5s 比较稳)
-    const preTriggerMs = (CONFIG.timing.preTriggerSeconds || 0) * 1000;
+    // 提前 preTriggerMs 毫秒开始尝试 (踩 8:30 整可能太晚, 提前 1s 比较稳)
+    const preTriggerMs = CONFIG.timing.preTriggerMs || 0;
     return target.getTime() - serverOffsetMs - preTriggerMs;
   }
 
@@ -294,40 +300,51 @@
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
   function categorizeError(httpStatus, data) {
-    // HTTP 状态码层
-    if (httpStatus === 401) return { type: 'AUTH', tip: '🔒 Token 已过期 · 请刷新页面重新登录', retry: false };
-    if (httpStatus === 403) return { type: 'PERMISSION', tip: '🚫 权限不足', retry: false };
-    if (httpStatus === 409) return { type: 'CONFLICT', tip: '🔴 时间段冲突 · 已被他人占用', retry: false };
-    if (httpStatus === 429) return { type: 'RATE_LIMIT', tip: '⏱ HTTP 429 · 请求过于频繁', retry: true, retryDelayMs: 300 };
-    if (httpStatus >= 500) return { type: 'SERVER_ERROR', tip: '🔥 服务器异常', retry: true, retryDelayMs: 500 };
-
-    // 业务错误 code 层(welink 用 code/message)
+    // 提取消息
     const code = data && data.code;
     const msgStr = ((data && (data.message || data.msg || data.error)) || '').toString();
     const detailMsg = (data && data.details && data.details[0] && data.details[0].message) || '';
-    const fullMsg = msgStr + ' ' + detailMsg;
+    const fullMsg = (msgStr + ' ' + detailMsg).trim();
     const m = fullMsg.toLowerCase();
 
-    // welink 实测:code=8 + RESOURCE_EXHAUSTED = 速率限制
+    // ── 业务错误优先识别 (welink 用 code 字段) ──
+    // code=8 RESOURCE_EXHAUSTED = 速率限制
     if (code === 8 || m.includes('resource_exhausted') || m.includes('请求次数过多') || m.includes('过于频繁')) {
-      return { type: 'RATE_LIMIT', tip: `⏱ 请求频率限制 · "${detailMsg || msgStr}"`, retry: true, retryDelayMs: 300 };
+      return { type: 'RATE_LIMIT', tip: `⏱ 请求频率限制 · 自动重试中`, retry: true, retryDelayMs: 300 };
     }
-    // 尚未到开放时刻 - 这是我们最期待的"暂时拒绝",一定要持续重试
+    // 尚未到开放时刻 - 持续重试直到放开
     if (m.includes('尚未') || m.includes('未开放') || m.includes('未到') || m.includes('not_open') || m.includes('not open')) {
       return { type: 'NOT_OPEN', tip: `⏳ 尚未开放预订 · 持续尝试中`, retry: true, retryDelayMs: 80 };
     }
-    if (m.includes('已') && (m.includes('占') || m.includes('被预') || m.includes('冲突'))) {
-      return { type: 'CONFLICT', tip: `🔴 时间段已被占用 · "${detailMsg || msgStr}"`, retry: false };
+    // 时间冲突 (与他人预订冲突 OR 与自己已有预订重叠)
+    if (m.includes('冲突') || m.includes('占用') || m.includes('被预订') || m.includes('已订') || m.includes('overlap') || m.includes('已有预订')) {
+      return { type: 'CONFLICT', tip: `🔴 时间冲突 · ${detailMsg || msgStr || '与已有预订重叠或被他人占用'}`, retry: false };
     }
-    if (m.includes('范围') || m.includes('提前') || m.includes('超出')) {
-      return { type: 'OUT_OF_RANGE', tip: `📅 超出可预订日期范围 · "${detailMsg || msgStr}"`, retry: false };
+    // 超出范围
+    if (m.includes('范围') || m.includes('提前') || m.includes('超出') || m.includes('only allow')) {
+      return { type: 'OUT_OF_RANGE', tip: `📅 超出可预订范围 · ${detailMsg || msgStr}`, retry: false };
     }
+    // 重复
     if (m.includes('重复')) {
-      return { type: 'DUPLICATE', tip: `🔁 重复预订 · "${detailMsg || msgStr}"`, retry: false };
+      return { type: 'DUPLICATE', tip: `🔁 重复预订 · ${detailMsg || msgStr}`, retry: false };
     }
+    // 不存在
     if (m.includes('不存在') || m.includes('找不到')) {
-      return { type: 'NOT_FOUND', tip: `❓ 房间不存在 · "${detailMsg || msgStr}"`, retry: false };
+      return { type: 'NOT_FOUND', tip: `❓ 房间不存在 · ${detailMsg || msgStr}`, retry: false };
     }
+
+    // ── HTTP 状态码兜底 ──
+    if (httpStatus === 401) return { type: 'AUTH', tip: '🔒 Token 已过期 · 请刷新页面重新登录', retry: false };
+    if (httpStatus === 403) return { type: 'PERMISSION', tip: '🚫 权限不足', retry: false };
+    if (httpStatus === 409) return { type: 'CONFLICT', tip: `🔴 时间冲突 · ${detailMsg || msgStr || '已被占用'}`, retry: false };
+    if (httpStatus === 429) return { type: 'RATE_LIMIT', tip: '⏱ HTTP 429 · 请求过于频繁', retry: true, retryDelayMs: 300 };
+    if (httpStatus === 400) {
+      // 400 通常是请求被业务规则拒绝,重试无意义
+      return { type: 'BAD_REQUEST', tip: `⚠️ 请求被拒绝 · ${detailMsg || msgStr || 'BAD_REQUEST'}`, retry: false };
+    }
+    if (httpStatus >= 500) return { type: 'SERVER_ERROR', tip: `🔥 服务器异常 (${httpStatus})`, retry: true, retryDelayMs: 500 };
+
+    // 其它未知,允许少量重试
     return { type: 'OTHER', tip: `⚠️ ${detailMsg || msgStr || '未知错误'}`, retry: true, retryDelayMs: 200 };
   }
 
@@ -534,8 +551,11 @@
     syncServerTimePrecise().finally(() => {
       scheduledLocalTime = computeNextTriggerLocalTime();
       const waitMs = scheduledLocalTime - Date.now();
-      log(`⏰ 已设定:服务器时间 ${CONFIG.timing.bookingOpenTime} 自动开抢`, 'info');
-      log(`   ⏳ 还剩 ${(waitMs / 1000).toFixed(0)} 秒`, 'info');
+      const localFireTime = formatTimeWithMs(new Date(scheduledLocalTime));
+      const preTriggerMs = CONFIG.timing.preTriggerMs || 0;
+      log(`⏰ 服务器 ${CONFIG.timing.bookingOpenTime} 开放预订`, 'info');
+      log(`   工具将在本地 ${localFireTime} 启动 (提前 ${preTriggerMs}ms)`, 'info');
+      log(`   ⏳ 还剩 ${(waitMs / 1000).toFixed(1)} 秒`, 'info');
       setStatus('armed', '🟢 已就绪 · 等待开抢');
 
       if (waitMs > 35000) {
@@ -633,8 +653,12 @@
         border-bottom:2px solid transparent;color:#666;transition:all .15s}
       #mr-panel .tab.active{color:#1976d2;border-bottom-color:#1976d2;background:#f5f9ff}
       #mr-panel .tab:hover:not(.active){background:#fafafa}
-      #mr-panel .pane{display:none;min-height:140px;max-height:240px;overflow-y:auto}
+      #mr-panel .pane{display:none;height:260px;overflow-y:auto;padding-right:2px}
       #mr-panel .pane.active{display:block}
+      #mr-panel .task-header{display:flex;justify-content:space-between;align-items:center;
+        padding:4px 8px;margin-bottom:6px;font-size:11px;background:#f5f5f5;border-radius:4px}
+      #mr-panel .task-clear-btn{cursor:pointer;color:#c62828;padding:2px 6px;border-radius:3px;font-size:11px}
+      #mr-panel .task-clear-btn:hover{background:#ffebee}
       #mr-panel .empty{text-align:center;color:#999;padding:20px 8px;font-size:11px}
       #mr-panel .item{display:flex;justify-content:space-between;align-items:center;padding:6px 8px;
         border:1px solid #eee;border-radius:4px;margin-bottom:4px;background:#fafafa;font-size:11px}
@@ -679,7 +703,7 @@
     panel.id = 'mr-panel';
     panel.innerHTML = `
       <div class="h">
-        <span class="tt">📅 会议室自动抢订 v0.4</span>
+        <span class="tt">📅 会议室自动抢订 v0.5</span>
         <span class="tg" id="tg">−</span>
       </div>
       <div class="body" id="body">
@@ -775,6 +799,11 @@
     if (!CONFIG.bookings.length) {
       html += '<div class="empty">还没有抢订任务,点击下方按钮添加</div>';
     } else {
+      // 顶部头:任务计数 + 清空全部
+      html += `<div class="task-header">
+        <span style="color:#666">共 <b>${CONFIG.bookings.length}</b> 个任务</span>
+        <span class="task-clear-btn" id="clear-all-tasks">🗑 清空全部</span>
+      </div>`;
       const dateStr = formatBookingDate();
       CONFIG.bookings.forEach((b, i) => {
         const room = CONFIG.rooms.find(r => r.roomId === b.roomId);
@@ -802,6 +831,20 @@
       };
     });
     document.getElementById('add-task-btn').onclick = showAddTaskForm;
+
+    const clearBtn = document.getElementById('clear-all-tasks');
+    if (clearBtn) {
+      clearBtn.onclick = () => {
+        if (confirm(`⚠️ 确认清空全部 ${CONFIG.bookings.length} 个任务? 此操作不可撤销。`)) {
+          const n = CONFIG.bookings.length;
+          CONFIG.bookings = [];
+          saveConfig();
+          renderTasksPane();
+          updateUI();
+          log(`🗑 已清空 ${n} 个任务`, 'info');
+        }
+      };
+    }
   }
 
   function showAddTaskForm() {
@@ -1012,9 +1055,9 @@
         <input type="number" id="set-days" value="${CONFIG.timing.daysAhead}" min="0" max="30">
       </div>
       <div class="form-row">
-        <label>提前秒</label>
-        <input type="number" id="set-pretrig" value="${CONFIG.timing.preTriggerSeconds}" min="0" max="60" step="1">
-        <span style="font-size:11px;color:#666">8:30 前 N 秒开抢</span>
+        <label>提前ms</label>
+        <input type="number" id="set-pretrig" value="${CONFIG.timing.preTriggerMs}" min="0" max="60000" step="100">
+        <span style="font-size:11px;color:#666">8:30 前 N 毫秒</span>
       </div>
       <div class="form-row">
         <label>持续</label>
@@ -1035,7 +1078,7 @@
         <button id="set-reset" style="color:#c62828">恢复默认</button>
       </div>
       <div class="warn-text" id="set-warn" style="display:none"></div>
-      <div class="help">💡 服务器有 ~4 并发限制。"提前秒"让脚本提前几秒开始尝试,被拒绝就重试,直到 8:30 真正开放。<br>"持续"是最长尝试时长(超时未成功就放弃)。</div>`;
+      <div class="help">💡 服务器有 ~4 并发限制。"提前ms"让脚本提前几毫秒开始尝试,被拒绝就重试,直到 8:30 真正开放。<br>"持续"是最长尝试时长(超时未成功就放弃)。</div>`;
 
     document.getElementById('set-save').onclick = () => {
       const subject = document.getElementById('set-subject').value.trim();
@@ -1047,13 +1090,13 @@
       const warn = document.getElementById('set-warn');
       if (!subject) { warn.style.display = 'block'; warn.textContent = '⚠️ 主题不能为空'; return; }
       if (!open.match(/^\d{2}:\d{2}:\d{2}$/)) { warn.style.display = 'block'; warn.textContent = '⚠️ 开抢时刻格式应为 HH:MM:SS'; return; }
-      if (isNaN(pretrig) || pretrig < 0 || pretrig > 60) { warn.style.display = 'block'; warn.textContent = '⚠️ 提前秒应在 0~60 之间'; return; }
+      if (isNaN(pretrig) || pretrig < 0 || pretrig > 60000) { warn.style.display = 'block'; warn.textContent = '⚠️ 提前ms应在 0~60000 之间'; return; }
       if (isNaN(maxdur) || maxdur < 10) { warn.style.display = 'block'; warn.textContent = '⚠️ 持续时长太短'; return; }
       if (isNaN(conc) || conc < 1 || conc > 10) { warn.style.display = 'block'; warn.textContent = '⚠️ 并发数应在 1~10 之间'; return; }
       CONFIG.meeting.subject = subject;
       CONFIG.timing.bookingOpenTime = open;
       CONFIG.timing.daysAhead = days;
-      CONFIG.timing.preTriggerSeconds = pretrig;
+      CONFIG.timing.preTriggerMs = pretrig;
       CONFIG.timing.maxAttemptDurationSec = maxdur;
       CONFIG.advanced.concurrency = conc;
       saveConfig();
@@ -1207,9 +1250,18 @@
   /* ═══════════════════════════════════════════════════════════
      📝  日志
      ═══════════════════════════════════════════════════════════ */
+  function formatTimeWithMs(d) {
+    d = d || new Date();
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    const ss = String(d.getSeconds()).padStart(2, '0');
+    const ms = String(d.getMilliseconds()).padStart(3, '0');
+    return `${hh}:${mm}:${ss}.${ms}`;
+  }
+
   function log(msg, type) {
     type = type || 'info';
-    const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    const time = formatTimeWithMs();
     console.log(`[抢订 ${time}] ${msg}`);
     const logEl = document.getElementById('log');
     if (logEl) {
@@ -1237,7 +1289,7 @@
       return;
     }
     buildUI();
-    log('✅ 会议室自动抢订 v0.4.0 已加载');
+    log('✅ 会议室自动抢订 v0.5.0 已加载');
     log(`📋 已配置 ${CONFIG.bookings.length} 个任务 / ${CONFIG.rooms.length} 个房间`);
 
     setTimeout(() => {
