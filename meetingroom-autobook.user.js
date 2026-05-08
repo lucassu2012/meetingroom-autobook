@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         会议室自动抢订
 // @namespace    meetingroom-autobook
-// @version      0.3.0
-// @description  在系统开放预订时刻自动并发抢订会议室。GUI 配置 / 精确服务器对时 / 自动诊断 / 内置常用会议室。
+// @version      0.4.0
+// @description  在系统开放预订时刻自动抢订会议室。带并发限制的工作队列 / 提前连续重试 / 精确对时 / GUI 配置。
 // @author       Lucas
 // @match        https://inner.welink.huawei.com/meetingroom/*
 // @grant        none
@@ -24,7 +24,8 @@
     timing: {
       bookingOpenTime: '08:30:00',
       daysAhead: 7,
-      triggerOffsetMs: -100,
+      preTriggerSeconds: 5,         // 提前 N 秒开始尝试 (8:30:00 减 5s = 8:29:55 开始)
+      maxAttemptDurationSec: 90,    // 最长持续重试 90 秒
     },
     meeting: {
       subject: '团队工作时间',
@@ -45,8 +46,10 @@
     ],
     bookings: [],
     advanced: {
-      retryAttempts: 3,
-      retryIntervalMs: 100,
+      concurrency: 4,               // 同时最多 N 个请求 (服务器约 4 并发上限,留 1 余量)
+      interReqDelayMs: 80,          // 同一 worker 两次请求间最小间隔
+      retryDelayMs: 200,            // 普通重试延迟
+      maxAttemptsPerTask: 30,       // 单任务最多尝试次数
     },
   };
 
@@ -57,17 +60,34 @@
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) {
         const parsed = JSON.parse(saved);
-        const cfg = Object.assign({}, deepClone(DEFAULTS), parsed);
+        // 深度合并:确保新增字段(如 v0.4 的 preTriggerSeconds)被填上默认值
+        const cfg = deepMerge(deepClone(DEFAULTS), parsed);
         // v0.2 → v0.3 迁移: 重命名旧的 "D45R 示例" 为 "D45R"
         if (cfg.rooms) {
           cfg.rooms.forEach(r => {
             if (r.name === 'D45R 示例') r.name = 'D45R';
           });
         }
+        // v0.3 → v0.4 迁移: 移除已废弃的 triggerOffsetMs / retryAttempts / retryIntervalMs
+        if (cfg.timing && 'triggerOffsetMs' in cfg.timing) delete cfg.timing.triggerOffsetMs;
+        if (cfg.advanced && 'retryAttempts' in cfg.advanced) delete cfg.advanced.retryAttempts;
+        if (cfg.advanced && 'retryIntervalMs' in cfg.advanced) delete cfg.advanced.retryIntervalMs;
         return cfg;
       }
     } catch (e) { /* fall through */ }
     return deepClone(DEFAULTS);
+  }
+
+  function deepMerge(target, source) {
+    if (!source) return target;
+    Object.keys(source).forEach(key => {
+      if (source[key] && typeof source[key] === 'object' && !Array.isArray(source[key])) {
+        target[key] = deepMerge(target[key] || {}, source[key]);
+      } else {
+        target[key] = source[key];
+      }
+    });
+    return target;
   }
 
   function saveConfig() {
@@ -240,7 +260,9 @@
     if (target.getTime() <= serverNow.getTime()) {
       target.setDate(target.getDate() + 1);
     }
-    return target.getTime() - serverOffsetMs + CONFIG.timing.triggerOffsetMs;
+    // 提前 preTriggerSeconds 秒开始尝试 (正好踩 8:30 太晚, 早 5s 比较稳)
+    const preTriggerMs = (CONFIG.timing.preTriggerSeconds || 0) * 1000;
+    return target.getTime() - serverOffsetMs - preTriggerMs;
   }
 
   function computeEndTime(startTime, durationMinutes) {
@@ -272,43 +294,48 @@
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
   function categorizeError(httpStatus, data) {
-    if (httpStatus === 401) return { type: 'AUTH', tip: '🔒 Token 已过期 - 请刷新页面重新登录', retry: false };
+    // HTTP 状态码层
+    if (httpStatus === 401) return { type: 'AUTH', tip: '🔒 Token 已过期 · 请刷新页面重新登录', retry: false };
     if (httpStatus === 403) return { type: 'PERMISSION', tip: '🚫 权限不足', retry: false };
-    if (httpStatus === 409) return { type: 'CONFLICT', tip: '🔴 时间段冲突 - 已被他人占用', retry: false };
-    if (httpStatus === 429) return { type: 'RATE_LIMIT', tip: '⏱ 请求过于频繁', retry: true };
-    if (httpStatus >= 500) return { type: 'SERVER_ERROR', tip: '🔥 服务器异常', retry: true };
+    if (httpStatus === 409) return { type: 'CONFLICT', tip: '🔴 时间段冲突 · 已被他人占用', retry: false };
+    if (httpStatus === 429) return { type: 'RATE_LIMIT', tip: '⏱ HTTP 429 · 请求过于频繁', retry: true, retryDelayMs: 300 };
+    if (httpStatus >= 500) return { type: 'SERVER_ERROR', tip: '🔥 服务器异常', retry: true, retryDelayMs: 500 };
 
+    // 业务错误 code 层(welink 用 code/message)
+    const code = data && data.code;
     const msgStr = ((data && (data.message || data.msg || data.error)) || '').toString();
-    const m = msgStr.toLowerCase();
-    if (m.includes('已') && (m.includes('占') || m.includes('被预') || m.includes('冲突'))) {
-      return { type: 'CONFLICT', tip: `🔴 时间段已被占用 - "${msgStr}"`, retry: false };
+    const detailMsg = (data && data.details && data.details[0] && data.details[0].message) || '';
+    const fullMsg = msgStr + ' ' + detailMsg;
+    const m = fullMsg.toLowerCase();
+
+    // welink 实测:code=8 + RESOURCE_EXHAUSTED = 速率限制
+    if (code === 8 || m.includes('resource_exhausted') || m.includes('请求次数过多') || m.includes('过于频繁')) {
+      return { type: 'RATE_LIMIT', tip: `⏱ 请求频率限制 · "${detailMsg || msgStr}"`, retry: true, retryDelayMs: 300 };
     }
-    if (m.includes('开放') || m.includes('未到')) {
-      return { type: 'NOT_OPEN', tip: `⏳ 未到预订开放时刻 - "${msgStr}"`, retry: true };
+    // 尚未到开放时刻 - 这是我们最期待的"暂时拒绝",一定要持续重试
+    if (m.includes('尚未') || m.includes('未开放') || m.includes('未到') || m.includes('not_open') || m.includes('not open')) {
+      return { type: 'NOT_OPEN', tip: `⏳ 尚未开放预订 · 持续尝试中`, retry: true, retryDelayMs: 80 };
+    }
+    if (m.includes('已') && (m.includes('占') || m.includes('被预') || m.includes('冲突'))) {
+      return { type: 'CONFLICT', tip: `🔴 时间段已被占用 · "${detailMsg || msgStr}"`, retry: false };
     }
     if (m.includes('范围') || m.includes('提前') || m.includes('超出')) {
-      return { type: 'OUT_OF_RANGE', tip: `📅 超出可预订日期范围 - "${msgStr}"`, retry: false };
+      return { type: 'OUT_OF_RANGE', tip: `📅 超出可预订日期范围 · "${detailMsg || msgStr}"`, retry: false };
     }
     if (m.includes('重复')) {
-      return { type: 'DUPLICATE', tip: `🔁 重复预订 - "${msgStr}"`, retry: false };
+      return { type: 'DUPLICATE', tip: `🔁 重复预订 · "${detailMsg || msgStr}"`, retry: false };
     }
     if (m.includes('不存在') || m.includes('找不到')) {
-      return { type: 'NOT_FOUND', tip: `❓ 房间不存在 - "${msgStr}"`, retry: false };
+      return { type: 'NOT_FOUND', tip: `❓ 房间不存在 · "${detailMsg || msgStr}"`, retry: false };
     }
-    return { type: 'OTHER', tip: `⚠️ ${msgStr || '未知错误'}`, retry: true };
+    return { type: 'OTHER', tip: `⚠️ ${detailMsg || msgStr || '未知错误'}`, retry: true, retryDelayMs: 200 };
   }
 
-  async function submitBooking(booking, label, attempt) {
-    attempt = attempt || 1;
-    if (!authToken) {
-      log(`❌ ${label} 无 Token`, 'error');
-      return { success: false, reason: 'no-token' };
-    }
+  // 单次尝试,不做内部重试。重试由 executeAllBookings 的工作池调度。
+  async function attemptBooking(booking, label) {
+    if (!authToken) return { success: false, retriable: false, type: 'NO_AUTH', tip: '🔒 无 Token' };
     const xsrfToken = getXSRFToken();
-    if (!xsrfToken) {
-      log(`❌ ${label} 无 XSRF`, 'error');
-      return { success: false, reason: 'no-xsrf' };
-    }
+    if (!xsrfToken) return { success: false, retriable: false, type: 'NO_XSRF', tip: '🔒 无 XSRF' };
 
     const url = `https://inner.welink.huawei.com/meetingroom/schedule/v1/bookings?_t=${Date.now()}`;
     const payload = buildPayload(booking);
@@ -328,7 +355,7 @@
         credentials: 'include',
         body: JSON.stringify(payload),
       });
-      const elapsed = (performance.now() - t0).toFixed(0);
+      const elapsed = Math.round(performance.now() - t0);
 
       let data = {};
       try { data = await resp.json(); } catch (e) { /* not json */ }
@@ -342,28 +369,26 @@
       );
 
       if (success) {
-        log(`✅ ${label} 抢订成功 (${elapsed}ms)`, 'success');
-        if (data.id) log(`   订单号: ${data.id}`, 'debug');
-        return { success: true, orderId: data.id };
-      } else {
-        const cat = categorizeError(resp.status, data);
-        log(`⚠️ ${label} 失败#${attempt}: ${cat.tip}`, 'warn');
-        if (data && Object.keys(data).length) {
-          log(`   原始响应: ${JSON.stringify(data).slice(0, 200)}`, 'debug');
-        }
-        if (cat.retry && attempt < CONFIG.advanced.retryAttempts) {
-          await sleep(CONFIG.advanced.retryIntervalMs);
-          return submitBooking(booking, label, attempt + 1);
-        }
-        return { success: false, reason: cat.tip, type: cat.type };
+        return { success: true, orderId: data.id, elapsed };
       }
+      const cat = categorizeError(resp.status, data);
+      return {
+        success: false,
+        retriable: cat.retry,
+        type: cat.type,
+        tip: cat.tip,
+        retryDelayMs: cat.retryDelayMs || CONFIG.advanced.retryDelayMs,
+        rawData: data,
+        elapsed,
+      };
     } catch (err) {
-      log(`💥 ${label} 网络异常#${attempt}: ${err.message}`, 'error');
-      if (attempt < CONFIG.advanced.retryAttempts) {
-        await sleep(CONFIG.advanced.retryIntervalMs);
-        return submitBooking(booking, label, attempt + 1);
-      }
-      return { success: false, reason: err.message };
+      return {
+        success: false,
+        retriable: true,
+        type: 'NETWORK',
+        tip: `💥 网络异常: ${err.message}`,
+        retryDelayMs: 200,
+      };
     }
   }
 
@@ -372,30 +397,123 @@
       log('⚠️ 没有任何任务,请在 [任务] 标签页里添加', 'warn');
       return;
     }
-    setStatus('firing', `🔴 抢订中... (${CONFIG.bookings.length} 个任务)`, 60);
-    log(`🚀 开始并发抢订 ${CONFIG.bookings.length} 个任务...`);
+
+    const concurrency = Math.max(1, CONFIG.advanced.concurrency || 3);
+    const interReqDelay = Math.max(0, CONFIG.advanced.interReqDelayMs || 0);
+    const maxAttempts = Math.max(1, CONFIG.advanced.maxAttemptsPerTask || 30);
+    const maxDurationMs = Math.max(5, CONFIG.timing.maxAttemptDurationSec || 90) * 1000;
+    const deadline = Date.now() + maxDurationMs;
+
+    log(`🚀 开始抢订 ${CONFIG.bookings.length} 个任务 (并发=${concurrency},单任务最多 ${maxAttempts} 次,持续上限 ${maxDurationMs / 1000}s)`);
     const t0 = performance.now();
 
-    const promises = CONFIG.bookings.map((b, i) => {
+    // 每个任务的运行状态
+    const states = CONFIG.bookings.map((b, i) => {
       const room = CONFIG.rooms.find(r => r.roomId === b.roomId);
       const roomLabel = room ? room.name : b.roomId.slice(-6);
-      const label = `[#${i + 1} ${roomLabel} ${b.startTime}+${b.durationMinutes}m]`;
-      return submitBooking(b, label);
+      return {
+        booking: b,
+        index: i + 1,
+        label: `[#${i + 1} ${roomLabel} ${b.startTime}]`,
+        status: 'pending',  // pending | inflight | success | failed
+        attempts: 0,
+        result: null,
+        nextEarliestAt: 0,  // 下一次可尝试的最早时刻 (用于错误退避)
+      };
     });
 
-    const results = await Promise.all(promises);
-    const ok = results.filter(r => r.success).length;
+    setStatus('firing', `🔴 抢订中 · 0/${states.length} 已成功`, 60);
+
+    function refreshFiringStatus() {
+      const ok = states.filter(s => s.status === 'success').length;
+      const failed = states.filter(s => s.status === 'failed').length;
+      setStatus('firing', `🔴 抢订中 · ${ok} 成功 / ${failed} 失败 / ${states.length - ok - failed} 进行中`, 60);
+    }
+
+    // 工作池: concurrency 个 worker 并行从队列里抽任务
+    async function worker(workerId) {
+      while (true) {
+        const now = Date.now();
+        if (now >= deadline) {
+          // 全局超时, 把所有 pending 标为失败
+          states.filter(s => s.status === 'pending').forEach(s => {
+            s.status = 'failed';
+            s.result = { tip: `⏱ 超时 (${maxDurationMs / 1000}s)`, type: 'TIMEOUT' };
+          });
+          return;
+        }
+
+        // 找一个可以尝试的任务: pending 且 nextEarliestAt 已到
+        const state = states.find(s => s.status === 'pending' && now >= s.nextEarliestAt);
+        if (!state) {
+          // 没有立即可执行的, 看看还有没有 pending(等待退避)
+          const stillPending = states.some(s => s.status === 'pending' || s.status === 'inflight');
+          if (!stillPending) return;
+          await sleep(20);
+          continue;
+        }
+
+        if (state.attempts >= maxAttempts) {
+          state.status = 'failed';
+          state.result = { tip: `⏱ 达到最大尝试次数 ${maxAttempts}`, type: 'MAX_RETRY' };
+          refreshFiringStatus();
+          continue;
+        }
+
+        state.status = 'inflight';
+        state.attempts++;
+        const result = await attemptBooking(state.booking, state.label);
+
+        if (result.success) {
+          state.status = 'success';
+          state.result = result;
+          log(`✅ ${state.label} 第 ${state.attempts} 次成功 (${result.elapsed}ms)`, 'success');
+          if (result.orderId) log(`   订单号: ${result.orderId}`, 'debug');
+        } else if (result.retriable && Date.now() < deadline && state.attempts < maxAttempts) {
+          // 排回队列, 设置最早重试时刻
+          state.status = 'pending';
+          state.nextEarliestAt = Date.now() + (result.retryDelayMs || 200);
+          // 重要错误首次出现时打印, 后续不刷屏
+          if (state.attempts === 1 || state.attempts % 5 === 0) {
+            log(`⏳ ${state.label} 第 ${state.attempts} 次: ${result.tip}`, 'warn');
+          }
+        } else {
+          state.status = 'failed';
+          state.result = result;
+          log(`❌ ${state.label} 终止: ${result.tip}`, 'warn');
+        }
+
+        refreshFiringStatus();
+
+        // 同 worker 两次请求最小间隔
+        if (interReqDelay > 0) await sleep(interReqDelay);
+      }
+    }
+
+    await Promise.all(Array(concurrency).fill().map((_, i) => worker(i)));
+
+    const ok = states.filter(s => s.status === 'success').length;
     const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
 
-    if (ok === results.length) {
-      log(`🎉 全部抢订成功 (${ok}/${results.length},耗时 ${elapsed}s)`, 'success');
-      setStatus('done', `✅ 全部成功 ${ok}/${results.length}`, 60);
+    // 统计失败原因
+    const failGroups = {};
+    states.filter(s => s.status === 'failed').forEach(s => {
+      const r = (s.result && s.result.tip) || '未知';
+      failGroups[r] = (failGroups[r] || 0) + 1;
+    });
+    const failSummary = Object.entries(failGroups).map(([r, c]) => `${c}×「${r}」`).join('  ');
+
+    if (ok === states.length) {
+      log(`🎉 全部抢订成功 (${ok}/${states.length},耗时 ${elapsed}s)`, 'success');
+      setStatus('done', `✅ 全部成功 ${ok}/${states.length}`, 60);
     } else if (ok > 0) {
-      log(`⚠️ 部分成功 (${ok}/${results.length},耗时 ${elapsed}s)`, 'warn');
-      setStatus('partial', `⚠️ 部分成功 ${ok}/${results.length}`, 60);
+      log(`⚠️ 部分成功 (${ok}/${states.length},耗时 ${elapsed}s)`, 'warn');
+      if (failSummary) log(`   失败原因汇总: ${failSummary}`, 'debug');
+      setStatus('partial', `⚠️ ${ok}/${states.length} 成功`, 60);
     } else {
       log(`❌ 全部失败 (耗时 ${elapsed}s)`, 'error');
-      setStatus('error', `❌ 全部失败 0/${results.length}`, 30);
+      if (failSummary) log(`   失败原因汇总: ${failSummary}`, 'debug');
+      setStatus('error', `❌ 全部失败 0/${states.length}`, 30);
     }
   }
 
@@ -561,7 +679,7 @@
     panel.id = 'mr-panel';
     panel.innerHTML = `
       <div class="h">
-        <span class="tt">📅 会议室自动抢订 v0.3</span>
+        <span class="tt">📅 会议室自动抢订 v0.4</span>
         <span class="tg" id="tg">−</span>
       </div>
       <div class="body" id="body">
@@ -657,13 +775,14 @@
     if (!CONFIG.bookings.length) {
       html += '<div class="empty">还没有抢订任务,点击下方按钮添加</div>';
     } else {
+      const dateStr = formatBookingDate();
       CONFIG.bookings.forEach((b, i) => {
         const room = CONFIG.rooms.find(r => r.roomId === b.roomId);
         const roomLabel = room ? room.name : `<未知房间 ${b.roomId.slice(-6)}>`;
         const endTime = computeEndTime(b.startTime, b.durationMinutes);
         html += `
           <div class="item">
-            <div class="left">📌 <b>${escapeHtml(roomLabel)}</b> · ${b.startTime}~${endTime} (${b.durationMinutes}min)</div>
+            <div class="left">📌 <b>${escapeHtml(roomLabel)}</b> · ${dateStr} · ${b.startTime}~${endTime}</div>
             <span class="x" data-action="del-task" data-idx="${i}" title="删除">×</span>
           </div>`;
       });
@@ -713,9 +832,9 @@
           <input type="time" id="task-start" value="08:30" step="600">
         </div>
         <div class="form-row">
-          <label>时长</label>
-          <input type="number" id="task-duration" value="210" min="15" max="240" step="15">
-          <span style="font-size:11px;color:#666">分钟 (最大 240)</span>
+          <label>结束</label>
+          <input type="time" id="task-end" value="12:00" step="600">
+          <span style="font-size:11px;color:#666">单段≤4 小时</span>
         </div>
         <div class="form-buttons">
           <button id="task-save" class="save">保存</button>
@@ -731,10 +850,10 @@
         btn.classList.add('on');
         if (btn.dataset.preset === 'morning') {
           document.getElementById('task-start').value = '08:30';
-          document.getElementById('task-duration').value = '210';
+          document.getElementById('task-end').value = '12:00';
         } else if (btn.dataset.preset === 'afternoon') {
           document.getElementById('task-start').value = '14:00';
-          document.getElementById('task-duration').value = '240';
+          document.getElementById('task-end').value = '18:00';
         }
       };
     });
@@ -743,12 +862,19 @@
     document.getElementById('task-save').onclick = () => {
       const checked = Array.from(host.querySelectorAll('input[name=task-room]:checked')).map(c => c.value);
       const startTime = document.getElementById('task-start').value;
-      const duration = parseInt(document.getElementById('task-duration').value, 10);
+      const endTime = document.getElementById('task-end').value;
       const warn = document.getElementById('task-warn');
 
       if (!checked.length) { warn.style.display = 'block'; warn.textContent = '⚠️ 至少选择一个房间'; return; }
       if (!startTime || !startTime.match(/^\d{2}:\d{2}$/)) { warn.style.display = 'block'; warn.textContent = '⚠️ 开始时间格式错误'; return; }
-      if (!duration || duration < 15 || duration > 240) { warn.style.display = 'block'; warn.textContent = '⚠️ 时长必须在 15~240 分钟之间'; return; }
+      if (!endTime || !endTime.match(/^\d{2}:\d{2}$/)) { warn.style.display = 'block'; warn.textContent = '⚠️ 结束时间格式错误'; return; }
+
+      const [sh, sm] = startTime.split(':').map(Number);
+      const [eh, em] = endTime.split(':').map(Number);
+      const duration = (eh * 60 + em) - (sh * 60 + sm);
+      if (duration <= 0) { warn.style.display = 'block'; warn.textContent = '⚠️ 结束时间必须晚于开始时间'; return; }
+      if (duration > 240) { warn.style.display = 'block'; warn.textContent = `⚠️ 单段最长 4 小时,你设置了 ${duration} 分钟`; return; }
+      if (duration < 15) { warn.style.display = 'block'; warn.textContent = '⚠️ 时长不能少于 15 分钟'; return; }
 
       checked.forEach(roomId => {
         CONFIG.bookings.push({ roomId, startTime, durationMinutes: duration });
@@ -757,7 +883,7 @@
       host.innerHTML = '';
       renderTasksPane();
       updateUI();
-      log(`✅ 添加 ${checked.length} 个任务 (${startTime}, ${duration}min)`, 'success');
+      log(`✅ 添加 ${checked.length} 个任务 (${startTime}~${endTime})`, 'success');
     };
   }
 
@@ -886,13 +1012,19 @@
         <input type="number" id="set-days" value="${CONFIG.timing.daysAhead}" min="0" max="30">
       </div>
       <div class="form-row">
-        <label>提前ms</label>
-        <input type="number" id="set-offset" value="${CONFIG.timing.triggerOffsetMs}" step="10" max="0" min="-1000">
-        <span style="font-size:11px;color:#666">负数=提前</span>
+        <label>提前秒</label>
+        <input type="number" id="set-pretrig" value="${CONFIG.timing.preTriggerSeconds}" min="0" max="60" step="1">
+        <span style="font-size:11px;color:#666">8:30 前 N 秒开抢</span>
       </div>
       <div class="form-row">
-        <label>重试</label>
-        <input type="number" id="set-retry" value="${CONFIG.advanced.retryAttempts}" min="0" max="10">
+        <label>持续</label>
+        <input type="number" id="set-maxdur" value="${CONFIG.timing.maxAttemptDurationSec}" min="10" max="300" step="10">
+        <span style="font-size:11px;color:#666">秒,最长重试时长</span>
+      </div>
+      <div class="form-row">
+        <label>并发</label>
+        <input type="number" id="set-conc" value="${CONFIG.advanced.concurrency}" min="1" max="10" step="1">
+        <span style="font-size:11px;color:#666">≤4 (避免限流)</span>
       </div>
       <div class="form-buttons" style="margin-top:8px">
         <button id="set-save" class="save">保存设置</button>
@@ -903,22 +1035,27 @@
         <button id="set-reset" style="color:#c62828">恢复默认</button>
       </div>
       <div class="warn-text" id="set-warn" style="display:none"></div>
-      <div class="help">💡 配置自动保存到浏览器 localStorage。<br>导出配置可以分享给同事一键导入。</div>`;
+      <div class="help">💡 服务器有 ~4 并发限制。"提前秒"让脚本提前几秒开始尝试,被拒绝就重试,直到 8:30 真正开放。<br>"持续"是最长尝试时长(超时未成功就放弃)。</div>`;
 
     document.getElementById('set-save').onclick = () => {
       const subject = document.getElementById('set-subject').value.trim();
       const open = document.getElementById('set-open').value.trim();
       const days = parseInt(document.getElementById('set-days').value, 10);
-      const off = parseInt(document.getElementById('set-offset').value, 10);
-      const retry = parseInt(document.getElementById('set-retry').value, 10);
+      const pretrig = parseInt(document.getElementById('set-pretrig').value, 10);
+      const maxdur = parseInt(document.getElementById('set-maxdur').value, 10);
+      const conc = parseInt(document.getElementById('set-conc').value, 10);
       const warn = document.getElementById('set-warn');
       if (!subject) { warn.style.display = 'block'; warn.textContent = '⚠️ 主题不能为空'; return; }
       if (!open.match(/^\d{2}:\d{2}:\d{2}$/)) { warn.style.display = 'block'; warn.textContent = '⚠️ 开抢时刻格式应为 HH:MM:SS'; return; }
+      if (isNaN(pretrig) || pretrig < 0 || pretrig > 60) { warn.style.display = 'block'; warn.textContent = '⚠️ 提前秒应在 0~60 之间'; return; }
+      if (isNaN(maxdur) || maxdur < 10) { warn.style.display = 'block'; warn.textContent = '⚠️ 持续时长太短'; return; }
+      if (isNaN(conc) || conc < 1 || conc > 10) { warn.style.display = 'block'; warn.textContent = '⚠️ 并发数应在 1~10 之间'; return; }
       CONFIG.meeting.subject = subject;
       CONFIG.timing.bookingOpenTime = open;
       CONFIG.timing.daysAhead = days;
-      CONFIG.timing.triggerOffsetMs = off;
-      CONFIG.advanced.retryAttempts = retry;
+      CONFIG.timing.preTriggerSeconds = pretrig;
+      CONFIG.timing.maxAttemptDurationSec = maxdur;
+      CONFIG.advanced.concurrency = conc;
       saveConfig();
       log('✅ 设置已保存', 'success');
       updateUI();
@@ -1016,10 +1153,13 @@
 
     if (scheduledLocalTime) {
       const remain = Math.max(0, scheduledLocalTime - Date.now());
-      const h = Math.floor(remain / 3600000);
-      const m = Math.floor((remain % 3600000) / 60000);
-      const s = Math.floor((remain % 60000) / 1000);
-      cd.textContent = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+      const totalSec = Math.floor(remain / 1000);
+      const days = Math.floor(totalSec / 86400);
+      const h = Math.floor((totalSec % 86400) / 3600);
+      const m = Math.floor((totalSec % 3600) / 60);
+      const s = totalSec % 60;
+      const hms = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+      cd.textContent = days > 0 ? `${days} 天 ${hms}` : hms;
     } else {
       const sn = new Date(getServerNow());
       cd.textContent = sn.toLocaleTimeString('zh-CN', { hour12: false });
@@ -1097,7 +1237,7 @@
       return;
     }
     buildUI();
-    log('✅ 会议室自动抢订 v0.3.0 已加载');
+    log('✅ 会议室自动抢订 v0.4.0 已加载');
     log(`📋 已配置 ${CONFIG.bookings.length} 个任务 / ${CONFIG.rooms.length} 个房间`);
 
     setTimeout(() => {
