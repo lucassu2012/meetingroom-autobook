@@ -310,17 +310,24 @@
     // ── 业务错误优先识别 (welink 用 code 字段) ──
     // code=8 RESOURCE_EXHAUSTED = 速率限制
     if (code === 8 || m.includes('resource_exhausted') || m.includes('请求次数过多') || m.includes('过于频繁')) {
-      return { type: 'RATE_LIMIT', tip: `⏱ 请求频率限制 · 自动重试中`, retry: true, retryDelayMs: 300 };
+      return { type: 'RATE_LIMIT', tip: `⏱ 请求频率限制 · 自动重试中`, retry: true, retryDelayMs: 200 };
+    }
+    // 超过提前预订天数 - 当 daysAhead<=7 时,这是"尚未滚动到第7天",必须持续重试
+    if (m.includes('exceed_booking_advance') || m.includes('exceed_advance')) {
+      if (CONFIG.timing.daysAhead <= 7) {
+        return { type: 'NOT_OPEN', tip: `⏳ 尚未开放 (advance limit) · 持续尝试`, retry: true, retryDelayMs: 80 };
+      }
+      return { type: 'OUT_OF_RANGE', tip: `📅 超出可预订范围 · 提前天数 ${CONFIG.timing.daysAhead} > 7`, retry: false };
     }
     // 尚未到开放时刻 - 持续重试直到放开
     if (m.includes('尚未') || m.includes('未开放') || m.includes('未到') || m.includes('not_open') || m.includes('not open')) {
       return { type: 'NOT_OPEN', tip: `⏳ 尚未开放预订 · 持续尝试中`, retry: true, retryDelayMs: 80 };
     }
     // 时间冲突 (与他人预订冲突 OR 与自己已有预订重叠)
-    if (m.includes('冲突') || m.includes('占用') || m.includes('被预订') || m.includes('已订') || m.includes('overlap') || m.includes('已有预订')) {
+    if (m.includes('冲突') || m.includes('占用') || m.includes('被预订') || m.includes('已订') || m.includes('overlap') || m.includes('已有预订') || m.includes('span_in_use') || m.includes('in_use')) {
       return { type: 'CONFLICT', tip: `🔴 时间冲突 · ${detailMsg || msgStr || '与已有预订重叠或被他人占用'}`, retry: false };
     }
-    // 超出范围
+    // 超出范围 (中文)
     if (m.includes('范围') || m.includes('提前') || m.includes('超出') || m.includes('only allow')) {
       return { type: 'OUT_OF_RANGE', tip: `📅 超出可预订范围 · ${detailMsg || msgStr}`, retry: false };
     }
@@ -337,7 +344,7 @@
     if (httpStatus === 401) return { type: 'AUTH', tip: '🔒 Token 已过期 · 请刷新页面重新登录', retry: false };
     if (httpStatus === 403) return { type: 'PERMISSION', tip: '🚫 权限不足', retry: false };
     if (httpStatus === 409) return { type: 'CONFLICT', tip: `🔴 时间冲突 · ${detailMsg || msgStr || '已被占用'}`, retry: false };
-    if (httpStatus === 429) return { type: 'RATE_LIMIT', tip: '⏱ HTTP 429 · 请求过于频繁', retry: true, retryDelayMs: 300 };
+    if (httpStatus === 429) return { type: 'RATE_LIMIT', tip: '⏱ HTTP 429 · 请求过于频繁', retry: true, retryDelayMs: 200 };
     if (httpStatus === 400) {
       // 400 通常是请求被业务规则拒绝,重试无意义
       return { type: 'BAD_REQUEST', tip: `⚠️ 请求被拒绝 · ${detailMsg || msgStr || 'BAD_REQUEST'}`, retry: false };
@@ -490,8 +497,8 @@
           // 排回队列, 设置最早重试时刻
           state.status = 'pending';
           state.nextEarliestAt = Date.now() + (result.retryDelayMs || 200);
-          // 重要错误首次出现时打印, 后续不刷屏
-          if (state.attempts === 1 || state.attempts % 5 === 0) {
+          // 重要错误首 3 次都显示, 之后每 5 次显示一次, 避免刷屏
+          if (state.attempts <= 3 || state.attempts % 5 === 0) {
             log(`⏳ ${state.label} 第 ${state.attempts} 次: ${result.tip}`, 'warn');
           }
         } else {
@@ -653,8 +660,9 @@
         border-bottom:2px solid transparent;color:#666;transition:all .15s}
       #mr-panel .tab.active{color:#1976d2;border-bottom-color:#1976d2;background:#f5f9ff}
       #mr-panel .tab:hover:not(.active){background:#fafafa}
-      #mr-panel .pane{display:none;height:260px;overflow-y:auto;padding-right:2px}
+      #mr-panel .pane{display:none;height:320px;overflow-y:auto;padding-right:2px}
       #mr-panel .pane.active{display:block}
+      #mr-panel .pane#pane-log.active{display:flex;flex-direction:column}
       #mr-panel .task-header{display:flex;justify-content:space-between;align-items:center;
         padding:4px 8px;margin-bottom:6px;font-size:11px;background:#f5f5f5;border-radius:4px}
       #mr-panel .task-clear-btn{cursor:pointer;color:#c62828;padding:2px 6px;border-radius:3px;font-size:11px}
@@ -665,6 +673,12 @@
       #mr-panel .item .left{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       #mr-panel .item .x{color:#c62828;cursor:pointer;padding:0 6px;font-size:14px;line-height:1}
       #mr-panel .item .x:hover{background:#ffebee;border-radius:3px}
+      #mr-panel .rooms-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-bottom:6px}
+      #mr-panel .room-cell{display:flex;justify-content:space-between;align-items:center;padding:5px 6px;
+        border:1px solid #eee;border-radius:4px;background:#fafafa;font-size:11px;overflow:hidden}
+      #mr-panel .room-cell .rn{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      #mr-panel .room-cell .x{color:#c62828;cursor:pointer;padding:0 4px;font-size:13px;line-height:1;flex-shrink:0}
+      #mr-panel .room-cell .x:hover{background:#ffebee;border-radius:3px}
       #mr-panel .add-btn{width:100%;padding:6px;border:1px dashed #ccc;background:#fff;border-radius:4px;
         cursor:pointer;color:#666;font-size:11px;margin-bottom:6px}
       #mr-panel .add-btn:hover{background:#f5f5f5;border-color:#999}
@@ -684,11 +698,11 @@
       #mr-panel .checkbox-list label{display:flex;align-items:center;padding:3px 6px;cursor:pointer;font-size:11px}
       #mr-panel .checkbox-list label:hover{background:#f5f5f5}
       #mr-panel .checkbox-list input{margin-right:6px}
-      #mr-panel .ll{font-size:11px;color:#999;margin-bottom:4px;display:flex;justify-content:space-between}
+      #mr-panel .ll{font-size:11px;color:#999;margin-bottom:4px;display:flex;justify-content:space-between;flex-shrink:0}
       #mr-panel .clr{cursor:pointer}
       #mr-panel .clr:hover{color:#333}
       #mr-panel .log{background:#fafafa;border:1px solid #eee;border-radius:4px;padding:6px 8px;
-        height:170px;overflow-y:auto;font-family:Consolas,monospace;font-size:11px;line-height:1.5}
+        flex:1;min-height:0;overflow-y:auto;font-family:Consolas,monospace;font-size:11px;line-height:1.5}
       #mr-panel .log .l-info{color:#555}
       #mr-panel .log .l-debug{color:#888}
       #mr-panel .log .l-success{color:#2e7d32;font-weight:500}
@@ -703,7 +717,7 @@
     panel.id = 'mr-panel';
     panel.innerHTML = `
       <div class="h">
-        <span class="tt">📅 会议室自动抢订 v0.5</span>
+        <span class="tt">📅 会议室自动抢订 v0.6</span>
         <span class="tg" id="tg">−</span>
       </div>
       <div class="body" id="body">
@@ -872,12 +886,12 @@
         </div>
         <div class="form-row">
           <label>开始</label>
-          <input type="time" id="task-start" value="08:30" step="600">
+          <input type="time" id="task-start" value="08:30" step="1800">
         </div>
         <div class="form-row">
           <label>结束</label>
-          <input type="time" id="task-end" value="12:00" step="600">
-          <span style="font-size:11px;color:#666">单段≤4 小时</span>
+          <input type="time" id="task-end" value="12:00" step="1800">
+          <span style="font-size:11px;color:#666">30 分钟颗粒,单段≤4 小时</span>
         </div>
         <div class="form-buttons">
           <button id="task-save" class="save">保存</button>
@@ -917,7 +931,9 @@
       const duration = (eh * 60 + em) - (sh * 60 + sm);
       if (duration <= 0) { warn.style.display = 'block'; warn.textContent = '⚠️ 结束时间必须晚于开始时间'; return; }
       if (duration > 240) { warn.style.display = 'block'; warn.textContent = `⚠️ 单段最长 4 小时,你设置了 ${duration} 分钟`; return; }
-      if (duration < 15) { warn.style.display = 'block'; warn.textContent = '⚠️ 时长不能少于 15 分钟'; return; }
+      if (duration < 30) { warn.style.display = 'block'; warn.textContent = '⚠️ 时长不能少于 30 分钟 (系统颗粒度限制)'; return; }
+      if (duration % 30 !== 0) { warn.style.display = 'block'; warn.textContent = `⚠️ 时长必须是 30 分钟的整数倍 (你设置了 ${duration} 分钟)`; return; }
+      if (sm % 30 !== 0 || em % 30 !== 0) { warn.style.display = 'block'; warn.textContent = '⚠️ 开始/结束时刻必须落在整点或半点 (系统限制)'; return; }
 
       checked.forEach(roomId => {
         CONFIG.bookings.push({ roomId, startTime, durationMinutes: duration });
@@ -941,13 +957,15 @@
     if (!CONFIG.rooms.length) {
       html += '<div class="empty">还没有保存的会议室</div>';
     } else {
+      html += '<div class="rooms-grid">';
       CONFIG.rooms.forEach((r, i) => {
         html += `
-          <div class="item">
-            <div class="left">🏢 <b>${escapeHtml(r.name)}</b> <span style="color:#999">${r.roomId.slice(-6)}</span></div>
+          <div class="room-cell" title="${escapeHtml(r.name)} · ${r.roomId}">
+            <span class="rn">🏢 <b>${escapeHtml(r.name)}</b></span>
             <span class="x" data-action="del-room" data-idx="${i}" title="删除">×</span>
           </div>`;
       });
+      html += '</div>';
     }
     html += '<button class="add-btn" id="add-room-btn">+ 添加会议室</button>';
 
@@ -1238,6 +1256,12 @@
       if (b.durationMinutes > 240) {
         return { level: 'error', text: `⚠️ 任务 #${i + 1} 时长超过 4 小时上限` };
       }
+      if (b.durationMinutes < 30 || b.durationMinutes % 30 !== 0) {
+        return { level: 'error', text: `⚠️ 任务 #${i + 1} 时长 ${b.durationMinutes}min 不是 30 分钟整数倍` };
+      }
+    }
+    if (CONFIG.timing.daysAhead > 7) {
+      return { level: 'warn', text: `⚠️ 提前天数 ${CONFIG.timing.daysAhead} > 7,系统会拒绝。请改为 ≤7` };
     }
     if (syncQuality === 'NONE') {
       return { level: 'warn', text: `⏳ 等待服务器对时...` };
@@ -1289,7 +1313,7 @@
       return;
     }
     buildUI();
-    log('✅ 会议室自动抢订 v0.5.0 已加载');
+    log('✅ 会议室自动抢订 v0.6.0 已加载');
     log(`📋 已配置 ${CONFIG.bookings.length} 个任务 / ${CONFIG.rooms.length} 个房间`);
 
     setTimeout(() => {
@@ -1309,3 +1333,4 @@
     init();
   }
 })();
+
