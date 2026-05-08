@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         会议室自动抢订
 // @namespace    meetingroom-autobook
-// @version      0.5.0
+// @version      0.6.0
 // @description  在系统开放预订时刻自动抢订会议室。带并发限制的工作队列 / 提前连续重试 / 精确对时 / GUI 配置 / 固定高度浮窗。
 // @author       Lucas
 // @match        https://inner.welink.huawei.com/meetingroom/*
