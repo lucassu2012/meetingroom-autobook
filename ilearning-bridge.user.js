@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.5.5
+// @version      0.5.6
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.5.6 - iLearning 浮窗渲染 markdown(粗体/列表/嵌套), 不再是 raw 文本
 // v0.5.5 - 抓取保留格式(块元素换行 + markdown加粗) + 导出从JSON改为CSV(Excel友好,UTF-8 BOM)
 // v0.5.4 - 🔑 用 NotebookLM 完成标记(thumb_up出现)作主判定 + 强化 user message 容器查找(要全部选项) + 提交后强制最小等待
 // v0.5.3 - 修复 user message 容器识别(原版漏排除选项兄弟元素); 加导出题库 JSON
@@ -415,6 +416,26 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       .ilh-log-debug   { color: #b0bec5; opacity: 0.7; }
       .ilh-log-time    { opacity: 0.4; margin-right: 6px; }
 
+      .ilh-explain-content .ilh-md-line {
+        margin-bottom: 6px;
+      }
+      .ilh-explain-content ul.ilh-md-list {
+        margin: 4px 0 6px 0;
+        padding-left: 20px;
+        list-style: disc;
+      }
+      .ilh-explain-content ul.ilh-md-list ul.ilh-md-list {
+        list-style: circle;
+      }
+      .ilh-explain-content li {
+        margin-bottom: 4px;
+        line-height: 1.55;
+      }
+      .ilh-explain-content strong {
+        color: #fff;
+        font-weight: 600;
+      }
+      .ilh-explain-content em { font-style: italic; }
       #ilh-empty {
         padding: 32px 14px; text-align: center;
         opacity: 0.55; font-size: 12px; line-height: 1.7;
@@ -424,6 +445,61 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         display: block; margin-top: 6px;
       }
     `);
+
+    // === Markdown 渲染 (v0.5.6) ===
+    function renderMarkdown(md) {
+      if (!md) return '';
+      let html = escapeHtml(md);
+      // 加粗 **text** -> <strong>
+      html = html.replace(/\*\*([^*\n]+?)\*\*/g, '<strong>$1</strong>');
+      // 行级处理: 列表 vs 普通行 (支持嵌套缩进)
+      const lines = html.split('\n');
+      const out = [];
+      const listStack = []; // 记录每层 list 的缩进
+      function closeListsTo(targetIndent) {
+        while (listStack.length > 0 && listStack[listStack.length - 1] >= targetIndent) {
+          if (listStack[listStack.length - 1] > targetIndent || targetIndent === -1) {
+            out.push('</ul>');
+            listStack.pop();
+          } else break;
+        }
+      }
+      for (const rawLine of lines) {
+        const indentMatch = rawLine.match(/^( *)/);
+        const indent = indentMatch ? indentMatch[0].length : 0;
+        const trimmed = rawLine.trim();
+        const bulletMatch = trimmed.match(/^[-*•]\s+(.+)/) || trimmed.match(/^\d+\.\s+(.+)/);
+        if (bulletMatch) {
+          // 关闭比当前缩进深的 list
+          while (listStack.length > 0 && listStack[listStack.length - 1] > indent) {
+            out.push('</ul>');
+            listStack.pop();
+          }
+          // 开新层级 list
+          if (listStack.length === 0 || listStack[listStack.length - 1] < indent) {
+            out.push('<ul class="ilh-md-list">');
+            listStack.push(indent);
+          }
+          out.push('<li>' + bulletMatch[1] + '</li>');
+        } else {
+          // 关闭所有 list
+          while (listStack.length > 0) {
+            out.push('</ul>');
+            listStack.pop();
+          }
+          if (trimmed === '') {
+            // 空行: 段落分隔, 不输出标签
+          } else {
+            out.push('<div class="ilh-md-line">' + trimmed + '</div>');
+          }
+        }
+      }
+      while (listStack.length > 0) {
+        out.push('</ul>');
+        listStack.pop();
+      }
+      return out.join('\n');
+    }
 
     // === LOG ===
     function log(msg, type = 'info') {
@@ -669,7 +745,12 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       if (!wrap) return;
       wrap.style.display = 'block';
       contentEl.className = 'ilh-explain-content ' + (state || '');
-      contentEl.textContent = content;
+      // v0.5.6: 成功状态用 markdown 渲染, 等待/错误状态保持纯文本
+      if ((state === '' || !state) && content) {
+        setSafeHTML(contentEl, renderMarkdown(content));
+      } else {
+        contentEl.textContent = content;
+      }
       statusEl.textContent = statusText;
     }
 
