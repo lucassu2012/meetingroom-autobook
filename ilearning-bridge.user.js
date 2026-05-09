@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.6.2
+// @version      0.7.0
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,8 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.7.0 - 抓取算法完全重写: 抛弃 snapshot diff, 改用真实 NotebookLM DOM 选择器 (chat-message-pair + element-list-renderer)
+//          单题独立锁定, 彻底消除跨题串扰
 // v0.6.2 - 修跨题串扰: user message 排除改为实时检查 + 加 DOM 顺序检查(只看 user message 之后元素), 避免抓到前题的 AI response
 // v0.6.1 - 修题型识别(多选题被识别成单选题) + 修批次大小输入框被切题箭头键误触发
 // v0.6.0 - Stage 3.5 阶段A: iLearning 端批量预取面板(进度+未识别题号+批次大小可配置). 阶段B(NotebookLM真批处理)分别实现
@@ -1659,93 +1661,116 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       return map;
     }
 
-    function findGrowingResponseElement(snapshot, questionText, userMsgEl) {
-      const candidates = [];
-      document.querySelectorAll('div, p, article, section, main, span').forEach((el) => {
-        if (el.closest('#nlh-panel')) return;
+    /**
+     * v0.7.0: 用真实 NotebookLM DOM 直接定位当前题的 AI 响应
+     * 结构: div.chat-message-pair > [from-user-container, to-user-container]
+     * 取最后一对 → 验证是当前题 → 抓 element-list-renderer
+     */
+    function findCurrentAIResponse(req) {
+      const pairs = document.querySelectorAll('div.chat-message-pair');
+      if (pairs.length === 0) return { status: 'no-pair' };
 
-        // v0.6.2: 三重排除策略 (实时检查, 不受 streaming 影响)
-        if (userMsgEl) {
-          // ① user message 自己 + 所有后代
-          if (userMsgEl === el || userMsgEl.contains(el)) return;
-          // ② user message 的祖先 (textContent 包含 user msg, 不算干净 AI response)
-          if (el.contains(userMsgEl)) return;
-          // ③ DOM 顺序在 user message 之前的元素 (前题 AI response, sidebar, etc)
-          const pos = userMsgEl.compareDocumentPosition(el);
-          if (!(pos & Node.DOCUMENT_POSITION_FOLLOWING)) return;
-        }
+      // 取最后一对 (最新的问答)
+      const lastPair = pairs[pairs.length - 1];
 
-        const newLen = el.textContent.length;
-        const oldLen = snapshot.get(el) || 0;
-        const growth = newLen - oldLen;
-        if (growth < CONFIG.minResponseChars) return;
-        const text = el.textContent;
-        if (questionText && text.includes(questionText.substring(0, Math.min(40, questionText.length)))) {
-          if (growth < questionText.length + CONFIG.minResponseChars) return;
+      // 验证 user message 是当前题 (用题干前 30 字做指纹)
+      const userMsg = lastPair.querySelector('div.from-user-container div.md3-body-text');
+      if (!userMsg) return { status: 'no-user-msg' };
+
+      const userText = (userMsg.textContent || '').replace(/\s+/g, ' ');
+      const stemFp = (req.stem || '').substring(0, 30).replace(/\s+/g, ' ').trim();
+      if (stemFp.length >= 10 && !userText.includes(stemFp)) {
+        return { status: 'wrong-pair', userTextPreview: userText.substring(0, 50) };
+      }
+
+      // 找 AI 响应正文容器 (干净, 只含 AI 生成内容)
+      const aiEl = lastPair.querySelector('div.to-user-container element-list-renderer');
+      if (!aiEl) return { status: 'no-ai-yet' };
+
+      // 完成检测: 这一对的 mat-card-actions 是否有 thumb_up button
+      // (流式中 mat-card-actions 不存在或子元素未填充, 完成后才出现完整 actions)
+      let complete = false;
+      const actions = lastPair.querySelector('div.to-user-container mat-card-actions');
+      if (actions) {
+        const icons = actions.querySelectorAll('mat-icon');
+        for (const icon of icons) {
+          if (icon.textContent.trim() === 'thumb_up') {
+            complete = true;
+            break;
+          }
         }
-        let depth = 0;
-        let p = el;
-        while (p && p !== document.body) { depth++; p = p.parentElement; }
-        candidates.push({ el, growth, depth });
-      });
-      if (candidates.length === 0) return null;
-      candidates.sort((a, b) => (b.depth - a.depth) || (b.growth - a.growth));
-      return candidates[0].el;
+      }
+
+      return { status: 'ok', el: aiEl, complete };
     }
 
-    async function waitForResponse(snapshot, questionText, userMsgEl) {
+    async function waitForResponse(req) {
       const startTs = Date.now();
+      let lastEl = null;
       let lastLen = 0;
-      let lastChangeTs = Date.now();
-      let responseEl = null;
-      // v0.5.4: 用完成标记数量作主判定
-      const markersBefore = countCompletedResponses();
-      log(`  └ 提交前完成标记数: ${markersBefore}`, 'debug');
-      let markerIncreasedAt = null;
+      let lastChangeTs = startTs;
+      let completedAt = null;
+      let lastStatus = null;
+      let okStartedAt = null;
 
       while (Date.now() - startTs < CONFIG.maxResponseWaitMs) {
         await sleep(CONFIG.pollIntervalMs);
         const elapsed = Date.now() - startTs;
 
-        // 跟踪增长(用于抓内容)
-        const currentEl = findGrowingResponseElement(snapshot, questionText, userMsgEl);
-        if (currentEl) {
-          responseEl = currentEl;
-          const currentLen = currentEl.textContent.length;
-          if (currentLen > lastLen) {
-            lastLen = currentLen;
-            lastChangeTs = Date.now();
+        const result = findCurrentAIResponse(req);
+
+        // 状态变化 → log 一次
+        if (result.status !== lastStatus) {
+          if (result.status === 'wrong-pair') {
+            log(`  └ 状态: 最后一对不是本题 (text=${result.userTextPreview}...)`, 'debug');
+          } else if (result.status === 'ok' && lastStatus !== 'ok') {
+            log(`  └ 状态: 锁定本题 AI 响应区, 开始监听增长`, 'debug');
+            okStartedAt = Date.now();
+          } else {
+            log(`  └ 状态: ${result.status}`, 'debug');
           }
+          lastStatus = result.status;
         }
 
-        // 主判定: thumb_up 等完成标记出现 = 这道题真的完成了
-        const markersNow = countCompletedResponses();
-        if (markersNow > markersBefore) {
-          if (markerIncreasedAt === null) {
-            markerIncreasedAt = Date.now();
-            log(`  ✅ 检测到完成标记 ${markersBefore}→${markersNow} (开始 1.5s 收尾)`, 'success');
+        if (result.status !== 'ok') continue;
+
+        lastEl = result.el;
+        const currentLen = lastEl.textContent.length;
+        if (currentLen > lastLen) {
+          lastLen = currentLen;
+          lastChangeTs = Date.now();
+        }
+
+        // 主判定: 完成标记 (mat-card-actions thumb_up 出现)
+        if (result.complete && lastLen >= CONFIG.minResponseChars) {
+          if (completedAt === null) {
+            completedAt = Date.now();
+            log(`  ✅ 检测到完成标记 (thumb_up), 收尾 1.5s`, 'success');
           }
-          // 标记出现后再多等 1.5s, 让最后一段 streaming 落地
-          if (Date.now() - markerIncreasedAt > 1500) {
-            // 最后再抓一次确保拿到完整内容
-            const finalEl = findGrowingResponseElement(snapshot, questionText, userMsgEl);
-            if (finalEl) responseEl = finalEl;
-            const finalText = responseEl ? extractFormattedText(responseEl) : null;
-            log(`  ✅ 完成标记稳定, 抓取最终响应 (${finalText ? finalText.length : 0} 字符, 含格式)`, 'success');
-            return finalText;
+          if (Date.now() - completedAt > 1500) {
+            // 收尾再抓一次, 拿最完整内容
+            const finalResult = findCurrentAIResponse(req);
+            const finalEl = (finalResult.status === 'ok' && finalResult.el) ? finalResult.el : lastEl;
+            const text = extractFormattedText(finalEl);
+            log(`  ✅ 抓取最终响应 (${text ? text.length : 0} 字符, 含格式)`, 'success');
+            return text;
           }
           continue;
         }
 
-        // 兜底: 静默检测 (但要过了 minInitialWait, 防止 NotebookLM 还没开始生成被误判)
-        if (elapsed < CONFIG.minInitialWaitMs) continue;
-        if (lastLen > CONFIG.minResponseChars && (Date.now() - lastChangeTs) > CONFIG.silenceTimeoutMs) {
-          log(`  ⚠️ 没等到完成标记, 静默 ${Math.round(CONFIG.silenceTimeoutMs/1000)}s 强制返回 (可能不可靠)`, 'warn');
-          return responseEl ? extractFormattedText(responseEl) : null;
+        // 兜底: 静默检测 (lastEl 已锁定本题且 minInitialWait 已过)
+        const okElapsed = okStartedAt ? Date.now() - okStartedAt : 0;
+        if (okElapsed > CONFIG.minInitialWaitMs && lastLen >= CONFIG.minResponseChars) {
+          const silenceMs = Date.now() - lastChangeTs;
+          if (silenceMs > CONFIG.silenceTimeoutMs) {
+            log(`  ⚠️ 没等到完成标记, 静默 ${Math.round(silenceMs/1000)}s 强制返回 (内容已稳定)`, 'warn');
+            return extractFormattedText(lastEl);
+          }
         }
       }
+
       log(`  ⏱️ 达到最长等待时间 ${Math.round(CONFIG.maxResponseWaitMs/1000)}s`, 'warn');
-      return responseEl ? extractFormattedText(responseEl) : null;
+      return lastEl ? extractFormattedText(lastEl) : null;
     }
 
     // === 处理一道题 ===
@@ -1771,10 +1796,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         await setInputValue(inputEl, text);
         await sleep(CONFIG.submitWaitMs);
 
-        // 3. 拍快照
-        const snapshot = snapshotPageText();
-
-        // 4. 提交
+        // 3. 提交 (v0.7.0: 不再需要 snapshot, 用 chat-message-pair 锁定本题)
         const method = await submitMessage(inputEl);
         if (!method) {
           log('❌ 提交失败', 'error');
@@ -1783,16 +1805,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         }
         await sleep(CONFIG.responseInitialDelayMs);
 
-        // 4.5. v0.6.2: 识别 user message 容器, 用实时检查排除而非预建 Set (避免 streaming 中新加的子元素逃逸)
-        const userMsgEl = findUserMessageContainer(req);
-        if (userMsgEl) {
-          log(`  └ user message 容器: ${describeEl(userMsgEl)}`, 'debug');
-        } else {
-          log('  ⚠️ 未识别到 user message 容器, 退回旧过滤', 'warn');
-        }
-
-        // 5. 等响应 (传 userMsgEl, findGrowingResponseElement 实时排除其子树/祖先/前置元素)
-        const responseText = await waitForResponse(snapshot, text, userMsgEl);
+        // 4. 等响应 (v0.7.0: 直接用真实 DOM 选择器锁定本题 AI 响应)
+        const responseText = await waitForResponse(req);
         if (!responseText || responseText.length < CONFIG.minResponseChars) {
           log(`❌ 响应过短 (${responseText?.length || 0} 字符)`, 'error');
           Bridge.writeResponse(req.id, responseText || '', 'error', '响应过短或未抓到');
