@@ -1,20 +1,29 @@
 // ==UserScript==
 // @name         iLearning 学习助手 - NotebookLM 端 (Stage 2)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.1.0
+// @version      0.1.1
 // @description  在 NotebookLM 上自动化输入题目、提交、抓取解析(Stage 2: 不连 iLearning, 手动测试)
 // @author       Lucas
-// @match        https://notebooklm.google.com/notebook/*
+// @match        https://notebooklm.google.com/*
 // @grant        GM_addStyle
 // @grant        GM_setValue
 // @grant        GM_getValue
-// @run-at       document-end
+// @run-at       document-idle
 // @updateURL    https://raw.githubusercontent.com/lucassu2012/meetingroom-autobook/main/notebooklm-helper.js
 // @downloadURL  https://raw.githubusercontent.com/lucassu2012/meetingroom-autobook/main/notebooklm-helper.js
 // ==/UserScript==
 
 // CHANGELOG
-// v0.1.0 - Stage 2 初版: 自动输入/提交/等待/抓取响应
+// v0.1.1 - 拓宽 @match (整个 notebooklm.google.com); @run-at 改为 document-idle (SPA 友好); 加入顶层无条件诊断日志
+// v0.1.0 - Stage 2 初版
+
+// 🔔 顶层诊断日志: 不在任何函数/IIFE 内, 一定会打印
+// 如果在 Console 看不到这些, 说明脚本根本没注入
+console.log('[NLH-DIAG] 🔔 脚本文件已加载');
+console.log('[NLH-DIAG] location.href =', location.href);
+console.log('[NLH-DIAG] location.pathname =', location.pathname);
+console.log('[NLH-DIAG] document.readyState =', document.readyState);
+console.log('[NLH-DIAG] GM_addStyle 类型 =', typeof GM_addStyle);
 
 (function () {
   'use strict';
@@ -678,15 +687,46 @@
      🚀  INIT
      ═══════════════════════════════════════════════════════════ */
   function init() {
+    console.log('[NLH-DIAG] init() 被调用, document.body =', !!document.body);
     if (!document.body) { setTimeout(init, 100); return; }
+
+    // 路径校验: 只在笔记本页激活
     if (!location.pathname.startsWith('/notebook/')) {
-      console.log('[NLH] 当前不是笔记本页, 不激活');
+      console.log(`[NLH-DIAG] 不是笔记本页 (${location.pathname}), 浮窗不激活`);
+      // 监听路由变化, 跳到 /notebook/ 时再激活
+      watchForNotebookEntry();
       return;
     }
-    buildPanel();
-    log(`✅ NotebookLM 助手 v${VERSION} 已加载`, 'success');
-    log(`🎯 当前阶段: ${STAGE_LABEL} (手动喂题测试)`, 'info');
-    log('💡 操作步骤: 1) 粘一道完整题目  2) 点"测试问答"  3) 等 10-30 秒抓取', 'info');
+
+    try {
+      buildPanel();
+      log(`✅ NotebookLM 助手 v${VERSION} 已加载`, 'success');
+      log(`🎯 当前阶段: ${STAGE_LABEL} (手动喂题测试)`, 'info');
+      log('💡 操作步骤: 1) 粘一道完整题目  2) 点"测试问答"  3) 等 10-30 秒抓取', 'info');
+      console.log('[NLH-DIAG] ✅ 浮窗已挂载到 body');
+    } catch (e) {
+      console.error('[NLH-DIAG] ❌ 浮窗构建失败:', e);
+    }
+  }
+
+  /** 路由变化监听: 从笔记本列表页进笔记本时不刷新页面 */
+  function watchForNotebookEntry() {
+    let lastPath = location.pathname;
+    const tryActivate = () => {
+      if (location.pathname !== lastPath) {
+        lastPath = location.pathname;
+        if (location.pathname.startsWith('/notebook/') && !document.getElementById('nlh-panel')) {
+          console.log('[NLH-DIAG] 🔀 进入笔记本, 激活浮窗');
+          init();
+        }
+      }
+    };
+    ['pushState', 'replaceState'].forEach((m) => {
+      const orig = history[m];
+      history[m] = function () { orig.apply(this, arguments); tryActivate(); };
+    });
+    window.addEventListener('popstate', tryActivate);
+    setInterval(tryActivate, 1500);
   }
 
   if (document.readyState === 'loading') {
