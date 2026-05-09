@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         会议室自动抢订
+// @name         会议室自动抢订-v12
 // @namespace    meetingroom-autobook
 // @version      0.12.0
 // @description  在系统开放预订时刻自动抢订会议室。带并发限制的工作队列 / 提前连续重试 / 精确对时 / Apple 风格界面 / GUI 配置
