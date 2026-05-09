@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.8.0
+// @version      0.8.1
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.8.1 - UI 紧凑化: ① overview grid 暗色化 ② 删冗余信息 (题目识别状态行/已识别计数/全部识别完成) ③ 批处理控件合并为单行 ④ 题目区扩大
 // v0.8.0 - UX 大改进: ① 加状态灯系统 (sidebar dots + 浮窗 overview grid) ② 修复重复提交 ③ 任意题后台完成后自动通知 + 当前题自动刷新解析
 // v0.7.0 - 抓取算法完全重写: 抛弃 snapshot diff, 改用真实 NotebookLM DOM 选择器 (chat-message-pair + element-list-renderer)
 //          单题独立锁定, 彻底消除跨题串扰
@@ -439,48 +440,34 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     }
 
     function updateBatchPanel() {
-      const idCount = document.getElementById('ilh-batch-id-count');
-      const totalEl = document.getElementById('ilh-batch-total');
-      const missingEl = document.getElementById('ilh-batch-missing-list');
-      const statusEl = document.getElementById('ilh-batch-status-text');
+      // v0.8.1: 大幅简化 - 状态只通过 button disabled + grid 颜色表达, 不再渲染文字
       const startBtn = document.getElementById('ilh-batch-start');
       const panelEl = document.getElementById('ilh-batch-panel');
-      if (!idCount) return;
+      if (!startBtn || !panelEl) return;
 
-      idCount.textContent = batchState.identifiedPositions.size;
-      totalEl.textContent = batchState.totalQuestions || '?';
       panelEl.classList.toggle('disabled', !batchState.enabled);
 
       if (!batchState.enabled) {
-        statusEl.textContent = '已关闭, 单题模式';
-        statusEl.className = '';
+        startBtn.disabled = true;
+        startBtn.title = '已关闭批量预取';
         return;
       }
 
       if (batchState.totalQuestions > 0) {
         const missing = getMissingPositions();
-        missingEl.textContent = missing.length > 0
-          ? `未识别: ${compactRanges(new Set(missing))}`
-          : '✅ 全部识别完成';
-
         if (batchState.batchStarted) {
-          statusEl.textContent = '🚀 批处理已启动 (阶段A仅模拟)';
-          statusEl.className = 'running';
           startBtn.disabled = true;
+          startBtn.title = '批处理运行中';
         } else if (missing.length === 0) {
-          statusEl.textContent = '✅ 全部识别完成, 可启动批处理';
-          statusEl.className = 'ready';
           startBtn.disabled = false;
+          startBtn.title = '全部题已识别, 点击启动批处理';
         } else {
-          statusEl.textContent = `⏸ 还需识别 ${missing.length} 题`;
-          statusEl.className = '';
           startBtn.disabled = true;
+          startBtn.title = `还需识别 ${missing.length} 题: ${compactRanges(new Set(missing))}`;
         }
       } else {
-        missingEl.textContent = '未识别: 等待第一题识别后获取总数';
-        statusEl.textContent = '⏸ 等待第一题识别';
-        statusEl.className = '';
         startBtn.disabled = true;
+        startBtn.title = '等待第一题识别';
       }
     }
 
@@ -502,7 +489,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       #ilh-panel {
         position: fixed; bottom: 24px; right: 24px;
         width: ${CONFIG.panelWidth}px;
-        max-height: ${CONFIG.panelMaxHeight}px;
+        max-height: min(${CONFIG.panelMaxHeight}px, calc(100vh - 48px));
         background: linear-gradient(135deg, #1a1d2e 0%, #232842 100%);
         color: #e8eaf6;
         font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -516,21 +503,24 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       }
       #ilh-panel.collapsed { max-height: 44px; }
 
-      /* v0.8.0: overview grid */
+      /* v0.8.1: overview grid - 暗色系, 与浮窗一致 */
       #ilh-overview-grid {
-        background: #fafbfc;
-        border: 1px solid #e8eaed;
-        border-radius: 8px;
-        padding: 8px 10px;
-        margin: 8px 12px 4px 12px;
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.06);
+        border-radius: 6px;
+        padding: 7px 10px 9px;
+        margin: 8px 12px 0;
         font-size: 11px;
       }
       .ilh-overview-header {
         display: flex; justify-content: space-between; align-items: center;
-        margin-bottom: 6px; color: #5f6368; font-weight: 500;
+        margin-bottom: 6px;
+        color: #b0bec5;
+        font-weight: 500;
+        font-size: 11px;
       }
-      .ilh-overview-legend { font-size: 10px; color: #80868b; }
-      .ilh-overview-legend span { margin-right: 8px; }
+      .ilh-overview-legend { font-size: 9.5px; color: #78909c; }
+      .ilh-overview-legend span { margin-right: 7px; }
       .ilh-overview-legend i {
         display: inline-block; width: 7px; height: 7px; border-radius: 50%;
         margin-right: 3px; vertical-align: middle;
@@ -546,20 +536,20 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         justify-content: center;
         height: 18px;
         border-radius: 3px;
-        background: #9ca3af;
-        color: white;
+        background: #4a5568;
+        color: rgba(255,255,255,0.85);
         font-size: 9px;
         font-weight: 600;
         cursor: pointer;
-        transition: background 0.3s, transform 0.15s;
+        transition: background 0.3s, transform 0.15s, box-shadow 0.15s;
         user-select: none;
       }
-      .ilh-grid-dot:hover { transform: scale(1.15); box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
-      .ilh-grid-dot.pending { animation: ilh-pulse 1.2s ease-in-out infinite; }
-      @keyframes ilh-pulse {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.55; }
+      .ilh-grid-dot:hover {
+        transform: scale(1.18);
+        box-shadow: 0 2px 6px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.18);
+        z-index: 2;
       }
+      .ilh-grid-dot.pending { animation: ilh-pulse 1.2s ease-in-out infinite; }
       #ilh-header {
         padding: 11px 14px;
         background: rgba(0,0,0,0.28);
@@ -593,100 +583,61 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       }
       .ilh-toggle:hover { opacity: 1; }
 
+      /* v0.8.1: batch-panel 单行紧凑布局 */
       #ilh-batch-panel {
-        padding: 9px 14px 10px;
+        padding: 8px 12px;
         border-bottom: 1px solid rgba(255,255,255,0.06);
         background: rgba(33,150,243,0.04);
         font-size: 11px;
-      }
-      .ilh-batch-header {
-        display: flex; justify-content: space-between; align-items: center;
-        margin-bottom: 6px;
-        font-weight: 600; font-size: 12px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
       }
       .ilh-batch-toggle {
         display: flex; align-items: center; gap: 5px;
         cursor: pointer;
-        font-size: 11px; opacity: 0.9;
-        font-weight: normal;
+        font-weight: 500;
+        opacity: 0.9;
+        white-space: nowrap;
       }
       .ilh-batch-toggle input[type="checkbox"] {
         cursor: pointer;
       }
       .ilh-batch-config {
-        margin-bottom: 5px;
-        display: flex; align-items: center; gap: 6px;
+        display: flex; align-items: center; gap: 5px;
         opacity: 0.9;
+        white-space: nowrap;
       }
       .ilh-batch-config input {
-        width: 48px; padding: 2px 4px;
-        background: rgba(0,0,0,0.25);
+        width: 44px; padding: 2px 4px;
+        background: rgba(0,0,0,0.28);
         color: #e8eaf6;
         border: 1px solid rgba(255,255,255,0.15);
         border-radius: 3px;
         font-size: 11px;
         text-align: center;
       }
-      .ilh-batch-progress {
-        margin-bottom: 4px;
-        opacity: 0.85;
-      }
-      .ilh-batch-progress .ilh-batch-num {
-        font-weight: 600;
-        color: #64b5f6;
-      }
-      .ilh-batch-missing {
-        margin-bottom: 6px;
-        opacity: 0.7;
-        font-family: "SF Mono", Monaco, Consolas, monospace;
-        font-size: 10px;
-        word-break: break-all;
-        max-height: 36px;
-        overflow-y: auto;
-      }
-      .ilh-batch-status-row {
-        display: flex; justify-content: space-between; align-items: center;
-        gap: 6px;
-        margin-top: 6px;
-        padding-top: 6px;
-        border-top: 1px solid rgba(255,255,255,0.05);
-      }
-      #ilh-batch-status-text {
-        flex: 1; font-size: 11px;
-      }
-      #ilh-batch-status-text.ready { color: #81c784; font-weight: 600; }
-      #ilh-batch-status-text.running { color: #64b5f6; font-weight: 600; }
       #ilh-batch-start {
-        font-size: 10px; padding: 4px 9px;
+        margin-left: auto;
+        font-size: 10.5px;
+        padding: 4px 10px;
+        white-space: nowrap;
       }
       #ilh-batch-start:disabled {
-        opacity: 0.35; cursor: not-allowed;
+        opacity: 0.32; cursor: not-allowed;
       }
       #ilh-batch-panel.disabled {
-        opacity: 0.45;
+        opacity: 0.5;
       }
       #ilh-batch-panel.disabled .ilh-batch-config,
-      #ilh-batch-panel.disabled .ilh-batch-progress,
-      #ilh-batch-panel.disabled .ilh-batch-missing,
-      #ilh-batch-panel.disabled .ilh-batch-status-row {
-        display: none;
+      #ilh-batch-panel.disabled #ilh-batch-start {
+        opacity: 0.5;
       }
-
-      #ilh-status {
-        padding: 11px 14px;
-        font-weight: 500;
-        border-left: 3px solid #4caf50;
-        background: rgba(76,175,80,0.08);
-      }
-      #ilh-status.error { border-left-color: #f44336; background: rgba(244,67,54,0.08); }
-      #ilh-status.idle  { border-left-color: #666;    background: rgba(255,255,255,0.03); opacity: 0.75; }
-      #ilh-status.warn  { border-left-color: #ff9800; background: rgba(255,152,0,0.08); }
-      #ilh-status.busy  { border-left-color: #2196f3; background: rgba(33,150,243,0.08); }
 
       #ilh-question {
         padding: 12px 14px;
         overflow-y: auto;
-        max-height: 280px;
+        max-height: 380px;  /* v0.8.1: 释放出来的空间给题目 */
       }
       .ilh-meta { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
       .ilh-pill {
@@ -1060,24 +1011,15 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           <span class="ilh-stage">${STAGE}</span>
           <span class="ilh-toggle" id="ilh-toggle-panel" title="折叠/展开">━</span>
         </div>
-        <div id="ilh-status" class="idle">⏸ 等待识别题目...</div>
         <div id="ilh-batch-panel">
-          <div class="ilh-batch-header">
-            <span>🚀 批量预取</span>
-            <label class="ilh-batch-toggle">
-              <input type="checkbox" id="ilh-batch-enabled" checked>
-              <span>开启</span>
-            </label>
-          </div>
+          <label class="ilh-batch-toggle" title="批量预取: 启用后会自动把未抓取的题目分批发给 NotebookLM">
+            <input type="checkbox" id="ilh-batch-enabled" checked>
+            <span>批量预取</span>
+          </label>
           <div class="ilh-batch-config">
-            每批: <input type="number" id="ilh-batch-size" value="20" min="1" max="50"> 题
+            每批 <input type="number" id="ilh-batch-size" value="20" min="1" max="50"> 题
           </div>
-          <div class="ilh-batch-progress">已识别: <span class="ilh-batch-num" id="ilh-batch-id-count">0</span>/<span id="ilh-batch-total">?</span></div>
-          <div class="ilh-batch-missing" id="ilh-batch-missing-list">未识别: -</div>
-          <div class="ilh-batch-status-row">
-            <span id="ilh-batch-status-text">⏸ 等待第一题识别</span>
-            <button class="ilh-mini-btn" id="ilh-batch-start" disabled>▷ 立即批处理</button>
-          </div>
+          <button class="ilh-mini-btn" id="ilh-batch-start" disabled title="所有题识别完后启用">▷ 立即批处理</button>
         </div>
         <div id="ilh-overview-grid">
           <div class="ilh-overview-header">
@@ -1216,12 +1158,11 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     }
 
     function setStatus(level, text) {
-      const sEl = document.getElementById('ilh-status');
-      if (!sEl) return;
-      sEl.className = level || '';
-      sEl.textContent = text;
+      // v0.8.1: ilh-status div 已删除, 只更新 header dot 的颜色 (题目识别状态信息会在 ilh-meta pill 里显示)
       const dot = document.querySelector('#ilh-header .ilh-dot');
       if (dot) dot.className = 'ilh-dot' + (level ? ' ' + level : '');
+      // 同时把 text 设为 dot 的 title (hover 提示)
+      if (dot && text) dot.title = text;
     }
 
     function renderQuestion(q) {
