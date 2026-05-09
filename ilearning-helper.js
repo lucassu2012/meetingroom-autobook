@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 1: DOM 抽取)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.1.2
+// @version      0.2.0
 // @description  iLearning 习题页自动识别题目,Stage 1 只验证 DOM 抽取(尚未联动 NotebookLM)
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -14,7 +14,8 @@
 // ==/UserScript==
 
 // CHANGELOG
-// v0.1.2 - 修复选项识别 (选项字母和内容跨节点); @match 精确到 examContent
+// v0.2.0 - 双保险URL过滤(@match宽 + 运行时校验,只在 examContent 激活); 加入 @updateURL/@downloadURL 支持自动升级
+// v0.1.2 - 修复选项识别(选项字母和内容跨节点)
 // v0.1.0 - Stage 1 初版
 
 (function () {
@@ -622,18 +623,57 @@
   /* ═══════════════════════════════════════════════════════════
      🚀  INIT
      ═══════════════════════════════════════════════════════════ */
+  /** 只在真正的答题页(examContent)激活, 不在 examInfo 等页面激活 */
+  function isExamContentPage() {
+    return location.pathname.includes('/examContent');
+  }
+
   function init() {
     if (!document.body) { setTimeout(init, 100); return; }
+
+    // 运行时URL校验 - 双保险, 即使 @match 把脚本注入到了 examInfo, 这里也会拦截
+    if (!isExamContentPage()) {
+      console.log(`[ILH] 当前不是答题页 (${location.pathname}), 浮窗不激活`);
+      // 仍然监听 SPA 路由变化, 一旦跳转到 examContent 就激活
+      watchForExamPageEntry();
+      return;
+    }
+
+    activatePanel();
+  }
+
+  function activatePanel() {
+    if (document.getElementById('ilh-panel')) return; // 防重复激活
 
     buildPanel();
     log(`✅ iLearning 学习助手 v${VERSION} 已加载`, 'success');
     log(`🎯 当前阶段: ${STAGE_LABEL} (仅验证 DOM 抽取)`, 'info');
     log(`🌐 ${location.pathname}${location.search}`, 'info');
 
-    // 首次抽取(等 SPA 渲染完)
     setTimeout(() => handleQuestionChange(true), 800);
-    // 启动观察器
     setupObserver();
+  }
+
+  /** 监听 SPA 路由变化: 用户从 examInfo 点"开始答题"跳到 examContent 时不刷新页面也能激活 */
+  function watchForExamPageEntry() {
+    let lastPath = location.pathname;
+    const tryActivate = () => {
+      if (location.pathname !== lastPath) {
+        lastPath = location.pathname;
+        if (isExamContentPage()) {
+          console.log('[ILH] 检测到进入答题页, 激活浮窗');
+          activatePanel();
+        }
+      }
+    };
+    // 拦截 history API
+    ['pushState', 'replaceState'].forEach((m) => {
+      const orig = history[m];
+      history[m] = function () { orig.apply(this, arguments); tryActivate(); };
+    });
+    window.addEventListener('popstate', tryActivate);
+    // 兜底: 1.5 秒轮询一次(防 SPA 用了非标准的路由方式)
+    setInterval(tryActivate, 1500);
   }
 
   if (document.readyState === 'loading') {
