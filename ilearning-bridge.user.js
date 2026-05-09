@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.5.6
+// @version      0.5.7
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.5.7 - markdown 渲染段落紧凑化(去掉换行符夹层 + margin 归零)
 // v0.5.6 - iLearning 浮窗渲染 markdown(粗体/列表/嵌套), 不再是 raw 文本
 // v0.5.5 - 抓取保留格式(块元素换行 + markdown加粗) + 导出从JSON改为CSV(Excel友好,UTF-8 BOM)
 // v0.5.4 - 🔑 用 NotebookLM 完成标记(thumb_up出现)作主判定 + 强化 user message 容器查找(要全部选项) + 提交后强制最小等待
@@ -417,19 +418,25 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       .ilh-log-time    { opacity: 0.4; margin-right: 6px; }
 
       .ilh-explain-content .ilh-md-line {
-        margin-bottom: 6px;
+        margin: 0;
+        padding: 0;
+        line-height: 1.6;
       }
       .ilh-explain-content ul.ilh-md-list {
-        margin: 4px 0 6px 0;
+        margin: 3px 0;
         padding-left: 20px;
         list-style: disc;
       }
       .ilh-explain-content ul.ilh-md-list ul.ilh-md-list {
         list-style: circle;
+        margin: 0;
       }
       .ilh-explain-content li {
-        margin-bottom: 4px;
+        margin: 0;
         line-height: 1.55;
+      }
+      .ilh-explain-content.md-rendered {
+        white-space: normal;
       }
       .ilh-explain-content strong {
         color: #fff;
@@ -498,7 +505,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         out.push('</ul>');
         listStack.pop();
       }
-      return out.join('\n');
+      // v0.5.7: 不用 '\n' 连接, 避免 white-space:pre-wrap 把它显示成额外换行
+      return out.join('');
     }
 
     // === LOG ===
@@ -747,8 +755,10 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       contentEl.className = 'ilh-explain-content ' + (state || '');
       // v0.5.6: 成功状态用 markdown 渲染, 等待/错误状态保持纯文本
       if ((state === '' || !state) && content) {
+        contentEl.classList.add('md-rendered');
         setSafeHTML(contentEl, renderMarkdown(content));
       } else {
+        contentEl.classList.remove('md-rendered');
         contentEl.textContent = content;
       }
       statusEl.textContent = statusText;
