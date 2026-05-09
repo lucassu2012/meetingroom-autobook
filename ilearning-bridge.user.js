@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.7.0
+// @version      0.8.0
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.8.0 - UX 大改进: ① 加状态灯系统 (sidebar dots + 浮窗 overview grid) ② 修复重复提交 ③ 任意题后台完成后自动通知 + 当前题自动刷新解析
 // v0.7.0 - 抓取算法完全重写: 抛弃 snapshot diff, 改用真实 NotebookLM DOM 选择器 (chat-message-pair + element-list-renderer)
 //          单题独立锁定, 彻底消除跨题串扰
 // v0.6.2 - 修跨题串扰: user message 排除改为实时检查 + 加 DOM 顺序检查(只看 user message 之后元素), 避免抓到前题的 AI response
@@ -83,6 +84,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     KEY_RESP: (id) => `ilh:response:${id}`,
     KEY_QUEUE: 'ilh:queue',
     KEY_STATUS: 'ilh:nlm_status', // NotebookLM 端用来报告自己活着
+    KEY_NOTIFY: 'ilh:notify',     // v0.8.0: 全局通知 (任何题状态变化都写这里, iLearning 端用一个 listener 监听全部题)
 
     /** iLearning 端: 发 request, 如已有缓存 response 则直接返回 */
     sendRequest(question) {
@@ -99,6 +101,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         queue.push(question.id);
         GM_setValue(this.KEY_QUEUE, queue);
       }
+      // v0.8.0: 发出请求时也通知 (让 dot 立刻变黄 = pending)
+      GM_setValue(this.KEY_NOTIFY, { qId: question.id, status: 'pending', ts: Date.now() });
       return null;
     },
 
@@ -161,6 +165,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       });
       const queue = GM_getValue(this.KEY_QUEUE, []);
       GM_setValue(this.KEY_QUEUE, queue.filter((id) => id !== qId));
+      // v0.8.0: 写全局通知 (iLearning 端会立即更新 status dot 和当前题显示)
+      GM_setValue(this.KEY_NOTIFY, { qId, status, ts: Date.now() });
     },
 
     /** NotebookLM 端: 报告心跳(我活着) */
@@ -245,12 +251,156 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       nlmCheckIntervalMs: 5000, // 每 5s 检查 NotebookLM 心跳
     };
 
+    /* ───── v0.8.0: 状态灯系统 ───── */
+    const StatusDot = {
+      // 单题状态推断
+      getStatus(qId) {
+        if (!qId) return 'idle';
+        const resp = GM_getValue(`ilh:response:${qId}`, null);
+        if (resp && resp.status === 'done') return 'ready';
+        if (resp && resp.status === 'error') return 'error';
+        const req = GM_getValue(`ilh:request:${qId}`, null);
+        if (req) return 'pending';
+        return 'idle';
+      },
+      colorFor(s) {
+        return ({ ready: '#22c55e', pending: '#eab308', error: '#ef4444', idle: '#9ca3af' })[s] || '#9ca3af';
+      },
+      labelFor(s) {
+        return ({ ready: '✅ 解析已就绪 · 点开秒回', pending: '⏳ 获取中...', error: '❌ 获取失败 · 可重试', idle: '⚫ 未开始' })[s] || s;
+      },
+
+      // 找 iLearning sidebar 里的题项 (用 "第N题" 文本定位, 排除浮窗)
+      findSidebarItems() {
+        const items = new Map(); // pos -> element
+        const RE = /^第\s*(\d+)\s*题\s*(?:[（(]\s*\d+\s*分\s*[)）])?\s*$/;
+        document.querySelectorAll('div, span, li, a').forEach((el) => {
+          if (el.closest('#ilh-panel')) return;
+          if (el.children.length > 5) return;
+          const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+          if (t.length > 30) return;
+          const m = t.match(RE);
+          if (m) {
+            const pos = parseInt(m[1], 10);
+            if (Number.isInteger(pos) && pos >= 1 && pos <= 200) {
+              // 取最直接的容器 (子元素少 = 离文本最近)
+              const existing = items.get(pos);
+              if (!existing || el.children.length < existing.children.length) {
+                items.set(pos, el);
+              }
+            }
+          }
+        });
+        return items;
+      },
+
+      // 注入 sidebar dots
+      injectSidebarDots() {
+        const items = this.findSidebarItems();
+        let injected = 0;
+        items.forEach((el, pos) => {
+          if (el.querySelector('.ilh-sidebar-dot')) return;
+          const dot = document.createElement('span');
+          dot.className = 'ilh-sidebar-dot';
+          dot.dataset.pos = String(pos);
+          dot.style.cssText = 'display:inline-block;width:9px;height:9px;border-radius:50%;margin-left:8px;background:#9ca3af;flex-shrink:0;box-shadow:0 0 0 1px rgba(0,0,0,0.06);transition:background 0.3s,transform 0.2s;vertical-align:middle;';
+          dot.title = '⚫ 未开始';
+          el.appendChild(dot);
+          injected++;
+        });
+        return injected;
+      },
+
+      // 浮窗 overview grid - 4 行 x 10 列 = 40 个小点
+      buildOverviewGrid(total = 40) {
+        const container = document.getElementById('ilh-overview-grid-content');
+        if (!container) return;
+        container.innerHTML = '';
+        for (let i = 1; i <= total; i++) {
+          const dot = document.createElement('span');
+          dot.className = 'ilh-grid-dot';
+          dot.dataset.pos = String(i);
+          dot.title = `第 ${i} 题: ⚫ 未开始`;
+          dot.textContent = String(i);
+          container.appendChild(dot);
+        }
+      },
+
+      // 更新单个 dot
+      updateOne(position, qId) {
+        if (qId) state.qIdToPosition.set(qId, position);
+        const status = qId ? this.getStatus(qId) : 'idle';
+        const color = this.colorFor(status);
+        const label = `第 ${position} 题: ${this.labelFor(status)}`;
+
+        // sidebar dot
+        const sbItems = this.findSidebarItems();
+        const sbEl = sbItems.get(position);
+        if (sbEl) {
+          const sbDot = sbEl.querySelector('.ilh-sidebar-dot');
+          if (sbDot) {
+            sbDot.style.background = color;
+            sbDot.title = label;
+            if (status === 'pending') {
+              sbDot.style.animation = 'ilh-pulse 1.2s ease-in-out infinite';
+            } else {
+              sbDot.style.animation = '';
+            }
+          }
+        }
+
+        // overview grid dot
+        const gridDot = document.querySelector(`.ilh-grid-dot[data-pos="${position}"]`);
+        if (gridDot) {
+          gridDot.style.background = color;
+          gridDot.title = label;
+          gridDot.classList.toggle('pending', status === 'pending');
+          gridDot.classList.toggle('ready', status === 'ready');
+          gridDot.classList.toggle('error', status === 'error');
+        }
+      },
+
+      // 全量更新
+      updateAll() {
+        state.qIdToPosition.forEach((pos, qId) => this.updateOne(pos, qId));
+      },
+
+      // 通过 qId 找 position 并更新
+      updateByQId(qId) {
+        const pos = state.qIdToPosition.get(qId);
+        if (pos) this.updateOne(pos, qId);
+      },
+
+      // MutationObserver 自动注入新出现的 sidebar 项
+      setupAutoInject() {
+        let timer = null;
+        const observer = new MutationObserver(() => {
+          clearTimeout(timer);
+          timer = setTimeout(() => {
+            const n = this.injectSidebarDots();
+            if (n > 0) {
+              log(`🎯 注入 ${n} 个 sidebar 状态灯`, 'debug');
+              this.updateAll();
+            }
+          }, 400);
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+        // 初次延迟注入
+        setTimeout(() => {
+          const n = this.injectSidebarDots();
+          if (n > 0) log(`🎯 初始化 ${n} 个 sidebar 状态灯`, 'info');
+          this.updateAll();
+        }, 1500);
+      },
+    };
+
     const state = {
       currentQuestion: null,
       lastQuestionId: null,
       panelCollapsed: false,
       logCollapsed: false,
       activeListeners: new Map(), // qId -> listenerId
+      qIdToPosition: new Map(),   // v0.8.0: qId -> position 反向映射 (notify 收到 qId 后能找回 position)
     };
 
     // v0.6.0 Stage 3.5: 批量预取状态
@@ -365,6 +515,51 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         transition: max-height 0.25s ease;
       }
       #ilh-panel.collapsed { max-height: 44px; }
+
+      /* v0.8.0: overview grid */
+      #ilh-overview-grid {
+        background: #fafbfc;
+        border: 1px solid #e8eaed;
+        border-radius: 8px;
+        padding: 8px 10px;
+        margin: 8px 12px 4px 12px;
+        font-size: 11px;
+      }
+      .ilh-overview-header {
+        display: flex; justify-content: space-between; align-items: center;
+        margin-bottom: 6px; color: #5f6368; font-weight: 500;
+      }
+      .ilh-overview-legend { font-size: 10px; color: #80868b; }
+      .ilh-overview-legend span { margin-right: 8px; }
+      .ilh-overview-legend i {
+        display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+        margin-right: 3px; vertical-align: middle;
+      }
+      #ilh-overview-grid-content {
+        display: grid;
+        grid-template-columns: repeat(10, 1fr);
+        gap: 3px;
+      }
+      .ilh-grid-dot {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 18px;
+        border-radius: 3px;
+        background: #9ca3af;
+        color: white;
+        font-size: 9px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: background 0.3s, transform 0.15s;
+        user-select: none;
+      }
+      .ilh-grid-dot:hover { transform: scale(1.15); box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
+      .ilh-grid-dot.pending { animation: ilh-pulse 1.2s ease-in-out infinite; }
+      @keyframes ilh-pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.55; }
+      }
       #ilh-header {
         padding: 11px 14px;
         background: rgba(0,0,0,0.28);
@@ -884,6 +1079,18 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
             <button class="ilh-mini-btn" id="ilh-batch-start" disabled>▷ 立即批处理</button>
           </div>
         </div>
+        <div id="ilh-overview-grid">
+          <div class="ilh-overview-header">
+            <span>🎯 题目状态总览</span>
+            <span class="ilh-overview-legend">
+              <span><i style="background:#9ca3af"></i>未开始</span>
+              <span><i style="background:#eab308"></i>获取中</span>
+              <span><i style="background:#22c55e"></i>已就绪</span>
+              <span><i style="background:#ef4444"></i>失败</span>
+            </span>
+          </div>
+          <div id="ilh-overview-grid-content"></div>
+        </div>
         <div id="ilh-question">
           <div id="ilh-empty">尚未识别到题目<span class="ilh-hint">切换到任意题目即可触发抽取</span></div>
         </div>
@@ -970,6 +1177,25 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       });
 
       makeDraggable(panel, document.getElementById('ilh-header'));
+
+      // v0.8.0: 初始化 overview grid (默认 40 题, 第一题识别后会按 q.total 重建)
+      StatusDot.buildOverviewGrid(40);
+      // 点击 grid 上的题号 → 模拟点击 sidebar 跳过去
+      document.getElementById('ilh-overview-grid-content').addEventListener('click', (e) => {
+        const dot = e.target.closest('.ilh-grid-dot');
+        if (!dot) return;
+        const pos = parseInt(dot.dataset.pos, 10);
+        const items = StatusDot.findSidebarItems();
+        const sbEl = items.get(pos);
+        if (sbEl) {
+          // 找最近的可点击祖先 (li / button / a)
+          const clickable = sbEl.closest('li, button, a, [role="button"]') || sbEl;
+          clickable.click();
+          log(`🎯 跳到第 ${pos} 题`, 'info');
+        } else {
+          log(`⚠️ sidebar 找不到第 ${pos} 题, 无法跳转`, 'warn');
+        }
+      });
     }
 
     function makeDraggable(el, handle) {
@@ -1102,16 +1328,31 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     }
 
     function requestExplanation(q) {
-      // v0.5.2: 缓存优先(命中就秒回, 不依赖 NotebookLM 活跃状态)
+      // v0.8.0: 记录 qId → position 映射 (供全局 notify listener 反查)
+      state.qIdToPosition.set(q.id, q.position);
+
+      // 缓存优先(命中就秒回, 不依赖 NotebookLM 活跃状态)
       const cached = GM_getValue(`ilh:response:${q.id}`, null);
       if (cached && cached.status === 'done') {
         showExplain('', cached.text, '✅ 缓存命中 · 秒回');
         log(`💾 缓存命中: ${q.id}`, 'success');
+        StatusDot.updateOne(q.position, q.id);
         return;
       }
       if (cached && cached.status === 'error') {
         showExplain('error', cached.error || '上次请求失败 · 点"重新请求"重试', '上次失败');
         log(`⚠️ 缓存的错误响应, 不重试 (用户可手动重试)`, 'warn');
+        StatusDot.updateOne(q.position, q.id);
+        return;
+      }
+
+      // v0.8.0: 检查是否已经在 pending (request 已发, response 还没回) - 不再重复发
+      const existingReq = GM_getValue(`ilh:request:${q.id}`, null);
+      if (existingReq) {
+        const elapsed = Math.round((Date.now() - (existingReq.timestamp || Date.now())) / 1000);
+        showExplain('waiting', `⏳ 上次请求还在处理 (已等 ${elapsed} 秒)\n\nNotebookLM 通常需要 10-30 秒, 请耐心等待。\n完成后会自动显示, 不用反复点击。`, '处理中');
+        log(`⏳ ${q.id} 已在处理中, 不重复发送 (已 ${elapsed}s)`, 'info');
+        StatusDot.updateOne(q.position, q.id);
         return;
       }
 
@@ -1124,6 +1365,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
 
       // 发新 request
       Bridge.sendRequest(q);
+      StatusDot.updateOne(q.position, q.id);
       const startTs = Date.now();
       showExplain('waiting', '⏳ 已发送给 NotebookLM, 通常需要 10-30 秒...', '排队中');
       log(`📤 发出 request: ${q.id} (题号 ${q.position})`, 'info');
@@ -1175,6 +1417,31 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     setTimeout(() => handleQuestionChange(true), 800);
     setupObserver();
     updateBatchPanel(); // v0.6.0: 初始化批量面板
+
+    // v0.8.0: 启动状态灯系统 (sidebar 自动注入 + 全量更新)
+    StatusDot.setupAutoInject();
+
+    // v0.8.0: 全局 notify listener - 监听任何题状态变化, 更新 dot + 自动刷新当前题显示
+    GM_addValueChangeListener(Bridge.KEY_NOTIFY, (key, oldVal, newVal) => {
+      if (!newVal || !newVal.qId) return;
+      // 更新对应 dot
+      StatusDot.updateByQId(newVal.qId);
+      // 如果是当前显示的题且状态变 done/error, 自动刷新解析显示
+      if (state.currentQuestion && state.currentQuestion.id === newVal.qId) {
+        const cached = GM_getValue(`ilh:response:${newVal.qId}`, null);
+        if (cached && cached.status === 'done') {
+          showExplain('', cached.text, '✅ 已完成');
+          log(`✅ 收到解析: ${newVal.qId}, ${cached.text.length} 字符 (后台到达)`, 'success');
+        } else if (cached && cached.status === 'error') {
+          showExplain('error', cached.error || '处理失败', '失败');
+          log(`❌ 解析失败: ${cached.error}`, 'error');
+        }
+      } else if (newVal.status === 'done') {
+        // 不是当前题但完成了 - 仅在 dot 上提示, 不打扰用户
+        const pos = state.qIdToPosition.get(newVal.qId);
+        if (pos) log(`🟢 第 ${pos} 题 后台已就绪`, 'info');
+      }
+    });
 
     // 定期提示用户 NotebookLM 状态(只在还没识别到题时)
     setInterval(() => {
