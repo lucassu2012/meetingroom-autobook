@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 - NotebookLM 端 (Stage 2)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.2.0
+// @version      0.3.0
 // @description  在 NotebookLM 上自动化输入题目、提交、抓取解析(Stage 2: 不连 iLearning, 手动测试)
 // @author       Lucas
 // @match        https://notebooklm.google.com/*
@@ -14,6 +14,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.3.0 - 输入注入改用 execCommand (穿透 Web Component); 空间约束放宽; 允许 disabled 按钮候选; 探测面板列出周围所有按钮
 // v0.2.0 - Enter主路提交策略; 找按钮加空间约束+黑/白名单(避免选到"收起Studio"); 响应噪音阈值 30→150
 // v0.1.2 - 修复 Trusted Types CSP 拦截 (NotebookLM 禁止直接 innerHTML 赋值); 浮窗现在能在 NotebookLM 渲染
 // v0.1.1 - 拓宽 @match (整个 notebooklm.google.com); @run-at 改为 document-idle (SPA 友好); 加入顶层无条件诊断日志
@@ -70,7 +71,7 @@ function __setSafeInnerHTML(el, htmlString) {
   /* ═══════════════════════════════════════════════════════════
      ⚙️  CONFIG
      ═══════════════════════════════════════════════════════════ */
-  const VERSION = '0.1.0';
+  const VERSION = '0.3.0';
   const STAGE_LABEL = 'Stage 2';
 
   const CONFIG = {
@@ -386,24 +387,26 @@ function __setSafeInnerHTML(el, htmlString) {
 
     const candidates = [];
     document.querySelectorAll('button, [role="button"]').forEach((btn) => {
-      if (!isVisible(btn) || btn.disabled) return;
+      if (!isVisible(btn)) return;
+      // v0.3.0: 不再排除 disabled (execCommand 注入后 disabled 会变 enabled)
       if (isBlacklisted(btn)) return;
 
       const rect = btn.getBoundingClientRect();
       const btnCenterY = (rect.top + rect.bottom) / 2;
 
-      // 空间约束 1: 和输入框同一水平区域 (垂直差 < 80px)
+      // 空间约束 1: 和输入框同一水平区域 (v0.3.0: 80→120)
       const verticalDist = Math.abs(btnCenterY - inputCenterY);
-      if (verticalDist > 80) return;
+      if (verticalDist > 120) return;
 
-      // 空间约束 2: 在输入框右侧或紧邻 (水平距离 -50~150px)
+      // 空间约束 2: 在输入框右侧或与输入框重叠 (v0.3.0: 放宽到 -200~+200)
       const horizontalGap = rect.left - inputRect.right;
-      if (horizontalGap < -50 || horizontalGap > 150) return;
+      if (horizontalGap < -200 || horizontalGap > 200) return;
 
-      // 评分: 距离越近分越低; 含正面关键词减 1000 优先
+      // 评分: 距离越近分越低; 含正面关键词减 1000 优先; disabled 加 100 (其他条件相同时优先 enabled)
       let score = verticalDist + Math.abs(horizontalGap);
       if (isPositive(btn)) score -= 1000;
-      candidates.push({ btn, score, isPositive: isPositive(btn) });
+      if (btn.disabled) score += 100;
+      candidates.push({ btn, score, isPositive: isPositive(btn), disabled: btn.disabled });
     });
 
     if (candidates.length === 0) return null;
@@ -413,8 +416,9 @@ function __setSafeInnerHTML(el, htmlString) {
     const top = candidates.slice(0, Math.min(3, candidates.length));
     log(`  └ 按钮候选 (top ${top.length}):`, 'debug');
     top.forEach((c, i) => {
-      const tag = c.isPositive ? '🎯' : '  ';
-      log(`     ${tag} ${i + 1}. ${describeEl(c.btn)} score=${c.score.toFixed(0)}`, 'debug');
+      const posTag = c.isPositive ? '🎯' : '  ';
+      const disTag = c.disabled ? '🔒disabled' : '✓enabled';
+      log(`     ${posTag} ${i + 1}. ${describeEl(c.btn)} score=${c.score.toFixed(0)} ${disTag}`, 'debug');
     });
 
     return candidates[0].btn;
@@ -432,28 +436,50 @@ function __setSafeInnerHTML(el, htmlString) {
      这是关键步骤: 普通的 .value = xxx 不会触发 React 状态更新
      ═══════════════════════════════════════════════════════════ */
 
-  function setInputValue(el, text) {
+  async function setInputValue(el, text) {
     el.focus();
-    if (el.tagName.toLowerCase() === 'textarea' || el.tagName.toLowerCase() === 'input') {
-      // React-friendly: 使用原生 setter
-      const proto = el.tagName.toLowerCase() === 'textarea'
-        ? window.HTMLTextAreaElement.prototype
-        : window.HTMLInputElement.prototype;
+    await sleep(80);
+    const tag = el.tagName.toLowerCase();
+
+    // 主路: execCommand 'insertText' - 浏览器原生命令, 触发完整事件链
+    // 兼容 React / Angular / Lit / Web Components, 比 nativeSetter 更可靠
+    try {
+      // 全选并删除现有内容
+      if (tag === 'textarea' || tag === 'input') {
+        el.select();
+      } else {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+      document.execCommand('delete');
+      const ok = document.execCommand('insertText', false, text);
+      const current = (tag === 'textarea' || tag === 'input') ? el.value : el.textContent;
+      if (ok && current && current.trim().length >= Math.floor(text.trim().length * 0.9)) {
+        log('  └ 输入注入: execCommand 成功', 'debug');
+        return;
+      }
+    } catch (e) {
+      log(`  ⚠️ execCommand 抛错: ${e.message}, 切换到 fallback`, 'debug');
+    }
+
+    // Fallback: native setter (老办法)
+    if (tag === 'textarea' || tag === 'input') {
+      const proto = tag === 'textarea' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
       const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value').set;
       nativeSetter.call(el, text);
       el.dispatchEvent(new Event('input', { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
+      log('  └ 输入注入: nativeSetter (fallback)', 'debug');
     } else {
-      // contenteditable: 用 textContent 清空(不触发 Trusted Types)
-      el.textContent = '';
-      // 用 InputEvent 让 React 接收到
       el.textContent = text;
       el.dispatchEvent(new InputEvent('input', {
-        bubbles: true, cancelable: true,
-        inputType: 'insertText', data: text,
+        bubbles: true, cancelable: true, inputType: 'insertText', data: text,
       }));
-      // 兜底: 触发 keyup 让某些框架认为输入完成
       el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+      log('  └ 输入注入: contenteditable textContent (fallback)', 'debug');
     }
   }
 
@@ -632,7 +658,7 @@ function __setSafeInnerHTML(el, htmlString) {
       // [2] 模拟输入
       setStatus('busy', '✏️ 输入题目中...');
       log('📍 [2/5] 输入题目内容', 'info');
-      setInputValue(inputEl, questionText);
+      await setInputValue(inputEl, questionText);
       state.submittedQuestionText = questionText;
       await sleep(CONFIG.submitWaitMs);
 
@@ -746,20 +772,46 @@ function __setSafeInnerHTML(el, htmlString) {
   function runDetectionOnly() {
     log('🔍 仅探测页面元素(不输入不提交)', 'info');
     const input = findInputElement();
-    if (input) {
-      log(`✅ 输入框: ${describeEl(input)}`, 'success');
-      flashHighlight(input, '#26a69a');
-    } else {
+    if (!input) {
       log('❌ 未找到输入框', 'error');
+      return;
     }
-    if (input) {
-      const btn = findSubmitButton(input);
-      if (btn) {
-        log(`✅ 提交按钮: ${describeEl(btn)}`, 'success');
-        flashHighlight(btn, '#ffb300');
-      } else {
-        log('⚠️ 未找到提交按钮(运行时会用 Enter 兜底)', 'warn');
-      }
+    log(`✅ 输入框: ${describeEl(input)}`, 'success');
+    flashHighlight(input, '#26a69a');
+    const ir = input.getBoundingClientRect();
+    log(`  └ 位置 x=${ir.left.toFixed(0)} y=${ir.top.toFixed(0)} w=${ir.width.toFixed(0)} h=${ir.height.toFixed(0)}`, 'debug');
+
+    // 现行算法的最佳候选
+    const btn = findSubmitButton(input);
+    if (btn) {
+      log(`✅ 算法选中按钮: ${describeEl(btn)}`, 'success');
+      flashHighlight(btn, '#ffb300');
+      const r = btn.getBoundingClientRect();
+      log(`  └ 位置 x=${r.left.toFixed(0)} y=${r.top.toFixed(0)} disabled=${btn.disabled}`, 'debug');
+    } else {
+      log('⚠️ 算法未找到符合条件的按钮', 'warn');
+    }
+
+    // v0.3.0 诊断: 列出输入框周围所有按钮 (不论 enabled/disabled, 不论黑名单)
+    log('📊 [诊断] 输入框附近 (垂直<200px, 水平<400px) 所有 button:', 'info');
+    const inputCenterY = (ir.top + ir.bottom) / 2;
+    const allBtns = [];
+    document.querySelectorAll('button, [role="button"]').forEach((b) => {
+      if (!isVisible(b)) return;
+      const r = b.getBoundingClientRect();
+      const verticalDist = Math.abs((r.top + r.bottom) / 2 - inputCenterY);
+      const horizontalGap = r.left - ir.right;
+      if (verticalDist > 200 || Math.abs(horizontalGap) > 400) return;
+      allBtns.push({ b, verticalDist, horizontalGap, disabled: b.disabled });
+    });
+    allBtns.sort((a, b) => (Math.abs(a.horizontalGap) + a.verticalDist) - (Math.abs(b.horizontalGap) + b.verticalDist));
+    if (allBtns.length === 0) {
+      log('  ⚠️ 输入框附近完全没有 button', 'warn');
+    } else {
+      allBtns.slice(0, 10).forEach((c, i) => {
+        const dis = c.disabled ? '🔒' : '✓';
+        log(`  ${i + 1}. ${dis} ${describeEl(c.b)} | vert=${c.verticalDist.toFixed(0)} horiz=${c.horizontalGap.toFixed(0)}`, 'debug');
+      });
     }
   }
 
