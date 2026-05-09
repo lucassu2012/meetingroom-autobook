@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         会议室自动抢订
 // @namespace    meetingroom-autobook
-// @version      1.0.0
+// @version      0.11.0
 // @description  在系统开放预订时刻自动抢订会议室。带并发限制的工作队列 / 提前连续重试 / 精确对时 / Apple 风格界面 / GUI 配置
 // @author       Lucas
 // @match        https://inner.welink.huawei.com/meetingroom/*
@@ -296,15 +296,34 @@
 
   function computeNextTriggerLocalTime() {
     const [h, m, s] = CONFIG.timing.bookingOpenTime.split(':').map(Number);
-    const serverNow = new Date(getServerNow());
-    const target = new Date(serverNow);
-    target.setHours(h, m, s, 0);
-    if (target.getTime() <= serverNow.getTime()) {
-      target.setDate(target.getDate() + 1);
-    }
-    // 提前 preTriggerMs 毫秒开始尝试 (踩 8:30 整可能太晚, 提前 1s 比较稳)
     const preTriggerMs = CONFIG.timing.preTriggerMs || 0;
-    return target.getTime() - serverOffsetMs - preTriggerMs;
+
+    // 关键逻辑: 设了目标日期时, 触发日 = (目标日期 - 7 天) 当天的 8:30
+    // 因为服务器规则是"今天 8:30 开放今天+7 天的槽位", 所以 5/18 = 5/11 的 8:30 才能订
+    const targetDate = parseTargetDate(CONFIG.timing.targetDate);
+    if (targetDate) {
+      const fireDate = new Date(targetDate);
+      fireDate.setDate(fireDate.getDate() - 7);
+      fireDate.setHours(h, m, s, 0);
+      // fireDate.getTime() 是"本地时区的 fire 当天 8:30:00", 也就是服务器的 8:30:00
+      // 因为 setHours 是按本地时区算, 而触发时刻应该是"服务器 8:30:00 时的本地时刻"
+      const fireLocal = fireDate.getTime() - serverOffsetMs - preTriggerMs;
+      // 容忍 60 秒以内的过期 (用户刚错过), 还是按这个时刻算
+      if (fireLocal > Date.now() - 60000) {
+        return fireLocal;
+      }
+      // 否则: 触发日已经远远过去, 落到滚动模式 (下一个 8:30)
+      // 此时 effective daysAhead 通常 < 7, 会"立即抢" (booking 已经开放)
+    }
+
+    // 滚动模式 / targetDate 已过期: 下一个 8:30
+    const serverNow = new Date(getServerNow());
+    const t = new Date(serverNow);
+    t.setHours(h, m, s, 0);
+    if (t.getTime() <= serverNow.getTime()) {
+      t.setDate(t.getDate() + 1);
+    }
+    return t.getTime() - serverOffsetMs - preTriggerMs;
   }
 
   function computeEndTime(startTime, durationMinutes) {
@@ -611,11 +630,18 @@
     syncServerTimePrecise().finally(() => {
       scheduledLocalTime = computeNextTriggerLocalTime();
       const waitMs = scheduledLocalTime - Date.now();
-      const localFireTime = formatTimeWithMs(new Date(scheduledLocalTime));
+      const fireDateObj = new Date(scheduledLocalTime);
+      const localFireTime = formatTimeWithMs(fireDateObj);
+      const fireDateStr = `${fireDateObj.getMonth() + 1}月${fireDateObj.getDate()}日`;
+      const dayName = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][fireDateObj.getDay()];
       const preTriggerMs = CONFIG.timing.preTriggerMs || 0;
-      log(`⏰ 服务器 ${CONFIG.timing.bookingOpenTime} 开放预订`, 'info');
-      log(`   工具将在本地 ${localFireTime} 启动 (提前 ${preTriggerMs}ms)`, 'info');
-      log(`   ⏳ 还剩 ${(waitMs / 1000).toFixed(1)} 秒`, 'info');
+      const targetDateStr = CONFIG.timing.targetDate ? ` (订 ${formatBookingDate()})` : '';
+      log(`⏰ 服务器 ${CONFIG.timing.bookingOpenTime} 开放预订${targetDateStr}`, 'info');
+      log(`   工具将在 ${fireDateStr} ${dayName} ${localFireTime} 启动 (提前 ${preTriggerMs}ms)`, 'info');
+      const hours = Math.floor(waitMs / 3600000);
+      const minutes = Math.floor((waitMs % 3600000) / 60000);
+      const seconds = Math.floor((waitMs % 60000) / 1000);
+      log(`   ⏳ 还剩 ${hours > 0 ? hours + '小时 ' : ''}${minutes > 0 ? minutes + '分 ' : ''}${seconds}秒`, 'info');
       setStatus('armed', '🟢 已就绪 · 等待开抢');
 
       if (waitMs > 35000) {
@@ -800,7 +826,7 @@
     panel.id = 'mr-panel';
     panel.innerHTML = `
       <div class="h">
-        <span class="tt">📅 会议室自动抢订 v0.10</span>
+        <span class="tt">📅 会议室自动抢订 v0.11</span>
         <span class="tg" id="tg">−</span>
       </div>
       <div class="body" id="body">
@@ -1475,7 +1501,7 @@
       return;
     }
     buildUI();
-    log('✅ 会议室自动抢订 v0.10.0 已加载');
+    log('✅ 会议室自动抢订 v0.11.0 已加载');
     log(`📋 已配置 ${CONFIG.bookings.length} 个任务 / ${CONFIG.rooms.length} 个房间`);
 
     setTimeout(() => {
