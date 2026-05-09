@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.6.1
+// @version      0.6.2
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.6.2 - 修跨题串扰: user message 排除改为实时检查 + 加 DOM 顺序检查(只看 user message 之后元素), 避免抓到前题的 AI response
 // v0.6.1 - 修题型识别(多选题被识别成单选题) + 修批次大小输入框被切题箭头键误触发
 // v0.6.0 - Stage 3.5 阶段A: iLearning 端批量预取面板(进度+未识别题号+批次大小可配置). 阶段B(NotebookLM真批处理)分别实现
 // v0.5.7 - markdown 渲染段落紧凑化(去掉换行符夹层 + margin 归零)
@@ -1658,11 +1659,22 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       return map;
     }
 
-    function findGrowingResponseElement(snapshot, questionText, excludedNodes) {
+    function findGrowingResponseElement(snapshot, questionText, userMsgEl) {
       const candidates = [];
       document.querySelectorAll('div, p, article, section, main, span').forEach((el) => {
         if (el.closest('#nlh-panel')) return;
-        if (excludedNodes && excludedNodes.has(el)) return; // v0.5.2: 排除 user message 树
+
+        // v0.6.2: 三重排除策略 (实时检查, 不受 streaming 影响)
+        if (userMsgEl) {
+          // ① user message 自己 + 所有后代
+          if (userMsgEl === el || userMsgEl.contains(el)) return;
+          // ② user message 的祖先 (textContent 包含 user msg, 不算干净 AI response)
+          if (el.contains(userMsgEl)) return;
+          // ③ DOM 顺序在 user message 之前的元素 (前题 AI response, sidebar, etc)
+          const pos = userMsgEl.compareDocumentPosition(el);
+          if (!(pos & Node.DOCUMENT_POSITION_FOLLOWING)) return;
+        }
+
         const newLen = el.textContent.length;
         const oldLen = snapshot.get(el) || 0;
         const growth = newLen - oldLen;
@@ -1681,7 +1693,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       return candidates[0].el;
     }
 
-    async function waitForResponse(snapshot, questionText, excludedNodes) {
+    async function waitForResponse(snapshot, questionText, userMsgEl) {
       const startTs = Date.now();
       let lastLen = 0;
       let lastChangeTs = Date.now();
@@ -1696,7 +1708,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         const elapsed = Date.now() - startTs;
 
         // 跟踪增长(用于抓内容)
-        const currentEl = findGrowingResponseElement(snapshot, questionText, excludedNodes);
+        const currentEl = findGrowingResponseElement(snapshot, questionText, userMsgEl);
         if (currentEl) {
           responseEl = currentEl;
           const currentLen = currentEl.textContent.length;
@@ -1716,7 +1728,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           // 标记出现后再多等 1.5s, 让最后一段 streaming 落地
           if (Date.now() - markerIncreasedAt > 1500) {
             // 最后再抓一次确保拿到完整内容
-            const finalEl = findGrowingResponseElement(snapshot, questionText, excludedNodes);
+            const finalEl = findGrowingResponseElement(snapshot, questionText, userMsgEl);
             if (finalEl) responseEl = finalEl;
             const finalText = responseEl ? extractFormattedText(responseEl) : null;
             log(`  ✅ 完成标记稳定, 抓取最终响应 (${finalText ? finalText.length : 0} 字符, 含格式)`, 'success');
@@ -1771,23 +1783,16 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         }
         await sleep(CONFIG.responseInitialDelayMs);
 
-        // 4.5. v0.5.3: 识别完整 user message 容器(含题干+选项), 整个排除
+        // 4.5. v0.6.2: 识别 user message 容器, 用实时检查排除而非预建 Set (避免 streaming 中新加的子元素逃逸)
         const userMsgEl = findUserMessageContainer(req);
-        const excludedNodes = new Set();
         if (userMsgEl) {
-          log(`  └ user message 容器: ${describeEl(userMsgEl)} (包含 ${userMsgEl.querySelectorAll('*').length} 个子元素)`, 'debug');
-          // 容器自己 + 所有后代 (包括题干、选项、所有兄弟)
-          excludedNodes.add(userMsgEl);
-          userMsgEl.querySelectorAll('*').forEach((c) => excludedNodes.add(c));
-          // 祖先(因为祖先 textContent 包含 user message, 但兄弟 = AI response 不会被排除)
-          let p = userMsgEl.parentElement;
-          while (p && p !== document.body) { excludedNodes.add(p); p = p.parentElement; }
+          log(`  └ user message 容器: ${describeEl(userMsgEl)}`, 'debug');
         } else {
           log('  ⚠️ 未识别到 user message 容器, 退回旧过滤', 'warn');
         }
 
-        // 5. 等响应
-        const responseText = await waitForResponse(snapshot, text, excludedNodes);
+        // 5. 等响应 (传 userMsgEl, findGrowingResponseElement 实时排除其子树/祖先/前置元素)
+        const responseText = await waitForResponse(snapshot, text, userMsgEl);
         if (!responseText || responseText.length < CONFIG.minResponseChars) {
           log(`❌ 响应过短 (${responseText?.length || 0} 字符)`, 'error');
           Bridge.writeResponse(req.id, responseText || '', 'error', '响应过短或未抓到');
