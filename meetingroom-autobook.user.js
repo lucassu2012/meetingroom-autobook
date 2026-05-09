@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         会议室自动抢订
 // @namespace    meetingroom-autobook
-// @version      0.9.0
+// @version      1.0.0
 // @description  在系统开放预订时刻自动抢订会议室。带并发限制的工作队列 / 提前连续重试 / 精确对时 / Apple 风格界面 / GUI 配置
 // @author       Lucas
 // @match        https://inner.welink.huawei.com/meetingroom/*
@@ -800,7 +800,7 @@
     panel.id = 'mr-panel';
     panel.innerHTML = `
       <div class="h">
-        <span class="tt">📅 会议室自动抢订 v0.9</span>
+        <span class="tt">📅 会议室自动抢订 v0.10</span>
         <span class="tg" id="tg">−</span>
       </div>
       <div class="body" id="body">
@@ -1153,8 +1153,8 @@
       </div>
       <div class="form-row">
         <label>提前天数</label>
-        <input type="number" id="set-days" value="${CONFIG.timing.daysAhead}" min="0" max="7">
-        <span style="font-size:11px;color:#666">滚动模式 · 系统上限 7</span>
+        <input type="number" id="set-days" value="${CONFIG.timing.daysAhead}" min="0" max="14">
+        <span style="font-size:11px;color:#666">≤7 滚动 · &gt;7 自动转目标日期</span>
       </div>
       <div class="form-row">
         <label>目标日期</label>
@@ -1228,28 +1228,50 @@
       const warn = document.getElementById('set-warn');
       if (!subject) { warn.style.display = 'block'; warn.textContent = '⚠️ 主题不能为空'; return; }
       if (!open.match(/^\d{2}:\d{2}:\d{2}$/)) { warn.style.display = 'block'; warn.textContent = '⚠️ 开抢时刻格式应为 HH:MM:SS'; return; }
-      if (isNaN(days) || days < 0 || days > 7) { warn.style.display = 'block'; warn.textContent = '⚠️ 提前天数必须在 0~7 之间 (系统硬上限)'; return; }
-      // 目标日期校验
+      if (isNaN(days) || days < 0 || days > 14) { warn.style.display = 'block'; warn.textContent = '⚠️ 提前天数必须在 0~14 之间'; return; }
+      // 目标日期校验 (用户手动设置的)
       if (target) {
         const td = parseTargetDate(target);
         if (!td) { warn.style.display = 'block'; warn.textContent = '⚠️ 目标日期格式错误 (应为 YYYY-MM-DD)'; return; }
-        const today = new Date(); today.setHours(0, 0, 0, 0);
-        if (td.getTime() < today.getTime()) { warn.style.display = 'block'; warn.textContent = '⚠️ 目标日期不能在过去'; return; }
-        const diffDays = Math.round((td.getTime() - today.getTime()) / 86400000);
+        const today0 = new Date(); today0.setHours(0, 0, 0, 0);
+        if (td.getTime() < today0.getTime()) { warn.style.display = 'block'; warn.textContent = '⚠️ 目标日期不能在过去'; return; }
+        const diffDays = Math.round((td.getTime() - today0.getTime()) / 86400000);
         if (diffDays > 14) { warn.style.display = 'block'; warn.textContent = `⚠️ 目标日期距今 ${diffDays} 天太远, 最多 14 天`; return; }
       }
       if (isNaN(pretrig) || pretrig < 0 || pretrig > 60000) { warn.style.display = 'block'; warn.textContent = '⚠️ 提前ms应在 0~60000 之间'; return; }
       if (isNaN(maxdur) || maxdur < 10) { warn.style.display = 'block'; warn.textContent = '⚠️ 持续时长太短'; return; }
       if (isNaN(conc) || conc < 1 || conc > 10) { warn.style.display = 'block'; warn.textContent = '⚠️ 并发数应在 1~10 之间'; return; }
+
+      // 关键: 提前天数 > 7 时自动转为目标日期模式
+      // 否则在执行那一刻 today + 9 = 错误日期 (例如周一执行 today+9 就是 5/20 而非 5/18)
+      let finalTargetDate = target || null;
+      let finalDaysAhead = days;
+      let autoConvertNote = '';
+      if (days > 7 && !finalTargetDate) {
+        const today0 = new Date(); today0.setHours(0, 0, 0, 0);
+        const t = new Date(today0);
+        t.setDate(t.getDate() + days);
+        const yy = t.getFullYear();
+        const mo = String(t.getMonth() + 1).padStart(2, '0');
+        const dd = String(t.getDate()).padStart(2, '0');
+        finalTargetDate = `${yy}-${mo}-${dd}`;
+        finalDaysAhead = 7;  // 重置为安全值, targetDate 接管
+        autoConvertNote = `(已自动转为目标日期 ${finalTargetDate})`;
+      } else if (days > 7 && finalTargetDate) {
+        // 用户既填了目标日期又填了 >7 的天数, 以日期为准, 把 days 重置
+        finalDaysAhead = 7;
+        autoConvertNote = `(目标日期 ${finalTargetDate} 优先, 提前天数已重置为 7)`;
+      }
+
       CONFIG.meeting.subject = subject;
       CONFIG.timing.bookingOpenTime = open;
-      CONFIG.timing.daysAhead = days;
-      CONFIG.timing.targetDate = target || null;
+      CONFIG.timing.daysAhead = finalDaysAhead;
+      CONFIG.timing.targetDate = finalTargetDate;
       CONFIG.timing.preTriggerMs = pretrig;
       CONFIG.timing.maxAttemptDurationSec = maxdur;
       CONFIG.advanced.concurrency = conc;
       saveConfig();
-      log('✅ 设置已保存', 'success');
+      log(`✅ 设置已保存${autoConvertNote ? ' ' + autoConvertNote : ''}`, 'success');
       updateUI();
     };
 
@@ -1453,7 +1475,7 @@
       return;
     }
     buildUI();
-    log('✅ 会议室自动抢订 v0.9.0 已加载');
+    log('✅ 会议室自动抢订 v0.10.0 已加载');
     log(`📋 已配置 ${CONFIG.bookings.length} 个任务 / ${CONFIG.rooms.length} 个房间`);
 
     setTimeout(() => {
@@ -1473,3 +1495,4 @@
     init();
   }
 })();
+
