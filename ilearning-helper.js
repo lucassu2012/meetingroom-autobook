@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 1: DOM 抽取)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.1.0
+// @version      0.1.2
 // @description  iLearning 习题页自动识别题目,Stage 1 只验证 DOM 抽取(尚未联动 NotebookLM)
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
