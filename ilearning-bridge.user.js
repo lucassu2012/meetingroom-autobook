@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.5.0
+// @version      0.5.1
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.5.1 - 修复 SPA 路由问题 (NotebookLM/iLearning 的客户端路由不刷新页面, 之前脚本错过初始化)
 // v0.5.0 - Stage 3: 合并 iLearning + NotebookLM 双端, GM 存储桥接, 开题自动出解析
 
 console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'path=', location.pathname);
@@ -175,22 +176,44 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
   };
 
   /* ════════════════════════════════════════════════════════════
-     🚦  路由分发
+     🚦  路由分发 (含 SPA 路由监听 - v0.5.1)
+     iLearning 和 NotebookLM 都是 SPA, 客户端路由切换不刷新页面.
+     脚本必须监听 pushState/replaceState/popstate, 路径变成期望模式时再初始化.
      ════════════════════════════════════════════════════════════ */
+  function watchForRoute(matcher, label, callback) {
+    let initialized = false;
+    function check() {
+      if (initialized) return;
+      const match = matcher instanceof RegExp
+        ? matcher.test(location.pathname)
+        : location.pathname.includes(matcher);
+      if (match) {
+        initialized = true;
+        console.log(`[ILH-BRIDGE] ✅ 路由匹配 ${label}, 初始化中... (path=${location.pathname})`);
+        try { callback(); } catch (e) { console.error('[ILH-BRIDGE] 初始化失败:', e); }
+      }
+    }
+    // 拦截 history API
+    ['pushState', 'replaceState'].forEach((m) => {
+      const orig = history[m];
+      history[m] = function () { orig.apply(this, arguments); check(); };
+    });
+    window.addEventListener('popstate', check);
+    // 兜底: 1.5 秒轮询(防 SPA 用了非标准的路由方式)
+    const intervalId = setInterval(() => {
+      check();
+      if (initialized) clearInterval(intervalId);
+    }, 1500);
+    // 立即检查一次
+    check();
+  }
+
   if (location.hostname === 'ilearning.huawei.com') {
-    if (location.pathname.includes('/examContent')) {
-      console.log('[ILH-BRIDGE] 🎯 iLearning 答题页, 启动 iLearning 端');
-      initILearning();
-    } else {
-      console.log('[ILH-BRIDGE] iLearning 但不是答题页, 不激活');
-    }
+    console.log('[ILH-BRIDGE] iLearning 域, 等待答题页路由...');
+    watchForRoute(/\/examContent/, 'iLearning examContent', initILearning);
   } else if (location.hostname === 'notebooklm.google.com') {
-    if (location.pathname.startsWith('/notebook/')) {
-      console.log('[ILH-BRIDGE] 🎯 NotebookLM 笔记本页, 启动 NotebookLM 端');
-      initNotebookLM();
-    } else {
-      console.log('[ILH-BRIDGE] NotebookLM 但不是笔记本页, 不激活');
-    }
+    console.log('[ILH-BRIDGE] NotebookLM 域, 等待笔记本页路由...');
+    watchForRoute(/^\/notebook\//, 'NotebookLM /notebook/', initNotebookLM);
   }
 
   /* ════════════════════════════════════════════════════════════
