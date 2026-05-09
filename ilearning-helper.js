@@ -13,6 +13,10 @@
 // @downloadURL  https://raw.githubusercontent.com/lucassu2012/meetingroom-autobook/main/ilearning-helper.js
 // ==/UserScript==
 
+// CHANGELOG
+// v0.1.2 - 修复选项识别 (选项字母和内容跨节点); @match 精确到 examContent
+// v0.1.0 - Stage 1 初版
+
 (function () {
   'use strict';
 
@@ -262,9 +266,7 @@
 
       // [4] 找选项 (A./B./C./...)
       const options = findOptions();
-      if (options.length === 0 && questionType !== '判断题') {
-        log('⚠️ 未识别到选项', 'warn');
-      }
+      // (无选项时的提示移到 handleQuestionChange,避免重复抽取时刷屏)
 
       // [5] 生成题目唯一ID(供未来缓存复用)
       const id = `q${positionInfo.position}_${hashString(stem.substring(0, 60))}`;
@@ -350,12 +352,35 @@
     return bestCandidate;
   }
 
-  /** 找选项 A. B. C. D. ... */
+  /**
+   * 找选项 A. B. C. D. ...
+   * 多策略防御式抽取(因为选项的字母和内容可能在不同 DOM 节点里)
+   */
   function findOptions() {
-    const options = [];
-    const seenLetters = new Set();
-    const optRe = /^\s*([A-Z])\s*[\.、,，]\s*(.+)/;
+    const optRe = /^\s*([A-Z])\s*[\.、,，]\s*(.+)/s;
 
+    // 策略 A (主):查 [class*="option-list-item"] 容器, 取整个容器的拼接文本
+    // iLearning 选项DOM: <div class="option-list-item"> 内含 .option-order-str("A. ") + .content("产品组合SDT")
+    // 直接读 item.textContent 会拼成 "A. 产品组合SDT" - 这是最稳定的提取方式
+    let opts = extractOptionsFromContainers(
+      '[class*="option-list-item"], [class*="option-item"]',
+      optRe
+    );
+    if (opts.length > 0) {
+      log(`  └ 选项策略A命中(option-list-item 容器): ${opts.length} 个`, 'info');
+      return opts;
+    }
+
+    // 策略 B (备):查 [class*="option-content"] (排除 wrapper/list 等外层)
+    opts = extractOptionsFromContainers('[class*="option-content"]', optRe);
+    if (opts.length > 0) {
+      log(`  └ 选项策略B命中(option-content 容器): ${opts.length} 个`, 'info');
+      return opts;
+    }
+
+    // 策略 C (兜底):TreeWalker 单文本节点匹配(适用于扁平结构)
+    opts = [];
+    const seen = new Set();
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     let node;
     while ((node = walker.nextNode())) {
@@ -365,14 +390,40 @@
       if (m) {
         const letter = m[1];
         const content = m[2].trim();
-        if (!seenLetters.has(letter) && content.length > 0) {
-          seenLetters.add(letter);
-          options.push({ letter, content });
+        if (!seen.has(letter) && content.length > 0) {
+          seen.add(letter);
+          opts.push({ letter, content });
         }
       }
     }
-    options.sort((a, b) => a.letter.localeCompare(b.letter));
-    return options;
+    if (opts.length > 0) {
+      opts.sort((a, b) => a.letter.localeCompare(b.letter));
+      log(`  └ 选项策略C命中(单文本节点): ${opts.length} 个`, 'info');
+    }
+    return opts;
+  }
+
+  /** 通用工具:从一组容器里抽取选项, 每个容器的 textContent 应该形如 "A. xxx" */
+  function extractOptionsFromContainers(selector, optRe) {
+    const items = document.querySelectorAll(selector);
+    const opts = [];
+    const seen = new Set();
+    for (const item of items) {
+      // 折叠所有空白(空格/换行/制表)为单个空格
+      const text = item.textContent.replace(/\s+/g, ' ').trim();
+      if (text.length === 0 || text.length > 800) continue;
+      const m = text.match(optRe);
+      if (m) {
+        const letter = m[1];
+        const content = m[2].trim();
+        if (!seen.has(letter) && content.length > 0 && content.length < 800) {
+          seen.add(letter);
+          opts.push({ letter, content });
+        }
+      }
+    }
+    opts.sort((a, b) => a.letter.localeCompare(b.letter));
+    return opts;
   }
 
   /** 简单字符串哈希,用于题目唯一 ID */
@@ -550,6 +601,11 @@
       state.lastQuestionId = q.id;
       renderQuestion(q);
       setStatus('', `✅ 第 ${q.position}/${q.total} 题已识别 · ${q.type}`);
+
+      // 仅在题目真的变了时,才提示无选项(避免 MutationObserver 重复触发刷屏)
+      if (q.options.length === 0 && q.type !== '判断题') {
+        log(`⚠️ 第 ${q.position} 题未识别到选项`, 'warn');
+      }
     }, CONFIG.extractDebounceMs);
   }
 
