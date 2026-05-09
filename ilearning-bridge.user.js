@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.5.4
+// @version      0.5.5
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.5.5 - 抓取保留格式(块元素换行 + markdown加粗) + 导出从JSON改为CSV(Excel友好,UTF-8 BOM)
 // v0.5.4 - 🔑 用 NotebookLM 完成标记(thumb_up出现)作主判定 + 强化 user message 容器查找(要全部选项) + 提交后强制最小等待
 // v0.5.3 - 修复 user message 容器识别(原版漏排除选项兄弟元素); 加导出题库 JSON
 // v0.5.2 - 修复缓存抓错(排除user message区) + 加防错入库sanity check + 缓存优先 + 心跳容忍90s
@@ -984,8 +985,58 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       return true;
     }
 
-    /** v0.5.3: 导出所有缓存数据为 JSON 下载 */
-    function exportCache() {
+    /**
+     * v0.5.5: 遍历 DOM 提取保留格式的文本
+     * - 块级元素(div, p, li, h1-h6, ul, ol)前后加换行
+     * - <li> 前加 "- " (markdown bullet)
+     * - <strong>/<b> 用 **...** 包起来
+     * - <br> 转 \n
+     * 这样抓到的内容是 markdown 格式, 保留 NotebookLM 原始的层次结构
+     */
+    function extractFormattedText(el) {
+      if (!el) return '';
+      const parts = [];
+      function walk(node) {
+        if (!node) return;
+        if (node.nodeType === Node.TEXT_NODE) {
+          parts.push(node.textContent);
+          return;
+        }
+        if (node.nodeType !== Node.ELEMENT_NODE) return;
+        const tag = node.tagName.toLowerCase();
+        if (['style', 'script', 'noscript', 'svg'].includes(tag)) return;
+        if (tag === 'br') { parts.push('\n'); return; }
+
+        const isBlock = ['div', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol', 'pre', 'blockquote', 'tr', 'article', 'section'].includes(tag);
+        const isBold = tag === 'strong' || tag === 'b';
+        const isItem = tag === 'li';
+
+        if (isBlock || isItem) {
+          const last = parts.length ? parts[parts.length - 1] : '';
+          if (last && !last.endsWith('\n')) parts.push('\n');
+        }
+        if (isItem) parts.push('- ');
+        if (isBold) parts.push('**');
+
+        for (const child of node.childNodes) walk(child);
+
+        if (isBold) parts.push('**');
+        if (isBlock || isItem) {
+          const last = parts.length ? parts[parts.length - 1] : '';
+          if (last && !last.endsWith('\n')) parts.push('\n');
+        }
+      }
+      walk(el);
+      // 清理: 行尾空白, 三连空行→双连空行, 空 ** **
+      return parts.join('')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .replace(/\*\*\s*\*\*/g, '')
+        .trim();
+    }
+
+    /** v0.5.5: 导出缓存为 CSV (Excel 友好) */
+    function exportCacheCSV() {
       const allKeys = Bridge.listAllKeys();
       const requests = {}, responses = {};
       let counts = { total: 0, done: 0, error: 0, pending: 0 };
@@ -999,42 +1050,68 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           if (v && v.status) counts[v.status] = (counts[v.status] || 0) + 1;
         }
       });
-      // 组合: 每题一个对象
       const combined = [];
       for (const qId in requests) {
         const req = requests[qId];
         const resp = responses[qId];
         combined.push({
-          id: qId,
-          position: req.position || null,
-          total: req.total || null,
-          type: req.type || null,
-          stem: req.stem || null,
+          position: req.position || 0,
+          type: req.type || '',
+          stem: req.stem || '',
           options: req.options || [],
-          response_status: resp ? resp.status : 'pending',
-          response_text: resp ? resp.text : null,
-          response_error: resp ? resp.error : null,
-          response_at: resp ? new Date(resp.timestamp).toISOString() : null,
+          status: resp ? resp.status : 'pending',
+          text: resp ? (resp.text || '') : '',
+          error: resp ? (resp.error || '') : '',
+          at: resp ? new Date(resp.timestamp).toLocaleString('zh-CN') : '',
         });
       }
-      combined.sort((a, b) => (a.position || 9999) - (b.position || 9999));
-      const exportData = {
-        exported_at: new Date().toISOString(),
-        notebook_url: location.href,
-        stats: counts,
-        questions: combined,
-      };
-      const json = JSON.stringify(exportData, null, 2);
-      const blob = new Blob([json], { type: 'application/json' });
+      combined.sort((a, b) => a.position - b.position);
+
+      // 选项可能多于 4 个(多选), 算最大数量
+      const maxOpts = combined.reduce((m, q) => Math.max(m, (q.options || []).length), 4);
+      const optHeaders = [];
+      for (let i = 0; i < maxOpts; i++) {
+        optHeaders.push(`选项${String.fromCharCode(65 + i)}`);
+      }
+      const headers = ['题号', '题型', '题干', ...optHeaders, '状态', '解析', '错误', '处理时间'];
+      const rows = [headers];
+      for (const q of combined) {
+        const opts = (q.options || []).map((o) => o.content || '');
+        while (opts.length < maxOpts) opts.push('');
+        rows.push([
+          q.position || '',
+          q.type || '',
+          q.stem || '',
+          ...opts,
+          q.status || '',
+          q.text || '',
+          q.error || '',
+          q.at || '',
+        ]);
+      }
+      // CSV 转换: 含逗号/引号/换行的字段用引号包起来, 内部引号双写转义
+      const csv = rows.map((row) =>
+        row.map((field) => {
+          const s = String(field == null ? '' : field);
+          if (/[",\n\r]/.test(s)) {
+            return '"' + s.replace(/"/g, '""') + '"';
+          }
+          return s;
+        }).join(',')
+      ).join('\r\n'); // CRLF, Excel/Windows 友好
+
+      // UTF-8 BOM 让 Excel 正确识别中文
+      const csvWithBOM = '\ufeff' + csv;
+      const blob = new Blob([csvWithBOM], { type: 'text/csv;charset=utf-8' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `ilearning-cache-${new Date().toISOString().slice(0, 19).replace(/[:.]/g, '-')}.json`;
+      a.download = `ilearning-questions-${new Date().toISOString().slice(0, 19).replace(/[:.]/g, '-')}.csv`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-      log(`📥 已导出 ${combined.length} 道题 (done: ${counts.done}, error: ${counts.error})`, 'success');
+      log(`📥 已导出 ${combined.length} 道题为 CSV (done: ${counts.done}, error: ${counts.error})`, 'success');
     }
 
     function describeEl(el) {
@@ -1248,8 +1325,9 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
             // 最后再抓一次确保拿到完整内容
             const finalEl = findGrowingResponseElement(snapshot, questionText, excludedNodes);
             if (finalEl) responseEl = finalEl;
-            log(`  ✅ 完成标记稳定, 抓取最终响应 (${responseEl ? responseEl.textContent.length : 0} 字符)`, 'success');
-            return responseEl ? responseEl.textContent.trim() : null;
+            const finalText = responseEl ? extractFormattedText(responseEl) : null;
+            log(`  ✅ 完成标记稳定, 抓取最终响应 (${finalText ? finalText.length : 0} 字符, 含格式)`, 'success');
+            return finalText;
           }
           continue;
         }
@@ -1258,11 +1336,11 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         if (elapsed < CONFIG.minInitialWaitMs) continue;
         if (lastLen > CONFIG.minResponseChars && (Date.now() - lastChangeTs) > CONFIG.silenceTimeoutMs) {
           log(`  ⚠️ 没等到完成标记, 静默 ${Math.round(CONFIG.silenceTimeoutMs/1000)}s 强制返回 (可能不可靠)`, 'warn');
-          return responseEl ? responseEl.textContent.trim() : null;
+          return responseEl ? extractFormattedText(responseEl) : null;
         }
       }
       log(`  ⏱️ 达到最长等待时间 ${Math.round(CONFIG.maxResponseWaitMs/1000)}s`, 'warn');
-      return responseEl ? responseEl.textContent.trim() : null;
+      return responseEl ? extractFormattedText(responseEl) : null;
     }
 
     // === 处理一道题 ===
@@ -1502,7 +1580,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         </div>
         <div id="nlh-actions">
           <button class="nlh-btn" id="nlh-btn-detect">🔍 仅探测</button>
-          <button class="nlh-btn" id="nlh-btn-export">📥 导出</button>
+          <button class="nlh-btn" id="nlh-btn-export">📥 CSV</button>
           <button class="nlh-btn" id="nlh-btn-clear">🗑️ 清空</button>
         </div>
         <div id="nlh-log-section">
@@ -1547,7 +1625,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         updateStats();
       });
       document.getElementById('nlh-btn-export').addEventListener('click', () => {
-        exportCache();
+        exportCacheCSV();
       });
 
       // 拖拽
