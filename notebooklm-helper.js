@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 - NotebookLM 端 (Stage 2)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.1.2
+// @version      0.2.0
 // @description  在 NotebookLM 上自动化输入题目、提交、抓取解析(Stage 2: 不连 iLearning, 手动测试)
 // @author       Lucas
 // @match        https://notebooklm.google.com/*
@@ -14,6 +14,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.2.0 - Enter主路提交策略; 找按钮加空间约束+黑/白名单(避免选到"收起Studio"); 响应噪音阈值 30→150
 // v0.1.2 - 修复 Trusted Types CSP 拦截 (NotebookLM 禁止直接 innerHTML 赋值); 浮窗现在能在 NotebookLM 渲染
 // v0.1.1 - 拓宽 @match (整个 notebooklm.google.com); @run-at 改为 document-idle (SPA 友好); 加入顶层无条件诊断日志
 // v0.1.0 - Stage 2 初版
@@ -78,7 +79,7 @@ function __setSafeInnerHTML(el, htmlString) {
     pollIntervalMs: 500,           // 响应增长检查频率
     silenceTimeoutMs: 5000,        // 内容静默 N 秒视为完成
     maxResponseWaitMs: 180000,     // 最长等 3 分钟
-    minResponseChars: 30,          // 响应至少这么长才算有效
+    minResponseChars: 150,         // 响应至少这么长才算有效 (过滤 UI 文字变化的噪音)
     panelWidth: 420,
     panelMaxHeight: 720,
     logMaxLines: 100,
@@ -348,30 +349,75 @@ function __setSafeInnerHTML(el, htmlString) {
   }
 
   /**
-   * 找提交按钮: 从输入框往上找祖先, 取祖先内最右边的可点击 button
-   * 这个约定在大多数聊天 UI 都成立(发送按钮在输入框右侧)
+   * 找提交按钮 - v0.2.0 重写: 空间约束 + 黑/白名单
+   * 旧版"找最右边的button"会错选 Studio 收起按钮(它在屏幕最右)
+   * 新版要求按钮必须和输入框水平相邻且垂直对齐
    */
   function findSubmitButton(inputEl) {
     if (!inputEl) return null;
-    let container = inputEl.parentElement;
-    for (let depth = 0; depth < 6 && container; depth++) {
-      const buttons = Array.from(container.querySelectorAll('button'))
-        .filter((btn) => isVisible(btn) && !btn.disabled);
-      if (buttons.length > 0) {
-        // 取最右边的(发送按钮通常在最右)
-        let rightmost = null, maxX = -Infinity;
-        for (const btn of buttons) {
-          const rect = btn.getBoundingClientRect();
-          if (rect.right > maxX) { maxX = rect.right; rightmost = btn; }
-        }
-        if (rightmost) {
-          log(`  └ 提交按钮: ${describeEl(rightmost)} (祖先深度 ${depth})`, 'debug');
-          return rightmost;
-        }
-      }
-      container = container.parentElement;
-    }
-    return null;
+    const inputRect = inputEl.getBoundingClientRect();
+    const inputCenterY = (inputRect.top + inputRect.bottom) / 2;
+
+    // 黑名单: 含这些关键词的按钮一律不选
+    const BLACKLIST = [
+      '收起', '展开', '关闭', '打开', 'studio', '面板', 'panel',
+      'collapse', 'expand', 'close', 'open', 'sidebar', 'menu',
+      '设置', 'settings', '帮助', 'help', '更多', 'more', '选项', 'options',
+      '分享', 'share', '创建', 'create', '保存', 'save',
+      '复制', 'copy', '粘贴', 'paste', '撤销', 'undo',
+      'thumb_up', 'thumb_down', '点赞', '点踩', 'like', 'dislike',
+    ];
+    // 白名单: 含这些的优先选
+    const POSITIVE = ['send', 'submit', '发送', '提交', 'arrow_upward', 'arrow_forward'];
+
+    const getBtnText = (btn) =>
+      ((btn.getAttribute('aria-label') || '') + ' ' +
+       (btn.getAttribute('title') || '') + ' ' +
+       btn.textContent).toLowerCase();
+
+    const isBlacklisted = (btn) => {
+      const text = getBtnText(btn);
+      return BLACKLIST.some((kw) => text.includes(kw.toLowerCase()));
+    };
+    const isPositive = (btn) => {
+      const text = getBtnText(btn);
+      return POSITIVE.some((kw) => text.includes(kw.toLowerCase()));
+    };
+
+    const candidates = [];
+    document.querySelectorAll('button, [role="button"]').forEach((btn) => {
+      if (!isVisible(btn) || btn.disabled) return;
+      if (isBlacklisted(btn)) return;
+
+      const rect = btn.getBoundingClientRect();
+      const btnCenterY = (rect.top + rect.bottom) / 2;
+
+      // 空间约束 1: 和输入框同一水平区域 (垂直差 < 80px)
+      const verticalDist = Math.abs(btnCenterY - inputCenterY);
+      if (verticalDist > 80) return;
+
+      // 空间约束 2: 在输入框右侧或紧邻 (水平距离 -50~150px)
+      const horizontalGap = rect.left - inputRect.right;
+      if (horizontalGap < -50 || horizontalGap > 150) return;
+
+      // 评分: 距离越近分越低; 含正面关键词减 1000 优先
+      let score = verticalDist + Math.abs(horizontalGap);
+      if (isPositive(btn)) score -= 1000;
+      candidates.push({ btn, score, isPositive: isPositive(btn) });
+    });
+
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => a.score - b.score);
+
+    // 调试: 列出 top 3 候选
+    const top = candidates.slice(0, Math.min(3, candidates.length));
+    log(`  └ 按钮候选 (top ${top.length}):`, 'debug');
+    top.forEach((c, i) => {
+      const tag = c.isPositive ? '🎯' : '  ';
+      log(`     ${tag} ${i + 1}. ${describeEl(c.btn)} score=${c.score.toFixed(0)}`, 'debug');
+    });
+
+    return candidates[0].btn;
   }
 
   function describeEl(el) {
@@ -411,13 +457,66 @@ function __setSafeInnerHTML(el, htmlString) {
     }
   }
 
-  /** 模拟按 Enter 提交 (作为找不到按钮时的兜底) */
+  /** 模拟按 Enter 提交 */
   function pressEnter(el) {
     el.focus();
     const opts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
     el.dispatchEvent(new KeyboardEvent('keydown', opts));
     el.dispatchEvent(new KeyboardEvent('keypress', opts));
     el.dispatchEvent(new KeyboardEvent('keyup', opts));
+  }
+
+  /** 读输入框的当前内容 */
+  function readInputValue(el) {
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'textarea' || tag === 'input') return el.value || '';
+    return el.textContent || '';
+  }
+
+  /**
+   * 提交消息 - v0.2.0 双策略
+   * 主路: Enter 键 (NotebookLM 标准聊天 UI, Enter 即发送)
+   * 通过"输入框是否被清空"判断 Enter 是否真的触发了提交
+   * 兜底: 找发送按钮点击 (用新的空间约束算法)
+   */
+  async function submitMessage(inputEl) {
+    const beforeValue = readInputValue(inputEl).trim();
+
+    // 主路: Enter
+    log('  ⌨️ 尝试 Enter 键提交', 'info');
+    pressEnter(inputEl);
+    await sleep(800);
+
+    const afterValue = readInputValue(inputEl).trim();
+    // 输入框被清空 = Enter 触发了提交
+    if (beforeValue && !afterValue) {
+      log('  ✅ Enter 提交成功 (输入框已被清空)', 'success');
+      return 'enter';
+    }
+    // 内容变化但没空 - 也认为提交了
+    if (beforeValue && afterValue !== beforeValue) {
+      log('  ✅ Enter 提交成功 (输入框内容已变化)', 'success');
+      return 'enter';
+    }
+
+    log('  ⚠️ Enter 似乎没触发提交, 尝试找发送按钮兜底', 'warn');
+
+    // 兜底: 按钮
+    const btn = findSubmitButton(inputEl);
+    if (btn) {
+      log(`  🖱 已点击按钮: ${describeEl(btn)}`, 'success');
+      btn.click();
+      await sleep(800);
+      const afterBtnValue = readInputValue(inputEl).trim();
+      if (beforeValue && afterBtnValue !== beforeValue) {
+        return 'button';
+      }
+      log('  ⚠️ 点了按钮但输入框未变, 仍当作已提交继续等响应', 'warn');
+      return 'button';
+    }
+
+    log('  ❌ 没找到符合条件的发送按钮 (空间约束+白/黑名单都无候选)', 'error');
+    return null;
   }
 
   /* ═══════════════════════════════════════════════════════════
@@ -542,16 +641,13 @@ function __setSafeInnerHTML(el, htmlString) {
       state.elementSnapshot = snapshotPageText();
       log(`  └ 快照覆盖 ${state.elementSnapshot.size} 个文本元素`, 'debug');
 
-      // [4] 提交
+      // [4] 提交 (v0.2.0: Enter 主路 + 按钮兜底)
       setStatus('busy', '📤 提交中...');
       log('📍 [4/5] 提交问题', 'info');
-      const submitBtn = findSubmitButton(inputEl);
-      if (submitBtn) {
-        submitBtn.click();
-        log(`  └ 已点击提交按钮`, 'success');
-      } else {
-        log('  ⚠️ 未找到提交按钮, 尝试 Enter 键', 'warn');
-        pressEnter(inputEl);
+      const submitMethod = await submitMessage(inputEl);
+      if (!submitMethod) {
+        setStatus('error', '❌ 提交失败');
+        return;
       }
       await sleep(CONFIG.responseInitialDelayMs);
 
