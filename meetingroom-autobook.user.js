@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         会议室自动抢订
 // @namespace    meetingroom-autobook
-// @version      0.11.0
+// @version      0.12.0
 // @description  在系统开放预订时刻自动抢订会议室。带并发限制的工作队列 / 提前连续重试 / 精确对时 / Apple 风格界面 / GUI 配置
 // @author       Lucas
 // @match        https://inner.welink.huawei.com/meetingroom/*
@@ -642,7 +642,9 @@
       const minutes = Math.floor((waitMs % 3600000) / 60000);
       const seconds = Math.floor((waitMs % 60000) / 1000);
       log(`   ⏳ 还剩 ${hours > 0 ? hours + '小时 ' : ''}${minutes > 0 ? minutes + '分 ' : ''}${seconds}秒`, 'info');
-      setStatus('armed', '🟢 已就绪 · 等待开抢');
+      // 状态栏显示触发日 (清晰表达"会在哪天哪刻动")
+      const fireTimeShort = `${String(fireDateObj.getHours()).padStart(2, '0')}:${String(fireDateObj.getMinutes()).padStart(2, '0')}`;
+      setStatus('armed', `🟢 已就绪 · ${fireDateStr} ${dayName} ${fireTimeShort} 开抢`);
 
       if (waitMs > 35000) {
         preTriggerSyncTimerId = setTimeout(() => {
@@ -787,6 +789,13 @@
         border:0.5px solid rgba(0,0,0,0.1);border-radius:7px;cursor:pointer;font-weight:500}
       #mr-panel .preset-btn:hover{background:#fff}
       #mr-panel .preset-btn.on{background:#0071e3;color:#fff;border-color:#0071e3}
+      #mr-panel .slot-row{display:flex;flex-direction:column;gap:4px;margin-bottom:8px;
+        background:rgba(255,255,255,0.7);border:0.5px solid rgba(0,0,0,0.08);
+        border-radius:8px;padding:6px}
+      #mr-panel .slot-cb{display:flex;align-items:center;padding:5px 8px;cursor:pointer;
+        font-size:12px;border-radius:6px;font-weight:500}
+      #mr-panel .slot-cb:hover{background:rgba(0,113,227,0.08)}
+      #mr-panel .slot-cb input{margin-right:8px;accent-color:#0071e3}
       #mr-panel .form-buttons{display:flex;gap:6px;margin-top:8px}
       #mr-panel .form-buttons button{flex:1;padding:7px;font-size:12px}
       #mr-panel .form-buttons button.save{background:#0071e3;color:#fff;border-color:#0071e3;font-weight:500}
@@ -826,7 +835,7 @@
     panel.id = 'mr-panel';
     panel.innerHTML = `
       <div class="h">
-        <span class="tt">📅 会议室自动抢订 v0.11</span>
+        <span class="tt">📅 会议室自动抢订 v0.12</span>
         <span class="tg" id="tg">−</span>
       </div>
       <div class="body" id="body">
@@ -985,22 +994,24 @@
 
     host.innerHTML = `
       <div class="form">
-        <div style="font-size:11px;color:#666;margin-bottom:4px">选择房间 (可多选,会自动展开为多个任务)</div>
+        <div style="font-size:11px;color:#666;margin-bottom:4px">选择房间 (可多选)</div>
         <div class="checkbox-list">${roomCheckboxes}</div>
-        <div style="font-size:11px;color:#666;margin:8px 0 4px">时段</div>
-        <div class="preset-row">
-          <button class="preset-btn" data-preset="morning">上午 08:30~12:00</button>
-          <button class="preset-btn" data-preset="afternoon">下午 14:00~18:00</button>
-          <button class="preset-btn on" data-preset="custom">自定义</button>
+        <div style="font-size:11px;color:#666;margin:8px 0 4px">时段 (可多选, 会与房间组合展开)</div>
+        <div class="slot-row">
+          <label class="slot-cb"><input type="checkbox" name="slot" value="morning" checked> 上午 08:30~12:00</label>
+          <label class="slot-cb"><input type="checkbox" name="slot" value="afternoon"> 下午 14:00~18:00</label>
+          <label class="slot-cb"><input type="checkbox" name="slot" value="custom" id="slot-custom-cb"> 自定义</label>
         </div>
-        <div class="form-row">
-          <label>开始</label>
-          <input type="time" id="task-start" value="08:30" step="1800">
-        </div>
-        <div class="form-row">
-          <label>结束</label>
-          <input type="time" id="task-end" value="12:00" step="1800">
-          <span style="font-size:11px;color:#666">30 分钟颗粒,单段≤4 小时</span>
+        <div id="slot-custom-row" style="display:none">
+          <div class="form-row">
+            <label>开始</label>
+            <input type="time" id="task-start" value="09:00" step="1800">
+          </div>
+          <div class="form-row">
+            <label>结束</label>
+            <input type="time" id="task-end" value="11:00" step="1800">
+            <span style="font-size:11px;color:#666">30 分钟颗粒</span>
+          </div>
         </div>
         <div class="form-buttons">
           <button id="task-save" class="save">保存</button>
@@ -1009,49 +1020,59 @@
         <div class="warn-text" id="task-warn" style="display:none"></div>
       </div>`;
 
-    const presetBtns = host.querySelectorAll('.preset-btn');
-    presetBtns.forEach(btn => {
-      btn.onclick = () => {
-        presetBtns.forEach(b => b.classList.remove('on'));
-        btn.classList.add('on');
-        if (btn.dataset.preset === 'morning') {
-          document.getElementById('task-start').value = '08:30';
-          document.getElementById('task-end').value = '12:00';
-        } else if (btn.dataset.preset === 'afternoon') {
-          document.getElementById('task-start').value = '14:00';
-          document.getElementById('task-end').value = '18:00';
-        }
-      };
-    });
+    // 自定义勾选时显示自定义时间输入
+    const customCb = document.getElementById('slot-custom-cb');
+    const customRow = document.getElementById('slot-custom-row');
+    customCb.onchange = () => {
+      customRow.style.display = customCb.checked ? 'block' : 'none';
+    };
 
     document.getElementById('task-cancel').onclick = () => { host.innerHTML = ''; };
     document.getElementById('task-save').onclick = () => {
-      const checked = Array.from(host.querySelectorAll('input[name=task-room]:checked')).map(c => c.value);
-      const startTime = document.getElementById('task-start').value;
-      const endTime = document.getElementById('task-end').value;
+      const checkedRooms = Array.from(host.querySelectorAll('input[name=task-room]:checked')).map(c => c.value);
+      const checkedSlots = Array.from(host.querySelectorAll('input[name=slot]:checked')).map(c => c.value);
       const warn = document.getElementById('task-warn');
 
-      if (!checked.length) { warn.style.display = 'block'; warn.textContent = '⚠️ 至少选择一个房间'; return; }
-      if (!startTime || !startTime.match(/^\d{2}:\d{2}$/)) { warn.style.display = 'block'; warn.textContent = '⚠️ 开始时间格式错误'; return; }
-      if (!endTime || !endTime.match(/^\d{2}:\d{2}$/)) { warn.style.display = 'block'; warn.textContent = '⚠️ 结束时间格式错误'; return; }
+      if (!checkedRooms.length) { warn.style.display = 'block'; warn.textContent = '⚠️ 至少选择一个房间'; return; }
+      if (!checkedSlots.length) { warn.style.display = 'block'; warn.textContent = '⚠️ 至少选择一个时段'; return; }
 
-      const [sh, sm] = startTime.split(':').map(Number);
-      const [eh, em] = endTime.split(':').map(Number);
-      const duration = (eh * 60 + em) - (sh * 60 + sm);
-      if (duration <= 0) { warn.style.display = 'block'; warn.textContent = '⚠️ 结束时间必须晚于开始时间'; return; }
-      if (duration > 240) { warn.style.display = 'block'; warn.textContent = `⚠️ 单段最长 4 小时,你设置了 ${duration} 分钟`; return; }
-      if (duration < 30) { warn.style.display = 'block'; warn.textContent = '⚠️ 时长不能少于 30 分钟 (系统颗粒度限制)'; return; }
-      if (duration % 30 !== 0) { warn.style.display = 'block'; warn.textContent = `⚠️ 时长必须是 30 分钟的整数倍 (你设置了 ${duration} 分钟)`; return; }
-      if (sm % 30 !== 0 || em % 30 !== 0) { warn.style.display = 'block'; warn.textContent = '⚠️ 开始/结束时刻必须落在整点或半点 (系统限制)'; return; }
+      // 收集所有要展开的时段
+      const slots = [];
+      if (checkedSlots.includes('morning'))   slots.push({ start: '08:30', end: '12:00' });
+      if (checkedSlots.includes('afternoon')) slots.push({ start: '14:00', end: '18:00' });
+      if (checkedSlots.includes('custom')) {
+        const startTime = document.getElementById('task-start').value;
+        const endTime = document.getElementById('task-end').value;
+        if (!startTime || !startTime.match(/^\d{2}:\d{2}$/)) { warn.style.display = 'block'; warn.textContent = '⚠️ 自定义开始时间格式错误'; return; }
+        if (!endTime || !endTime.match(/^\d{2}:\d{2}$/)) { warn.style.display = 'block'; warn.textContent = '⚠️ 自定义结束时间格式错误'; return; }
+        const [csh, csm] = startTime.split(':').map(Number);
+        const [ceh, cem] = endTime.split(':').map(Number);
+        const cdur = (ceh * 60 + cem) - (csh * 60 + csm);
+        if (cdur <= 0) { warn.style.display = 'block'; warn.textContent = '⚠️ 自定义: 结束时间必须晚于开始'; return; }
+        if (cdur > 240) { warn.style.display = 'block'; warn.textContent = `⚠️ 自定义: 单段最长 4 小时,你设置了 ${cdur} 分钟`; return; }
+        if (cdur < 30) { warn.style.display = 'block'; warn.textContent = '⚠️ 自定义: 时长不能少于 30 分钟'; return; }
+        if (cdur % 30 !== 0) { warn.style.display = 'block'; warn.textContent = `⚠️ 自定义: 时长必须是 30 分钟整数倍 (${cdur} 分钟)`; return; }
+        if (csm % 30 !== 0 || cem % 30 !== 0) { warn.style.display = 'block'; warn.textContent = '⚠️ 自定义: 时刻必须整点或半点'; return; }
+        slots.push({ start: startTime, end: endTime });
+      }
 
-      checked.forEach(roomId => {
-        CONFIG.bookings.push({ roomId, startTime, durationMinutes: duration });
+      // 展开为 房间 × 时段
+      let count = 0;
+      checkedRooms.forEach(roomId => {
+        slots.forEach(slot => {
+          const [sh, sm] = slot.start.split(':').map(Number);
+          const [eh, em] = slot.end.split(':').map(Number);
+          const duration = (eh * 60 + em) - (sh * 60 + sm);
+          CONFIG.bookings.push({ roomId, startTime: slot.start, durationMinutes: duration });
+          count++;
+        });
       });
       saveConfig();
       host.innerHTML = '';
       renderTasksPane();
       updateUI();
-      log(`✅ 添加 ${checked.length} 个任务 (${startTime}~${endTime})`, 'success');
+      const slotDesc = slots.map(s => `${s.start}~${s.end}`).join(', ');
+      log(`✅ 添加 ${count} 个任务 (${checkedRooms.length} 房间 × ${slots.length} 时段: ${slotDesc})`, 'success');
     };
   }
 
@@ -1179,15 +1200,19 @@
       </div>
       <div class="form-row">
         <label>提前天数</label>
-        <input type="number" id="set-days" value="${CONFIG.timing.daysAhead}" min="0" max="14">
-        <span style="font-size:11px;color:#666">≤7 滚动 · &gt;7 自动转目标日期</span>
+        <input type="number" id="set-days" value="${(() => {
+          // 智能反推: 若已存目标日期, 显示"目标日期 - 今天"的天数
+          const td = parseTargetDate(CONFIG.timing.targetDate);
+          if (td) {
+            const today0 = new Date(); today0.setHours(0, 0, 0, 0);
+            const diff = Math.round((td.getTime() - today0.getTime()) / 86400000);
+            if (diff >= 0 && diff <= 14) return diff;
+          }
+          return CONFIG.timing.daysAhead;
+        })()}" min="0" max="14">
+        <span style="font-size:11px;color:#666">≤7 滚动 · &gt;7 自动转固定日期</span>
       </div>
-      <div class="form-row">
-        <label>目标日期</label>
-        <input type="date" id="set-target" value="${CONFIG.timing.targetDate || ''}">
-        <span class="task-clear-btn" id="set-target-clear" title="清除目标日期, 改用滚动模式">清除</span>
-      </div>
-      <div class="form-row" style="background:rgba(0,113,227,0.06);padding:6px 10px;border-radius:8px;margin-top:-2px">
+      <div class="form-row" style="background:rgba(0,113,227,0.06);padding:6px 10px;border-radius:8px">
         <label style="color:#0071e3">实际预订</label>
         <span style="font-weight:600;color:#0071e3" id="set-effective-date">${formatBookingDate()}</span>
       </div>
@@ -1216,38 +1241,41 @@
       </div>
       <div class="warn-text" id="set-warn" style="display:none"></div>
       <div class="help">💡 服务器有 ~4 并发限制。"提前ms"让脚本提前几毫秒开始尝试,被拒绝就重试,直到 8:30 真正开放。<br>
-      <b>实战推荐:提前 ms = 200~500</b>(太大会浪费令牌桶限流额度,反而拖慢首次成功)。<br>
-      <b>📅 目标日期 vs 提前天数</b>:<br>
-      • 留空目标日期 = 滚动模式(执行时取 today + 提前天数,适合日常每天抢)<br>
-      • 设置目标日期 = 固定模式(始终订那一天,适合提前几天配置好等周一执行)
+      <b>实战推荐:提前 ms = 200~500</b>(太大会浪费令牌桶限流额度)。<br>
+      <b>📅 提前天数</b>:≤7 = 滚动模式(每天抢 N 天后);&gt;7 = 固定日期模式(锁定特定那天,自动选合适执行日)。
       </div>`;
 
     // 实时刷新"实际预订"显示
     const refreshEffective = () => {
       const days = parseInt(document.getElementById('set-days').value, 10) || 0;
-      const target = document.getElementById('set-target').value.trim();
       const oldDays = CONFIG.timing.daysAhead;
       const oldTarget = CONFIG.timing.targetDate;
-      CONFIG.timing.daysAhead = days;
-      CONFIG.timing.targetDate = target || null;
+      // 临时计算
+      if (days > 7) {
+        const today0 = new Date(); today0.setHours(0, 0, 0, 0);
+        const t = new Date(today0);
+        t.setDate(t.getDate() + days);
+        const yy = t.getFullYear();
+        const mo = String(t.getMonth() + 1).padStart(2, '0');
+        const dd = String(t.getDate()).padStart(2, '0');
+        CONFIG.timing.targetDate = `${yy}-${mo}-${dd}`;
+        CONFIG.timing.daysAhead = 7;
+      } else {
+        CONFIG.timing.targetDate = null;
+        CONFIG.timing.daysAhead = days;
+      }
       const el = document.getElementById('set-effective-date');
       if (el) el.textContent = formatBookingDate();
-      // 不真正保存, 还原
+      // 还原, 真正的保存才落盘
       CONFIG.timing.daysAhead = oldDays;
       CONFIG.timing.targetDate = oldTarget;
     };
     document.getElementById('set-days').oninput = refreshEffective;
-    document.getElementById('set-target').oninput = refreshEffective;
-    document.getElementById('set-target-clear').onclick = () => {
-      document.getElementById('set-target').value = '';
-      refreshEffective();
-    };
 
     document.getElementById('set-save').onclick = () => {
       const subject = document.getElementById('set-subject').value.trim();
       const open = document.getElementById('set-open').value.trim();
       const days = parseInt(document.getElementById('set-days').value, 10);
-      const target = document.getElementById('set-target').value.trim();
       const pretrig = parseInt(document.getElementById('set-pretrig').value, 10);
       const maxdur = parseInt(document.getElementById('set-maxdur').value, 10);
       const conc = parseInt(document.getElementById('set-conc').value, 10);
@@ -1255,38 +1283,31 @@
       if (!subject) { warn.style.display = 'block'; warn.textContent = '⚠️ 主题不能为空'; return; }
       if (!open.match(/^\d{2}:\d{2}:\d{2}$/)) { warn.style.display = 'block'; warn.textContent = '⚠️ 开抢时刻格式应为 HH:MM:SS'; return; }
       if (isNaN(days) || days < 0 || days > 14) { warn.style.display = 'block'; warn.textContent = '⚠️ 提前天数必须在 0~14 之间'; return; }
-      // 目标日期校验 (用户手动设置的)
-      if (target) {
-        const td = parseTargetDate(target);
-        if (!td) { warn.style.display = 'block'; warn.textContent = '⚠️ 目标日期格式错误 (应为 YYYY-MM-DD)'; return; }
-        const today0 = new Date(); today0.setHours(0, 0, 0, 0);
-        if (td.getTime() < today0.getTime()) { warn.style.display = 'block'; warn.textContent = '⚠️ 目标日期不能在过去'; return; }
-        const diffDays = Math.round((td.getTime() - today0.getTime()) / 86400000);
-        if (diffDays > 14) { warn.style.display = 'block'; warn.textContent = `⚠️ 目标日期距今 ${diffDays} 天太远, 最多 14 天`; return; }
-      }
       if (isNaN(pretrig) || pretrig < 0 || pretrig > 60000) { warn.style.display = 'block'; warn.textContent = '⚠️ 提前ms应在 0~60000 之间'; return; }
       if (isNaN(maxdur) || maxdur < 10) { warn.style.display = 'block'; warn.textContent = '⚠️ 持续时长太短'; return; }
       if (isNaN(conc) || conc < 1 || conc > 10) { warn.style.display = 'block'; warn.textContent = '⚠️ 并发数应在 1~10 之间'; return; }
 
-      // 关键: 提前天数 > 7 时自动转为目标日期模式
-      // 否则在执行那一刻 today + 9 = 错误日期 (例如周一执行 today+9 就是 5/20 而非 5/18)
-      let finalTargetDate = target || null;
+      // 简化模型: daysAhead 单一驱动
+      // ≤7 = 滚动模式 (清空 targetDate)
+      // >7 = 固定日期模式 (自动算 targetDate, daysAhead 重置为 7)
+      let finalTargetDate = null;
       let finalDaysAhead = days;
       let autoConvertNote = '';
-      if (days > 7 && !finalTargetDate) {
+      if (days > 7) {
         const today0 = new Date(); today0.setHours(0, 0, 0, 0);
-        const t = new Date(today0);
-        t.setDate(t.getDate() + days);
-        const yy = t.getFullYear();
-        const mo = String(t.getMonth() + 1).padStart(2, '0');
-        const dd = String(t.getDate()).padStart(2, '0');
+        const tDay = new Date(today0);
+        tDay.setDate(tDay.getDate() + days);
+        const yy = tDay.getFullYear();
+        const mo = String(tDay.getMonth() + 1).padStart(2, '0');
+        const dd = String(tDay.getDate()).padStart(2, '0');
         finalTargetDate = `${yy}-${mo}-${dd}`;
-        finalDaysAhead = 7;  // 重置为安全值, targetDate 接管
-        autoConvertNote = `(已自动转为目标日期 ${finalTargetDate})`;
-      } else if (days > 7 && finalTargetDate) {
-        // 用户既填了目标日期又填了 >7 的天数, 以日期为准, 把 days 重置
         finalDaysAhead = 7;
-        autoConvertNote = `(目标日期 ${finalTargetDate} 优先, 提前天数已重置为 7)`;
+        // 触发日 = targetDate - 7 天
+        const fireDay = new Date(tDay);
+        fireDay.setDate(fireDay.getDate() - 7);
+        const fireDayName = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][fireDay.getDay()];
+        const targetDayName = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][tDay.getDay()];
+        autoConvertNote = ` (锁定 ${finalTargetDate} ${targetDayName}, 将于 ${fireDay.getMonth() + 1}月${fireDay.getDate()}日 ${fireDayName} 8:30 触发)`;
       }
 
       CONFIG.meeting.subject = subject;
@@ -1297,7 +1318,7 @@
       CONFIG.timing.maxAttemptDurationSec = maxdur;
       CONFIG.advanced.concurrency = conc;
       saveConfig();
-      log(`✅ 设置已保存${autoConvertNote ? ' ' + autoConvertNote : ''}`, 'success');
+      log(`✅ 设置已保存${autoConvertNote}`, 'success');
       updateUI();
     };
 
@@ -1442,14 +1463,19 @@
     if (CONFIG.timing.daysAhead > 7) {
       return { level: 'warn', text: `⚠️ 提前天数 ${CONFIG.timing.daysAhead} > 7,系统会拒绝。请改为 ≤7` };
     }
-    // 目标日期模式: 校验执行时刻是否在 7 天内
-    const effDays = getEffectiveDaysAhead();
-    if (effDays > 7) {
-      const dateStr = formatBookingDate();
-      return { level: 'warn', text: `⚠️ 目标日期 ${dateStr} 距今 ${effDays} 天 > 7,执行时若仍超过 7 天会失败` };
-    }
-    if (effDays < 0) {
-      return { level: 'error', text: `⚠️ 目标日期已过期, 请重新选择` };
+    // 固定日期模式: 信任智能调度 (会自动选 targetDate-7 天的 8:30 触发)
+    // 仅校验日期是否过期或太远
+    const target = parseTargetDate(CONFIG.timing.targetDate);
+    if (target) {
+      const today0 = new Date(); today0.setHours(0, 0, 0, 0);
+      const diffDays = Math.round((target.getTime() - today0.getTime()) / 86400000);
+      if (diffDays < 0) {
+        return { level: 'error', text: `⚠️ 目标日期已过期, 请重新设置` };
+      }
+      if (diffDays > 14) {
+        return { level: 'warn', text: `⚠️ 目标日期距今 ${diffDays} 天 > 14, 太远` };
+      }
+      // 正常: 智能调度会选合适的触发日, 无需警告
     }
     if (syncQuality === 'NONE') {
       return { level: 'warn', text: `⏳ 等待服务器对时...` };
@@ -1501,7 +1527,7 @@
       return;
     }
     buildUI();
-    log('✅ 会议室自动抢订 v0.11.0 已加载');
+    log('✅ 会议室自动抢订 v0.12.0 已加载');
     log(`📋 已配置 ${CONFIG.bookings.length} 个任务 / ${CONFIG.rooms.length} 个房间`);
 
     setTimeout(() => {
