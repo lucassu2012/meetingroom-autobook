@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 - NotebookLM 端 (Stage 2)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.3.0
+// @version      0.4.0
 // @description  在 NotebookLM 上自动化输入题目、提交、抓取解析(Stage 2: 不连 iLearning, 手动测试)
 // @author       Lucas
 // @match        https://notebooklm.google.com/*
@@ -14,6 +14,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.4.0 - 🔥关键修复: 排除浮窗自身的 textarea/button (之前会把我自己的 textarea 当成 NotebookLM 输入框); 找按钮加重试机制
 // v0.3.0 - 输入注入改用 execCommand (穿透 Web Component); 空间约束放宽; 允许 disabled 按钮候选; 探测面板列出周围所有按钮
 // v0.2.0 - Enter主路提交策略; 找按钮加空间约束+黑/白名单(避免选到"收起Studio"); 响应噪音阈值 30→150
 // v0.1.2 - 修复 Trusted Types CSP 拦截 (NotebookLM 禁止直接 innerHTML 赋值); 浮窗现在能在 NotebookLM 渲染
@@ -71,7 +72,7 @@ function __setSafeInnerHTML(el, htmlString) {
   /* ═══════════════════════════════════════════════════════════
      ⚙️  CONFIG
      ═══════════════════════════════════════════════════════════ */
-  const VERSION = '0.3.0';
+  const VERSION = '0.4.0';
   const STAGE_LABEL = 'Stage 2';
 
   const CONFIG = {
@@ -317,18 +318,19 @@ function __setSafeInnerHTML(el, htmlString) {
     const candidates = [];
     // textarea
     document.querySelectorAll('textarea').forEach((el) => {
+      if (el.closest('#nlh-panel')) return; // v0.4.0: 排除自己浮窗里的 textarea
       if (isVisible(el) && !el.disabled && !el.readOnly) {
         candidates.push({ el, score: areaScore(el) + 100 }); // textarea 加分
       }
     });
     // contenteditable
     document.querySelectorAll('[contenteditable="true"]').forEach((el) => {
+      if (el.closest('#nlh-panel')) return; // v0.4.0
       if (isVisible(el)) {
         candidates.push({ el, score: areaScore(el) });
       }
     });
     if (candidates.length === 0) return null;
-    // 按 score 取最大的
     candidates.sort((a, b) => b.score - a.score);
     return candidates[0].el;
   }
@@ -387,6 +389,7 @@ function __setSafeInnerHTML(el, htmlString) {
 
     const candidates = [];
     document.querySelectorAll('button, [role="button"]').forEach((btn) => {
+      if (btn.closest('#nlh-panel')) return; // v0.4.0: 排除自己浮窗里的按钮
       if (!isVisible(btn)) return;
       // v0.3.0: 不再排除 disabled (execCommand 注入后 disabled 会变 enabled)
       if (isBlacklisted(btn)) return;
@@ -527,17 +530,35 @@ function __setSafeInnerHTML(el, htmlString) {
 
     log('  ⚠️ Enter 似乎没触发提交, 尝试找发送按钮兜底', 'warn');
 
-    // 兜底: 按钮
-    const btn = findSubmitButton(inputEl);
+    // 兜底: 按钮 (v0.4.0: 重试找 enabled, execCommand 后框架可能需要 100-500ms 切 disabled→enabled)
+    let btn = null;
+    for (let i = 0; i < 5; i++) {
+      btn = findSubmitButton(inputEl);
+      if (btn && !btn.disabled) {
+        log(`  ✓ 找到 enabled 按钮 (第 ${i + 1} 次尝试)`, 'debug');
+        break;
+      }
+      if (btn) {
+        log(`  ⏳ 按钮还是 disabled (第 ${i + 1}/5 次), 等 400ms`, 'debug');
+      } else {
+        log(`  ⏳ 还没找到按钮 (第 ${i + 1}/5 次), 等 400ms`, 'debug');
+      }
+      await sleep(400);
+    }
+
     if (btn) {
-      log(`  🖱 已点击按钮: ${describeEl(btn)}`, 'success');
+      log(`  🖱 点击按钮: ${describeEl(btn)} (disabled=${btn.disabled})`, 'success');
       btn.click();
       await sleep(800);
       const afterBtnValue = readInputValue(inputEl).trim();
       if (beforeValue && afterBtnValue !== beforeValue) {
         return 'button';
       }
-      log('  ⚠️ 点了按钮但输入框未变, 仍当作已提交继续等响应', 'warn');
+      if (btn.disabled) {
+        log('  ❌ 按钮始终是 disabled, 提交可能失败', 'error');
+      } else {
+        log('  ⚠️ 点了按钮但输入框未变, 仍当作已提交继续等响应', 'warn');
+      }
       return 'button';
     }
 
@@ -797,6 +818,7 @@ function __setSafeInnerHTML(el, htmlString) {
     const inputCenterY = (ir.top + ir.bottom) / 2;
     const allBtns = [];
     document.querySelectorAll('button, [role="button"]').forEach((b) => {
+      if (b.closest('#nlh-panel')) return; // v0.4.0: 排除自己浮窗
       if (!isVisible(b)) return;
       const r = b.getBoundingClientRect();
       const verticalDist = Math.abs((r.top + r.bottom) / 2 - inputCenterY);
