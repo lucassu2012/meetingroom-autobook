@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.6.0
+// @version      0.6.1
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.6.1 - 修题型识别(多选题被识别成单选题) + 修批次大小输入框被切题箭头键误触发
 // v0.6.0 - Stage 3.5 阶段A: iLearning 端批量预取面板(进度+未识别题号+批次大小可配置). 阶段B(NotebookLM真批处理)分别实现
 // v0.5.7 - markdown 渲染段落紧凑化(去掉换行符夹层 + margin 归零)
 // v0.5.6 - iLearning 浮窗渲染 markdown(粗体/列表/嵌套), 不再是 raw 文本
@@ -735,14 +736,54 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
 
     function findQuestionType() {
       const types = ['单选题', '多选题', '判断题'];
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-      let node;
-      while ((node = walker.nextNode())) {
-        const t = node.textContent.trim();
-        if (t.length > 5) continue;
-        for (const tp of types) if (t === tp) return tp;
+      // v0.6.1: 找所有题型候选 - sidebar 里可能有"单选题/多选题"分类标签, 不能取第一个
+      const candidates = [];
+      const w1 = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      let n1;
+      while ((n1 = w1.nextNode())) {
+        const t = n1.textContent.trim();
+        if (t.length > 5 || t.length < 2) continue;
+        if (types.includes(t)) candidates.push(n1);
       }
-      return '未知题型';
+      if (candidates.length === 0) return '未知题型';
+      if (candidates.length === 1) return candidates[0].textContent.trim();
+
+      // 多候选: 找包含"第 X/Y 题"的元素, 选 DOM 距离最近的题型
+      const positionRe = /第\s*\d+\s*\/\s*\d+\s*题/;
+      let positionEl = null;
+      const w2 = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      let n2;
+      while ((n2 = w2.nextNode())) {
+        if (n2.textContent.length < 200 && positionRe.test(n2.textContent)) {
+          positionEl = n2.parentElement;
+          break;
+        }
+      }
+      if (!positionEl) return candidates[0].textContent.trim();
+
+      let best = candidates[0];
+      let bestDist = Infinity;
+      for (const c of candidates) {
+        const cParent = c.parentElement;
+        if (!cParent) continue;
+        const d = domDistance(cParent, positionEl);
+        if (d < bestDist) { bestDist = d; best = c; }
+      }
+      return best.textContent.trim();
+    }
+
+    /** v0.6.1: 计算两个 element 在 DOM 树中的距离 (祖先链 LCA 距离之和) */
+    function domDistance(a, b) {
+      if (a === b) return 0;
+      const aAnc = new Map();
+      let p = a, d = 0;
+      while (p) { aAnc.set(p, d++); p = p.parentElement; }
+      p = b; d = 0;
+      while (p) {
+        if (aAnc.has(p)) return aAnc.get(p) + d;
+        d++; p = p.parentElement;
+      }
+      return Infinity;
     }
 
     function findStem(expectedPosition) {
@@ -902,7 +943,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           }
         }
       });
-      document.getElementById('ilh-batch-size').addEventListener('change', (e) => {
+      const batchSizeInput = document.getElementById('ilh-batch-size');
+      batchSizeInput.addEventListener('change', (e) => {
         const v = parseInt(e.target.value, 10);
         if (Number.isInteger(v) && v >= 1 && v <= 50) {
           batchState.batchSize = v;
@@ -910,6 +952,14 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           updateBatchPanel();
         } else {
           e.target.value = batchState.batchSize;
+        }
+        e.target.blur(); // v0.6.1: 改完失焦, 防止后续切题键被吃
+      });
+      // v0.6.1: 阻止 number input 在箭头键时自己 step (但不阻止事件传播给 iLearning 切题)
+      batchSizeInput.addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowUp' || e.key === 'ArrowDown' ||
+            e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+          e.preventDefault();
         }
       });
       document.getElementById('ilh-batch-start').addEventListener('click', () => {
