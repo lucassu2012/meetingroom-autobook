@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.5.2
+// @version      0.5.3
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.5.3 - 修复 user message 容器识别(原版漏排除选项兄弟元素); 加导出题库 JSON
 // v0.5.2 - 修复缓存抓错(排除user message区) + 加防错入库sanity check + 缓存优先 + 心跳容忍90s
 // v0.5.1 - 修复 SPA 路由问题 (NotebookLM/iLearning 的客户端路由不刷新页面, 之前脚本错过初始化)
 // v0.5.0 - Stage 3: 合并 iLearning + NotebookLM 双端, GM 存储桥接, 开题自动出解析
@@ -981,6 +982,59 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       return true;
     }
 
+    /** v0.5.3: 导出所有缓存数据为 JSON 下载 */
+    function exportCache() {
+      const allKeys = Bridge.listAllKeys();
+      const requests = {}, responses = {};
+      let counts = { total: 0, done: 0, error: 0, pending: 0 };
+      allKeys.forEach((k) => {
+        const v = GM_getValue(k, null);
+        if (k.startsWith('ilh:request:')) {
+          requests[k.replace('ilh:request:', '')] = v;
+        } else if (k.startsWith('ilh:response:')) {
+          responses[k.replace('ilh:response:', '')] = v;
+          counts.total++;
+          if (v && v.status) counts[v.status] = (counts[v.status] || 0) + 1;
+        }
+      });
+      // 组合: 每题一个对象
+      const combined = [];
+      for (const qId in requests) {
+        const req = requests[qId];
+        const resp = responses[qId];
+        combined.push({
+          id: qId,
+          position: req.position || null,
+          total: req.total || null,
+          type: req.type || null,
+          stem: req.stem || null,
+          options: req.options || [],
+          response_status: resp ? resp.status : 'pending',
+          response_text: resp ? resp.text : null,
+          response_error: resp ? resp.error : null,
+          response_at: resp ? new Date(resp.timestamp).toISOString() : null,
+        });
+      }
+      combined.sort((a, b) => (a.position || 9999) - (b.position || 9999));
+      const exportData = {
+        exported_at: new Date().toISOString(),
+        notebook_url: location.href,
+        stats: counts,
+        questions: combined,
+      };
+      const json = JSON.stringify(exportData, null, 2);
+      const blob = new Blob([json], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `ilearning-cache-${new Date().toISOString().slice(0, 19).replace(/[:.]/g, '-')}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      log(`📥 已导出 ${combined.length} 道题 (done: ${counts.done}, error: ${counts.error})`, 'success');
+    }
+
     function describeEl(el) {
       const tag = el.tagName.toLowerCase();
       const cls = el.className && typeof el.className === 'string' ? `.${el.className.split(' ')[0]}` : '';
@@ -1213,18 +1267,19 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         }
         await sleep(CONFIG.responseInitialDelayMs);
 
-        // 4.5. v0.5.2: 识别 user message 区域并加入排除集
-        // 提交后, NotebookLM 会先把用户消息显示在对话区, 我们要确保不抓到它
-        const userMsgEl = findUserMessageElement(text);
+        // 4.5. v0.5.3: 识别完整 user message 容器(含题干+选项), 整个排除
+        const userMsgEl = findUserMessageContainer(text, req.options || []);
         const excludedNodes = new Set();
         if (userMsgEl) {
-          log(`  └ 识别到 user message: ${describeEl(userMsgEl)}`, 'debug');
-          // 自己 + 所有祖先 + 所有后代加入排除
-          let p = userMsgEl;
-          while (p && p !== document.body) { excludedNodes.add(p); p = p.parentElement; }
+          log(`  └ user message 容器: ${describeEl(userMsgEl)} (包含 ${userMsgEl.querySelectorAll('*').length} 个子元素)`, 'debug');
+          // 容器自己 + 所有后代 (包括题干、选项、所有兄弟)
+          excludedNodes.add(userMsgEl);
           userMsgEl.querySelectorAll('*').forEach((c) => excludedNodes.add(c));
+          // 祖先(因为祖先 textContent 包含 user message, 但兄弟 = AI response 不会被排除)
+          let p = userMsgEl.parentElement;
+          while (p && p !== document.body) { excludedNodes.add(p); p = p.parentElement; }
         } else {
-          log('  ⚠️ 未识别到 user message, 用旧的过滤逻辑', 'warn');
+          log('  ⚠️ 未识别到 user message 容器, 退回旧过滤', 'warn');
         }
 
         // 5. 等响应
@@ -1235,11 +1290,33 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           return;
         }
 
-        // 5.5. v0.5.2: Sanity check - 响应不应该完全是题目本身
-        const fingerprint = text.substring(0, 60).trim();
-        if (fingerprint.length >= 20 && responseText.includes(fingerprint)) {
-          log(`  ⚠️ 响应包含原题指纹, 大概率抓到了 user message 而不是 AI 回答`, 'warn');
-          Bridge.writeResponse(req.id, responseText, 'error', '抓到了用户消息区而非 AI 回答, 请重新请求');
+        // 5.5. v0.5.3: Sanity check - normalize 空白后比对
+        const normalizedResp = responseText.replace(/\s+/g, ' ').trim();
+        const stemFp = (req.stem || '').substring(0, 40).replace(/\s+/g, ' ').trim();
+        const optFp = (req.options && req.options[0] ? req.options[0].content : '').substring(0, 25).replace(/\s+/g, ' ').trim();
+        let suspicious = false;
+        let suspReason = '';
+        // 检查 1: 响应是否包含题干特征
+        if (stemFp.length >= 15 && normalizedResp.includes(stemFp)) {
+          suspicious = true;
+          suspReason = '响应包含题干指纹';
+        }
+        // 检查 2: 响应是否大段就是选项原文
+        if (optFp.length >= 10 && normalizedResp.includes(optFp) && req.options.length >= 2) {
+          // 看是否所有选项都在响应里(说明响应就是选项罗列)
+          let optsInResp = 0;
+          for (const opt of req.options) {
+            const fp = (opt.content || '').substring(0, 20).replace(/\s+/g, ' ').trim();
+            if (fp.length >= 8 && normalizedResp.includes(fp)) optsInResp++;
+          }
+          if (optsInResp >= req.options.length - 1) {
+            suspicious = true;
+            suspReason = `响应包含 ${optsInResp}/${req.options.length} 个选项原文`;
+          }
+        }
+        if (suspicious) {
+          log(`  ⚠️ ${suspReason}, 大概率抓到了 user message 而不是 AI 回答`, 'warn');
+          Bridge.writeResponse(req.id, responseText, 'error', `${suspReason}: 抓到了用户消息区, 请重新请求`);
           return;
         }
 
@@ -1258,25 +1335,51 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       }
     }
 
-    /** v0.5.2: 找包含完整题目指纹的最深 + 最短(最具体)元素 = user message */
-    function findUserMessageElement(questionText) {
-      const fingerprint = questionText.substring(0, 80).replace(/\s+/g, ' ').trim();
-      if (fingerprint.length < 20) return null;
-      const candidates = [];
+    /**
+     * v0.5.3: 找完整 user message 容器(必须同时包含题干和至少一个选项)
+     * 旧版只找包含题干指纹的最具体元素, 但选项是兄弟元素时排除不到, 导致抓到选项当解析
+     */
+    function findUserMessageContainer(questionText, options) {
+      const stemFp = questionText.substring(0, 80).replace(/\s+/g, ' ').trim();
+      if (stemFp.length < 15) return null;
+
+      // 1. 找所有包含题干指纹的元素
+      const stemEls = [];
       document.querySelectorAll('*').forEach((el) => {
         if (el.closest('#nlh-panel')) return;
         const elText = el.textContent.replace(/\s+/g, ' ').trim();
-        if (elText.includes(fingerprint)) {
+        if (elText.includes(stemFp)) {
           let depth = 0;
           let p = el;
           while (p && p !== document.body) { depth++; p = p.parentElement; }
-          candidates.push({ el, depth, len: elText.length });
+          stemEls.push({ el, depth });
         }
       });
-      if (candidates.length === 0) return null;
-      // 优先短的(纯 user message), 再深的
-      candidates.sort((a, b) => (a.len - b.len) || (b.depth - a.depth));
-      return candidates[0].el;
+      if (stemEls.length === 0) return null;
+      // 取最深(最具体)的
+      stemEls.sort((a, b) => b.depth - a.depth);
+      const deepestStem = stemEls[0].el;
+
+      // 2. 从最深题干元素往上爬, 找祖先链中"也包含至少一个选项内容"的最近祖先
+      // 这个祖先 = user message 容器(包含题干+选项)
+      if (options && options.length > 0) {
+        let p = deepestStem;
+        while (p && p !== document.body) {
+          const text = p.textContent.replace(/\s+/g, ' ').trim();
+          let hasOption = false;
+          for (const opt of options) {
+            const optFp = (opt.content || '').substring(0, 25).replace(/\s+/g, ' ').trim();
+            if (optFp.length >= 8 && text.includes(optFp)) {
+              hasOption = true;
+              break;
+            }
+          }
+          if (hasOption) return p; // 找到了 user message 容器
+          p = p.parentElement;
+        }
+      }
+      // 3. 没找到包含选项的祖先(可能题/判断题没选项), 退回到题干元素
+      return deepestStem;
     }
 
     function formatQuestionForNLM(req) {
@@ -1332,8 +1435,9 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           <div class="nlh-current-content" id="nlh-current-content" style="opacity:0.5">空闲中</div>
         </div>
         <div id="nlh-actions">
-          <button class="nlh-btn" id="nlh-btn-detect">🔍 仅探测元素</button>
-          <button class="nlh-btn" id="nlh-btn-clear">🗑️ 清空缓存</button>
+          <button class="nlh-btn" id="nlh-btn-detect">🔍 仅探测</button>
+          <button class="nlh-btn" id="nlh-btn-export">📥 导出</button>
+          <button class="nlh-btn" id="nlh-btn-clear">🗑️ 清空</button>
         </div>
         <div id="nlh-log-section">
           <div id="nlh-log-header">
@@ -1375,6 +1479,9 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         Bridge.clearAll();
         log('🗑️ 已清空所有桥接数据', 'warn');
         updateStats();
+      });
+      document.getElementById('nlh-btn-export').addEventListener('click', () => {
+        exportCache();
       });
 
       // 拖拽
