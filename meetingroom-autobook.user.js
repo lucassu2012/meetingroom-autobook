@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         会议室自动抢订
 // @namespace    meetingroom-autobook
-// @version      0.7.0
-// @description  在系统开放预订时刻自动抢订会议室。带并发限制的工作队列 / 提前连续重试 / 精确对时 / GUI 配置 / 固定高度浮窗。
+// @version      0.8.0
+// @description  在系统开放预订时刻自动抢订会议室。带并发限制的工作队列 / 提前连续重试 / 精确对时 / Apple 风格界面 / GUI 配置
 // @author       Lucas
 // @match        https://inner.welink.huawei.com/meetingroom/*
 // @grant        none
@@ -23,7 +23,9 @@
     timing: {
       bookingOpenTime: '08:30:00',
       daysAhead: 7,
-      preTriggerMs: 1000,           // 提前 N 毫秒开始尝试 (默认 1 秒)
+      preTriggerMs: 300,            // 提前 N 毫秒开始尝试 (默认 300ms)
+                                    // 实战调优: 提前太多 (如 1000ms) 会浪费令牌桶限流额度
+                                    // 提前太少 (如 0ms) 又可能因网络抖动错过开放瞬间
       maxAttemptDurationSec: 90,    // 最长持续重试 90 秒
     },
     meeting: {
@@ -77,6 +79,11 @@
             cfg.timing.preTriggerMs = cfg.timing.preTriggerSeconds * 1000;
           }
           delete cfg.timing.preTriggerSeconds;
+        }
+        // v0.7 → v0.8 迁移: 老默认 preTriggerMs=1000 实战发现太大,自动迁移到新默认 300
+        // 用户如果手动设过其它值(500, 800 等)则保留
+        if (cfg.timing && cfg.timing.preTriggerMs === 1000) {
+          cfg.timing.preTriggerMs = 300;
         }
         return cfg;
       }
@@ -312,6 +319,11 @@
     if (code === 8 || m.includes('resource_exhausted') || m.includes('请求次数过多') || m.includes('过于频繁')) {
       return { type: 'RATE_LIMIT', tip: `⏱ 请求频率限制 · 自动重试中`, retry: true, retryDelayMs: 200 };
     }
+    // 尚未到开放时刻 (服务器英文错误码) - 跟"日期还没滚到"是不同概念
+    // 这是"今天 8:30 还没到"的语义,必须持续重试,无关 daysAhead 设置
+    if (m.includes('not_reaching_schedule_start') || m.includes('not_reaching') || m.includes('schedule_start_time')) {
+      return { type: 'NOT_OPEN', tip: `⏳ 尚未到开放时刻 · 持续尝试`, retry: true, retryDelayMs: 150 };
+    }
     // 超过提前预订天数 - 当 daysAhead<=7 时,这是"尚未滚动到第7天",必须持续重试
     // 注意: 80ms 太快会触发服务器限流 (10 任务 × 38 req/s = 限流爆炸), 用 150ms 平衡
     if (m.includes('exceed_booking_advance') || m.includes('exceed_advance')) {
@@ -320,7 +332,7 @@
       }
       return { type: 'OUT_OF_RANGE', tip: `📅 超出可预订范围 · 提前天数 ${CONFIG.timing.daysAhead} > 7`, retry: false };
     }
-    // 尚未到开放时刻 - 持续重试直到放开
+    // 中文 fallback - 持续重试直到放开
     if (m.includes('尚未') || m.includes('未开放') || m.includes('未到') || m.includes('not_open') || m.includes('not open')) {
       return { type: 'NOT_OPEN', tip: `⏳ 尚未开放预订 · 持续尝试中`, retry: true, retryDelayMs: 150 };
     }
@@ -758,7 +770,7 @@
     panel.id = 'mr-panel';
     panel.innerHTML = `
       <div class="h">
-        <span class="tt">📅 会议室自动抢订 v0.7</span>
+        <span class="tt">📅 会议室自动抢订 v0.8</span>
         <span class="tg" id="tg">−</span>
       </div>
       <div class="body" id="body">
@@ -1138,7 +1150,9 @@
         <button id="set-reset" style="color:#c62828">恢复默认</button>
       </div>
       <div class="warn-text" id="set-warn" style="display:none"></div>
-      <div class="help">💡 服务器有 ~4 并发限制。"提前ms"让脚本提前几毫秒开始尝试,被拒绝就重试,直到 8:30 真正开放。<br>"持续"是最长尝试时长(超时未成功就放弃)。</div>`;
+      <div class="help">💡 服务器有 ~4 并发限制。"提前ms"让脚本提前几毫秒开始尝试,被拒绝就重试,直到 8:30 真正开放。<br>
+      <b>实战推荐:提前 ms = 200~500</b>(太大会浪费令牌桶限流额度,反而拖慢首次成功)。<br>
+      "持续"是最长尝试时长(超时未成功就放弃)。</div>`;
 
     document.getElementById('set-save').onclick = () => {
       const subject = document.getElementById('set-subject').value.trim();
@@ -1356,7 +1370,7 @@
       return;
     }
     buildUI();
-    log('✅ 会议室自动抢订 v0.7.0 已加载');
+    log('✅ 会议室自动抢订 v0.8.0 已加载');
     log(`📋 已配置 ${CONFIG.bookings.length} 个任务 / ${CONFIG.rooms.length} 个房间`);
 
     setTimeout(() => {
@@ -1376,4 +1390,3 @@
     init();
   }
 })();
-
