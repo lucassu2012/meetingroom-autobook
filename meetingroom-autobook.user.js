@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         会议室自动抢订
 // @namespace    meetingroom-autobook
-// @version      0.8.0
+// @version      0.9.0
 // @description  在系统开放预订时刻自动抢订会议室。带并发限制的工作队列 / 提前连续重试 / 精确对时 / Apple 风格界面 / GUI 配置
 // @author       Lucas
 // @match        https://inner.welink.huawei.com/meetingroom/*
@@ -22,7 +22,8 @@
   const DEFAULTS = {
     timing: {
       bookingOpenTime: '08:30:00',
-      daysAhead: 7,
+      daysAhead: 7,                 // "滚动模式": 在执行那一刻 today + daysAhead 算预订日期
+      targetDate: null,             // "固定日期模式": ISO 字符串如 '2026-05-18',若设置则覆盖 daysAhead
       preTriggerMs: 300,            // 提前 N 毫秒开始尝试 (默认 300ms)
                                     // 实战调优: 提前太多 (如 1000ms) 会浪费令牌桶限流额度
                                     // 提前太少 (如 0ms) 又可能因网络抖动错过开放瞬间
@@ -250,17 +251,45 @@
   /* ═══════════════════════════════════════════════════════════
      📅  时间计算
      ═══════════════════════════════════════════════════════════ */
-  function computeBookingStartTime(hhmm) {
-    const [h, m] = hhmm.split(':').map(Number);
+
+  // 解析 'YYYY-MM-DD' 字符串为 Date 对象 (本地时区凌晨 0:00)
+  function parseTargetDate(s) {
+    if (!s) return null;
+    const m = String(s).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!m) return null;
+    const d = new Date(parseInt(m[1]), parseInt(m[2]) - 1, parseInt(m[3]));
+    if (isNaN(d.getTime())) return null;
+    return d;
+  }
+
+  // 计算最终会被预订的那一天的 Date (优先 targetDate, 否则 today + daysAhead)
+  function getEffectiveBookingDate() {
+    const target = parseTargetDate(CONFIG.timing.targetDate);
+    if (target) return target;
     const t = new Date();
     t.setDate(t.getDate() + CONFIG.timing.daysAhead);
+    t.setHours(0, 0, 0, 0);
+    return t;
+  }
+
+  // 计算"距今天还有几天"(用于服务器 ≤ 7 校验)
+  function getEffectiveDaysAhead() {
+    const target = parseTargetDate(CONFIG.timing.targetDate);
+    if (!target) return CONFIG.timing.daysAhead;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    return Math.round((target.getTime() - today.getTime()) / 86400000);
+  }
+
+  function computeBookingStartTime(hhmm) {
+    const [h, m] = hhmm.split(':').map(Number);
+    const t = getEffectiveBookingDate();
     t.setHours(h, m, 0, 0);
     return Math.floor(t.getTime() / 1000);
   }
 
   function formatBookingDate() {
-    const t = new Date();
-    t.setDate(t.getDate() + CONFIG.timing.daysAhead);
+    const t = getEffectiveBookingDate();
     const w = ['日', '一', '二', '三', '四', '五', '六'][t.getDay()];
     return `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')} 周${w}`;
   }
@@ -324,13 +353,14 @@
     if (m.includes('not_reaching_schedule_start') || m.includes('not_reaching') || m.includes('schedule_start_time')) {
       return { type: 'NOT_OPEN', tip: `⏳ 尚未到开放时刻 · 持续尝试`, retry: true, retryDelayMs: 150 };
     }
-    // 超过提前预订天数 - 当 daysAhead<=7 时,这是"尚未滚动到第7天",必须持续重试
+    // 超过提前预订天数 - 当 effective daysAhead<=7 时,这是"尚未滚动到第7天",必须持续重试
     // 注意: 80ms 太快会触发服务器限流 (10 任务 × 38 req/s = 限流爆炸), 用 150ms 平衡
     if (m.includes('exceed_booking_advance') || m.includes('exceed_advance')) {
-      if (CONFIG.timing.daysAhead <= 7) {
+      const effDays = getEffectiveDaysAhead();
+      if (effDays <= 7) {
         return { type: 'NOT_OPEN', tip: `⏳ 尚未开放 (advance limit) · 持续尝试`, retry: true, retryDelayMs: 150 };
       }
-      return { type: 'OUT_OF_RANGE', tip: `📅 超出可预订范围 · 提前天数 ${CONFIG.timing.daysAhead} > 7`, retry: false };
+      return { type: 'OUT_OF_RANGE', tip: `📅 超出可预订范围 · 距今 ${effDays} 天 > 7`, retry: false };
     }
     // 中文 fallback - 持续重试直到放开
     if (m.includes('尚未') || m.includes('未开放') || m.includes('未到') || m.includes('not_open') || m.includes('not open')) {
@@ -770,7 +800,7 @@
     panel.id = 'mr-panel';
     panel.innerHTML = `
       <div class="h">
-        <span class="tt">📅 会议室自动抢订 v0.8</span>
+        <span class="tt">📅 会议室自动抢订 v0.9</span>
         <span class="tg" id="tg">−</span>
       </div>
       <div class="body" id="body">
@@ -1124,7 +1154,16 @@
       <div class="form-row">
         <label>提前天数</label>
         <input type="number" id="set-days" value="${CONFIG.timing.daysAhead}" min="0" max="7">
-        <span style="font-size:11px;color:#666">系统上限 7</span>
+        <span style="font-size:11px;color:#666">滚动模式 · 系统上限 7</span>
+      </div>
+      <div class="form-row">
+        <label>目标日期</label>
+        <input type="date" id="set-target" value="${CONFIG.timing.targetDate || ''}">
+        <span class="task-clear-btn" id="set-target-clear" title="清除目标日期, 改用滚动模式">清除</span>
+      </div>
+      <div class="form-row" style="background:rgba(0,113,227,0.06);padding:6px 10px;border-radius:8px;margin-top:-2px">
+        <label style="color:#0071e3">实际预订</label>
+        <span style="font-weight:600;color:#0071e3" id="set-effective-date">${formatBookingDate()}</span>
       </div>
       <div class="form-row">
         <label>提前ms</label>
@@ -1152,12 +1191,37 @@
       <div class="warn-text" id="set-warn" style="display:none"></div>
       <div class="help">💡 服务器有 ~4 并发限制。"提前ms"让脚本提前几毫秒开始尝试,被拒绝就重试,直到 8:30 真正开放。<br>
       <b>实战推荐:提前 ms = 200~500</b>(太大会浪费令牌桶限流额度,反而拖慢首次成功)。<br>
-      "持续"是最长尝试时长(超时未成功就放弃)。</div>`;
+      <b>📅 目标日期 vs 提前天数</b>:<br>
+      • 留空目标日期 = 滚动模式(执行时取 today + 提前天数,适合日常每天抢)<br>
+      • 设置目标日期 = 固定模式(始终订那一天,适合提前几天配置好等周一执行)
+      </div>`;
+
+    // 实时刷新"实际预订"显示
+    const refreshEffective = () => {
+      const days = parseInt(document.getElementById('set-days').value, 10) || 0;
+      const target = document.getElementById('set-target').value.trim();
+      const oldDays = CONFIG.timing.daysAhead;
+      const oldTarget = CONFIG.timing.targetDate;
+      CONFIG.timing.daysAhead = days;
+      CONFIG.timing.targetDate = target || null;
+      const el = document.getElementById('set-effective-date');
+      if (el) el.textContent = formatBookingDate();
+      // 不真正保存, 还原
+      CONFIG.timing.daysAhead = oldDays;
+      CONFIG.timing.targetDate = oldTarget;
+    };
+    document.getElementById('set-days').oninput = refreshEffective;
+    document.getElementById('set-target').oninput = refreshEffective;
+    document.getElementById('set-target-clear').onclick = () => {
+      document.getElementById('set-target').value = '';
+      refreshEffective();
+    };
 
     document.getElementById('set-save').onclick = () => {
       const subject = document.getElementById('set-subject').value.trim();
       const open = document.getElementById('set-open').value.trim();
       const days = parseInt(document.getElementById('set-days').value, 10);
+      const target = document.getElementById('set-target').value.trim();
       const pretrig = parseInt(document.getElementById('set-pretrig').value, 10);
       const maxdur = parseInt(document.getElementById('set-maxdur').value, 10);
       const conc = parseInt(document.getElementById('set-conc').value, 10);
@@ -1165,12 +1229,22 @@
       if (!subject) { warn.style.display = 'block'; warn.textContent = '⚠️ 主题不能为空'; return; }
       if (!open.match(/^\d{2}:\d{2}:\d{2}$/)) { warn.style.display = 'block'; warn.textContent = '⚠️ 开抢时刻格式应为 HH:MM:SS'; return; }
       if (isNaN(days) || days < 0 || days > 7) { warn.style.display = 'block'; warn.textContent = '⚠️ 提前天数必须在 0~7 之间 (系统硬上限)'; return; }
+      // 目标日期校验
+      if (target) {
+        const td = parseTargetDate(target);
+        if (!td) { warn.style.display = 'block'; warn.textContent = '⚠️ 目标日期格式错误 (应为 YYYY-MM-DD)'; return; }
+        const today = new Date(); today.setHours(0, 0, 0, 0);
+        if (td.getTime() < today.getTime()) { warn.style.display = 'block'; warn.textContent = '⚠️ 目标日期不能在过去'; return; }
+        const diffDays = Math.round((td.getTime() - today.getTime()) / 86400000);
+        if (diffDays > 14) { warn.style.display = 'block'; warn.textContent = `⚠️ 目标日期距今 ${diffDays} 天太远, 最多 14 天`; return; }
+      }
       if (isNaN(pretrig) || pretrig < 0 || pretrig > 60000) { warn.style.display = 'block'; warn.textContent = '⚠️ 提前ms应在 0~60000 之间'; return; }
       if (isNaN(maxdur) || maxdur < 10) { warn.style.display = 'block'; warn.textContent = '⚠️ 持续时长太短'; return; }
       if (isNaN(conc) || conc < 1 || conc > 10) { warn.style.display = 'block'; warn.textContent = '⚠️ 并发数应在 1~10 之间'; return; }
       CONFIG.meeting.subject = subject;
       CONFIG.timing.bookingOpenTime = open;
       CONFIG.timing.daysAhead = days;
+      CONFIG.timing.targetDate = target || null;
       CONFIG.timing.preTriggerMs = pretrig;
       CONFIG.timing.maxAttemptDurationSec = maxdur;
       CONFIG.advanced.concurrency = conc;
@@ -1320,6 +1394,15 @@
     if (CONFIG.timing.daysAhead > 7) {
       return { level: 'warn', text: `⚠️ 提前天数 ${CONFIG.timing.daysAhead} > 7,系统会拒绝。请改为 ≤7` };
     }
+    // 目标日期模式: 校验执行时刻是否在 7 天内
+    const effDays = getEffectiveDaysAhead();
+    if (effDays > 7) {
+      const dateStr = formatBookingDate();
+      return { level: 'warn', text: `⚠️ 目标日期 ${dateStr} 距今 ${effDays} 天 > 7,执行时若仍超过 7 天会失败` };
+    }
+    if (effDays < 0) {
+      return { level: 'error', text: `⚠️ 目标日期已过期, 请重新选择` };
+    }
     if (syncQuality === 'NONE') {
       return { level: 'warn', text: `⏳ 等待服务器对时...` };
     }
@@ -1370,7 +1453,7 @@
       return;
     }
     buildUI();
-    log('✅ 会议室自动抢订 v0.8.0 已加载');
+    log('✅ 会议室自动抢订 v0.9.0 已加载');
     log(`📋 已配置 ${CONFIG.bookings.length} 个任务 / ${CONFIG.rooms.length} 个房间`);
 
     setTimeout(() => {
