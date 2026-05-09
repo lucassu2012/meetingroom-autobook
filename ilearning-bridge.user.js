@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.5.3
+// @version      0.5.4
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.5.4 - 🔑 用 NotebookLM 完成标记(thumb_up出现)作主判定 + 强化 user message 容器查找(要全部选项) + 提交后强制最小等待
 // v0.5.3 - 修复 user message 容器识别(原版漏排除选项兄弟元素); 加导出题库 JSON
 // v0.5.2 - 修复缓存抓错(排除user message区) + 加防错入库sanity check + 缓存优先 + 心跳容忍90s
 // v0.5.1 - 修复 SPA 路由问题 (NotebookLM/iLearning 的客户端路由不刷新页面, 之前脚本错过初始化)
@@ -801,6 +802,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       responseInitialDelayMs: 1500,
       pollIntervalMs: 500,
       silenceTimeoutMs: 5000,
+      minInitialWaitMs: 6000,         // v0.5.4: 提交后至少等 6 秒再考虑"静默", 防 NotebookLM 还没开始生成被误判完成
       maxResponseWaitMs: 180000,
       minResponseChars: 150,
       heartbeatIntervalMs: 3000,
@@ -1214,8 +1216,16 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       let lastLen = 0;
       let lastChangeTs = Date.now();
       let responseEl = null;
+      // v0.5.4: 用完成标记数量作主判定
+      const markersBefore = countCompletedResponses();
+      log(`  └ 提交前完成标记数: ${markersBefore}`, 'debug');
+      let markerIncreasedAt = null;
+
       while (Date.now() - startTs < CONFIG.maxResponseWaitMs) {
         await sleep(CONFIG.pollIntervalMs);
+        const elapsed = Date.now() - startTs;
+
+        // 跟踪增长(用于抓内容)
         const currentEl = findGrowingResponseElement(snapshot, questionText, excludedNodes);
         if (currentEl) {
           responseEl = currentEl;
@@ -1225,10 +1235,33 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
             lastChangeTs = Date.now();
           }
         }
+
+        // 主判定: thumb_up 等完成标记出现 = 这道题真的完成了
+        const markersNow = countCompletedResponses();
+        if (markersNow > markersBefore) {
+          if (markerIncreasedAt === null) {
+            markerIncreasedAt = Date.now();
+            log(`  ✅ 检测到完成标记 ${markersBefore}→${markersNow} (开始 1.5s 收尾)`, 'success');
+          }
+          // 标记出现后再多等 1.5s, 让最后一段 streaming 落地
+          if (Date.now() - markerIncreasedAt > 1500) {
+            // 最后再抓一次确保拿到完整内容
+            const finalEl = findGrowingResponseElement(snapshot, questionText, excludedNodes);
+            if (finalEl) responseEl = finalEl;
+            log(`  ✅ 完成标记稳定, 抓取最终响应 (${responseEl ? responseEl.textContent.length : 0} 字符)`, 'success');
+            return responseEl ? responseEl.textContent.trim() : null;
+          }
+          continue;
+        }
+
+        // 兜底: 静默检测 (但要过了 minInitialWait, 防止 NotebookLM 还没开始生成被误判)
+        if (elapsed < CONFIG.minInitialWaitMs) continue;
         if (lastLen > CONFIG.minResponseChars && (Date.now() - lastChangeTs) > CONFIG.silenceTimeoutMs) {
+          log(`  ⚠️ 没等到完成标记, 静默 ${Math.round(CONFIG.silenceTimeoutMs/1000)}s 强制返回 (可能不可靠)`, 'warn');
           return responseEl ? responseEl.textContent.trim() : null;
         }
       }
+      log(`  ⏱️ 达到最长等待时间 ${Math.round(CONFIG.maxResponseWaitMs/1000)}s`, 'warn');
       return responseEl ? responseEl.textContent.trim() : null;
     }
 
@@ -1268,7 +1301,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         await sleep(CONFIG.responseInitialDelayMs);
 
         // 4.5. v0.5.3: 识别完整 user message 容器(含题干+选项), 整个排除
-        const userMsgEl = findUserMessageContainer(text, req.options || []);
+        const userMsgEl = findUserMessageContainer(req);
         const excludedNodes = new Set();
         if (userMsgEl) {
           log(`  └ user message 容器: ${describeEl(userMsgEl)} (包含 ${userMsgEl.querySelectorAll('*').length} 个子元素)`, 'debug');
@@ -1336,50 +1369,83 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     }
 
     /**
-     * v0.5.3: 找完整 user message 容器(必须同时包含题干和至少一个选项)
-     * 旧版只找包含题干指纹的最具体元素, 但选项是兄弟元素时排除不到, 导致抓到选项当解析
+     * v0.5.4: 找完整 user message 容器 - 要求祖先包含题干 + 全部选项
+     * 旧版只要 1 个选项就返回, 可能找到不完整的内部元素
      */
-    function findUserMessageContainer(questionText, options) {
-      const stemFp = questionText.substring(0, 80).replace(/\s+/g, ' ').trim();
+    function findUserMessageContainer(req) {
+      const stemFp = (req.stem || '').substring(0, 50).replace(/\s+/g, ' ').trim();
       if (stemFp.length < 15) return null;
 
-      // 1. 找所有包含题干指纹的元素
+      const optFps = (req.options || [])
+        .map((o) => (o.content || '').substring(0, 25).replace(/\s+/g, ' ').trim())
+        .filter((s) => s.length >= 8);
+
+      // 1. 找所有 textContent 包含题干指纹的元素
       const stemEls = [];
       document.querySelectorAll('*').forEach((el) => {
         if (el.closest('#nlh-panel')) return;
         const elText = el.textContent.replace(/\s+/g, ' ').trim();
         if (elText.includes(stemFp)) {
-          let depth = 0;
-          let p = el;
-          while (p && p !== document.body) { depth++; p = p.parentElement; }
-          stemEls.push({ el, depth });
+          stemEls.push(el);
         }
       });
       if (stemEls.length === 0) return null;
-      // 取最深(最具体)的
-      stemEls.sort((a, b) => b.depth - a.depth);
-      const deepestStem = stemEls[0].el;
 
-      // 2. 从最深题干元素往上爬, 找祖先链中"也包含至少一个选项内容"的最近祖先
-      // 这个祖先 = user message 容器(包含题干+选项)
-      if (options && options.length > 0) {
-        let p = deepestStem;
+      // 2. 对每个题干元素往上爬, 找最小的祖先 - 必须包含 stem + 全部选项
+      let bestCandidate = null;
+      let bestSize = Infinity;
+      for (const stemEl of stemEls) {
+        let p = stemEl;
         while (p && p !== document.body) {
           const text = p.textContent.replace(/\s+/g, ' ').trim();
-          let hasOption = false;
-          for (const opt of options) {
-            const optFp = (opt.content || '').substring(0, 25).replace(/\s+/g, ' ').trim();
-            if (optFp.length >= 8 && text.includes(optFp)) {
-              hasOption = true;
-              break;
-            }
+          let optionsFound = 0;
+          for (const fp of optFps) {
+            if (text.includes(fp)) optionsFound++;
           }
-          if (hasOption) return p; // 找到了 user message 容器
+          // 要求: 没选项时只要题干, 有选项时要求全部选项
+          const allOptionsPresent = optFps.length === 0 || optionsFound >= optFps.length;
+          if (allOptionsPresent) {
+            // 这是个候选 - 取最小的(最贴合 user message 边界的)
+            if (text.length < bestSize) {
+              bestCandidate = p;
+              bestSize = text.length;
+            }
+            break; // 不再往上(更上的祖先必然更大)
+          }
           p = p.parentElement;
         }
       }
-      // 3. 没找到包含选项的祖先(可能题/判断题没选项), 退回到题干元素
-      return deepestStem;
+      // 3. 没找到完整的, 至少返回最深题干元素(better than nothing)
+      if (!bestCandidate && stemEls.length > 0) {
+        let deepest = stemEls[0], maxDepth = 0;
+        for (const el of stemEls) {
+          let d = 0; let p = el;
+          while (p && p !== document.body) { d++; p = p.parentElement; }
+          if (d > maxDepth) { maxDepth = d; deepest = el; }
+        }
+        return deepest;
+      }
+      return bestCandidate;
+    }
+
+    /**
+     * v0.5.4: 计数 NotebookLM 已完成 AI 回答的数量
+     * 用 thumb_up 按钮出现作完成信号 (生成中绝不出现, 完成后才显示)
+     */
+    function countCompletedResponses() {
+      let count = 0;
+      document.querySelectorAll('button, [role="button"]').forEach((btn) => {
+        if (btn.closest('#nlh-panel')) return;
+        if (!isVisible(btn)) return;
+        const text = ((btn.getAttribute('aria-label') || '') + ' ' +
+                      (btn.getAttribute('title') || '') + ' ' +
+                      btn.textContent);
+        // thumb_up 是 Material 图标名, "good response"/"like" 是 aria-label, "点赞" 是中文
+        if (/thumb_up|good response|点赞|👍/i.test(text) || /\blike\b/i.test(text)) {
+          count++;
+        }
+      });
+      return count;
     }
 
     function formatQuestionForNLM(req) {
