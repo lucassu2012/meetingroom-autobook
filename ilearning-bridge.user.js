@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.5.7
+// @version      0.6.0
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.6.0 - Stage 3.5 阶段A: iLearning 端批量预取面板(进度+未识别题号+批次大小可配置). 阶段B(NotebookLM真批处理)分别实现
 // v0.5.7 - markdown 渲染段落紧凑化(去掉换行符夹层 + margin 归零)
 // v0.5.6 - iLearning 浮窗渲染 markdown(粗体/列表/嵌套), 不再是 raw 文本
 // v0.5.5 - 抓取保留格式(块元素换行 + markdown加粗) + 导出从JSON改为CSV(Excel友好,UTF-8 BOM)
@@ -248,6 +249,100 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       activeListeners: new Map(), // qId -> listenerId
     };
 
+    // v0.6.0 Stage 3.5: 批量预取状态
+    const batchState = {
+      enabled: true,                       // 默认开
+      batchSize: 20,                       // 默认每批 20 题
+      totalQuestions: 0,                   // 第一题识别后从 q.total 填入
+      identifiedPositions: new Set(),      // 已识别的题号(数字)
+      identifiedQuestions: new Map(),      // qId -> q 对象
+      batchStarted: false,                 // 是否已经启动批处理
+    };
+
+    // v0.6.0: 把已识别的题号合并成紧凑 ranges (e.g. "1-3, 5, 7-10")
+    function compactRanges(positionsArray) {
+      const sorted = Array.from(positionsArray).filter((n) => Number.isInteger(n)).sort((a, b) => a - b);
+      if (sorted.length === 0) return '-';
+      const ranges = [];
+      let start = sorted[0], prev = sorted[0];
+      for (let i = 1; i <= sorted.length; i++) {
+        const cur = sorted[i];
+        if (cur !== prev + 1) {
+          ranges.push(start === prev ? `${start}` : `${start}-${prev}`);
+          start = cur;
+        }
+        prev = cur;
+      }
+      return ranges.join(', ');
+    }
+
+    function getMissingPositions() {
+      const missing = [];
+      for (let i = 1; i <= batchState.totalQuestions; i++) {
+        if (!batchState.identifiedPositions.has(i)) missing.push(i);
+      }
+      return missing;
+    }
+
+    function updateBatchPanel() {
+      const idCount = document.getElementById('ilh-batch-id-count');
+      const totalEl = document.getElementById('ilh-batch-total');
+      const missingEl = document.getElementById('ilh-batch-missing-list');
+      const statusEl = document.getElementById('ilh-batch-status-text');
+      const startBtn = document.getElementById('ilh-batch-start');
+      const panelEl = document.getElementById('ilh-batch-panel');
+      if (!idCount) return;
+
+      idCount.textContent = batchState.identifiedPositions.size;
+      totalEl.textContent = batchState.totalQuestions || '?';
+      panelEl.classList.toggle('disabled', !batchState.enabled);
+
+      if (!batchState.enabled) {
+        statusEl.textContent = '已关闭, 单题模式';
+        statusEl.className = '';
+        return;
+      }
+
+      if (batchState.totalQuestions > 0) {
+        const missing = getMissingPositions();
+        missingEl.textContent = missing.length > 0
+          ? `未识别: ${compactRanges(new Set(missing))}`
+          : '✅ 全部识别完成';
+
+        if (batchState.batchStarted) {
+          statusEl.textContent = '🚀 批处理已启动 (阶段A仅模拟)';
+          statusEl.className = 'running';
+          startBtn.disabled = true;
+        } else if (missing.length === 0) {
+          statusEl.textContent = '✅ 全部识别完成, 可启动批处理';
+          statusEl.className = 'ready';
+          startBtn.disabled = false;
+        } else {
+          statusEl.textContent = `⏸ 还需识别 ${missing.length} 题`;
+          statusEl.className = '';
+          startBtn.disabled = true;
+        }
+      } else {
+        missingEl.textContent = '未识别: 等待第一题识别后获取总数';
+        statusEl.textContent = '⏸ 等待第一题识别';
+        statusEl.className = '';
+        startBtn.disabled = true;
+      }
+    }
+
+    function startBatchProcessing() {
+      if (batchState.batchStarted) return;
+      batchState.batchStarted = true;
+      const total = batchState.identifiedQuestions.size;
+      const numBatches = Math.ceil(total / batchState.batchSize);
+      log(`🚀 (阶段A) 模拟启动批处理: ${total} 题, 每批 ${batchState.batchSize}, 共 ${numBatches} 批`, 'info');
+      log(`   阶段 B 接通 NotebookLM 后会真正发批量 prompt`, 'warn');
+      updateBatchPanel();
+      if (state.currentQuestion) {
+        showExplain('waiting', `🚀 批处理已启动\n\n${total} 道题分 ${numBatches} 批, 每批 ${batchState.batchSize} 题\n\n(阶段 A: 仅 UI 模拟, 阶段 B 接通后真正发送)`, '批处理中');
+      }
+    }
+
     // === STYLES ===
     GM_addStyle(`
       #ilh-panel {
@@ -298,6 +393,85 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         font-family: monospace;
       }
       .ilh-toggle:hover { opacity: 1; }
+
+      #ilh-batch-panel {
+        padding: 9px 14px 10px;
+        border-bottom: 1px solid rgba(255,255,255,0.06);
+        background: rgba(33,150,243,0.04);
+        font-size: 11px;
+      }
+      .ilh-batch-header {
+        display: flex; justify-content: space-between; align-items: center;
+        margin-bottom: 6px;
+        font-weight: 600; font-size: 12px;
+      }
+      .ilh-batch-toggle {
+        display: flex; align-items: center; gap: 5px;
+        cursor: pointer;
+        font-size: 11px; opacity: 0.9;
+        font-weight: normal;
+      }
+      .ilh-batch-toggle input[type="checkbox"] {
+        cursor: pointer;
+      }
+      .ilh-batch-config {
+        margin-bottom: 5px;
+        display: flex; align-items: center; gap: 6px;
+        opacity: 0.9;
+      }
+      .ilh-batch-config input {
+        width: 48px; padding: 2px 4px;
+        background: rgba(0,0,0,0.25);
+        color: #e8eaf6;
+        border: 1px solid rgba(255,255,255,0.15);
+        border-radius: 3px;
+        font-size: 11px;
+        text-align: center;
+      }
+      .ilh-batch-progress {
+        margin-bottom: 4px;
+        opacity: 0.85;
+      }
+      .ilh-batch-progress .ilh-batch-num {
+        font-weight: 600;
+        color: #64b5f6;
+      }
+      .ilh-batch-missing {
+        margin-bottom: 6px;
+        opacity: 0.7;
+        font-family: "SF Mono", Monaco, Consolas, monospace;
+        font-size: 10px;
+        word-break: break-all;
+        max-height: 36px;
+        overflow-y: auto;
+      }
+      .ilh-batch-status-row {
+        display: flex; justify-content: space-between; align-items: center;
+        gap: 6px;
+        margin-top: 6px;
+        padding-top: 6px;
+        border-top: 1px solid rgba(255,255,255,0.05);
+      }
+      #ilh-batch-status-text {
+        flex: 1; font-size: 11px;
+      }
+      #ilh-batch-status-text.ready { color: #81c784; font-weight: 600; }
+      #ilh-batch-status-text.running { color: #64b5f6; font-weight: 600; }
+      #ilh-batch-start {
+        font-size: 10px; padding: 4px 9px;
+      }
+      #ilh-batch-start:disabled {
+        opacity: 0.35; cursor: not-allowed;
+      }
+      #ilh-batch-panel.disabled {
+        opacity: 0.45;
+      }
+      #ilh-batch-panel.disabled .ilh-batch-config,
+      #ilh-batch-panel.disabled .ilh-batch-progress,
+      #ilh-batch-panel.disabled .ilh-batch-missing,
+      #ilh-batch-panel.disabled .ilh-batch-status-row {
+        display: none;
+      }
 
       #ilh-status {
         padding: 11px 14px;
@@ -648,6 +822,24 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           <span class="ilh-toggle" id="ilh-toggle-panel" title="折叠/展开">━</span>
         </div>
         <div id="ilh-status" class="idle">⏸ 等待识别题目...</div>
+        <div id="ilh-batch-panel">
+          <div class="ilh-batch-header">
+            <span>🚀 批量预取</span>
+            <label class="ilh-batch-toggle">
+              <input type="checkbox" id="ilh-batch-enabled" checked>
+              <span>开启</span>
+            </label>
+          </div>
+          <div class="ilh-batch-config">
+            每批: <input type="number" id="ilh-batch-size" value="20" min="1" max="50"> 题
+          </div>
+          <div class="ilh-batch-progress">已识别: <span class="ilh-batch-num" id="ilh-batch-id-count">0</span>/<span id="ilh-batch-total">?</span></div>
+          <div class="ilh-batch-missing" id="ilh-batch-missing-list">未识别: -</div>
+          <div class="ilh-batch-status-row">
+            <span id="ilh-batch-status-text">⏸ 等待第一题识别</span>
+            <button class="ilh-mini-btn" id="ilh-batch-start" disabled>▷ 立即批处理</button>
+          </div>
+        </div>
         <div id="ilh-question">
           <div id="ilh-empty">尚未识别到题目<span class="ilh-hint">切换到任意题目即可触发抽取</span></div>
         </div>
@@ -695,6 +887,33 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         GM_deleteValue(`ilh:response:${state.currentQuestion.id}`);
         log(`🔄 已清除 ${state.currentQuestion.id} 的缓存解析, 重新请求`, 'info');
         requestExplanation(state.currentQuestion);
+      });
+
+      // v0.6.0: 批量面板事件
+      document.getElementById('ilh-batch-enabled').addEventListener('change', (e) => {
+        batchState.enabled = e.target.checked;
+        log(`🚀 批量预取已${batchState.enabled ? '开启' : '关闭'}`, 'info');
+        updateBatchPanel();
+        // 切回单题模式时, 当前题没缓存就立即请求
+        if (!batchState.enabled && state.currentQuestion) {
+          const cached = GM_getValue(`ilh:response:${state.currentQuestion.id}`, null);
+          if (!cached || cached.status !== 'done') {
+            requestExplanation(state.currentQuestion);
+          }
+        }
+      });
+      document.getElementById('ilh-batch-size').addEventListener('change', (e) => {
+        const v = parseInt(e.target.value, 10);
+        if (Number.isInteger(v) && v >= 1 && v <= 50) {
+          batchState.batchSize = v;
+          log(`🚀 批次大小改为 ${v}`, 'info');
+          updateBatchPanel();
+        } else {
+          e.target.value = batchState.batchSize;
+        }
+      });
+      document.getElementById('ilh-batch-start').addEventListener('click', () => {
+        startBatchProcessing();
       });
 
       makeDraggable(panel, document.getElementById('ilh-header'));
@@ -793,7 +1012,39 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         state.lastQuestionId = q.id;
         renderQuestion(q);
         setStatus('', `✅ 第 ${q.position}/${q.total} 题已识别 · ${q.type}`);
-        requestExplanation(q);
+
+        // v0.6.0: 加入批量识别集
+        if (batchState.totalQuestions === 0 && q.total) {
+          batchState.totalQuestions = q.total;
+        }
+        batchState.identifiedPositions.add(q.position);
+        batchState.identifiedQuestions.set(q.id, q);
+        updateBatchPanel();
+
+        // 路由: 批量模式 vs 单题模式
+        if (batchState.enabled) {
+          // 批量模式: 缓存优先, 没缓存就显示"等识别完"
+          const cached = GM_getValue(`ilh:response:${q.id}`, null);
+          if (cached && cached.status === 'done') {
+            showExplain('', cached.text, '✅ 缓存命中 · 秒回');
+            log(`💾 缓存命中: ${q.id}`, 'success');
+          } else if (cached && cached.status === 'error') {
+            showExplain('error', cached.error || '上次失败', '上次失败 · 关闭批量模式可单题重试');
+          } else if (batchState.batchStarted) {
+            showExplain('waiting', '⏳ 批处理已启动, 这道题答案马上到...\n\n(阶段 A: 仅 UI 模拟, 阶段 B 真正发送)', '批处理中');
+          } else {
+            const missing = getMissingPositions();
+            if (missing.length > 0) {
+              showExplain('waiting', `⏳ 批量预取已开启, 请继续切题完成识别\n\n还需识别: ${compactRanges(new Set(missing))} (共 ${missing.length} 题)`, '识别进行中');
+            } else {
+              // 全部识别完, 自动启动批处理
+              startBatchProcessing();
+            }
+          }
+        } else {
+          // 单题模式 (沿用 v0.5.x 行为)
+          requestExplanation(q);
+        }
       }, CONFIG.extractDebounceMs);
     }
 
@@ -870,6 +1121,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
 
     setTimeout(() => handleQuestionChange(true), 800);
     setupObserver();
+    updateBatchPanel(); // v0.6.0: 初始化批量面板
 
     // 定期提示用户 NotebookLM 状态(只在还没识别到题时)
     setInterval(() => {
