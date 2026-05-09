@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 - NotebookLM 端 (Stage 2)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.1.1
+// @version      0.1.2
 // @description  在 NotebookLM 上自动化输入题目、提交、抓取解析(Stage 2: 不连 iLearning, 手动测试)
 // @author       Lucas
 // @match        https://notebooklm.google.com/*
@@ -14,6 +14,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.1.2 - 修复 Trusted Types CSP 拦截 (NotebookLM 禁止直接 innerHTML 赋值); 浮窗现在能在 NotebookLM 渲染
 // v0.1.1 - 拓宽 @match (整个 notebooklm.google.com); @run-at 改为 document-idle (SPA 友好); 加入顶层无条件诊断日志
 // v0.1.0 - Stage 2 初版
 
@@ -24,6 +25,43 @@ console.log('[NLH-DIAG] location.href =', location.href);
 console.log('[NLH-DIAG] location.pathname =', location.pathname);
 console.log('[NLH-DIAG] document.readyState =', document.readyState);
 console.log('[NLH-DIAG] GM_addStyle 类型 =', typeof GM_addStyle);
+
+// 🛡️ Trusted Types 兼容层 (NotebookLM/Gmail 等 Google 产品启用了 require-trusted-types-for)
+// 不处理这个, innerHTML = "..." 会被直接拦截
+const __trustedHTMLPolicy = (() => {
+  if (window.trustedTypes && typeof window.trustedTypes.createPolicy === 'function') {
+    try {
+      const p = window.trustedTypes.createPolicy('nlh-policy', { createHTML: (s) => s });
+      console.log('[NLH-DIAG] ✅ TrustedTypes policy 已创建');
+      return p;
+    } catch (e) {
+      console.log('[NLH-DIAG] ⚠️ TrustedTypes policy 创建被 CSP 拒绝, 将使用 DOMParser fallback:', e.message);
+      return null;
+    }
+  }
+  console.log('[NLH-DIAG] (页面未启用 TrustedTypes, 直接 innerHTML 即可)');
+  return null;
+})();
+
+/** 安全地设置一个 element 的 innerHTML, 自动处理 Trusted Types 限制 */
+function __setSafeInnerHTML(el, htmlString) {
+  // 路线 A: 有 policy 就直接用
+  if (__trustedHTMLPolicy) {
+    el.innerHTML = __trustedHTMLPolicy.createHTML(htmlString);
+    return;
+  }
+  // 路线 B: 用 DOMParser 解析(不经 Trusted Types sink)
+  try {
+    while (el.firstChild) el.removeChild(el.firstChild);
+    const doc = new DOMParser().parseFromString(htmlString, 'text/html');
+    while (doc.body.firstChild) el.appendChild(doc.body.firstChild);
+    return;
+  } catch (e) {
+    console.error('[NLH] DOMParser fallback 也失败了:', e);
+    // 路线 C: 最后兜底 - 至少保留文本
+    el.textContent = '[渲染失败, 看 Console 报错]';
+  }
+}
 
 (function () {
   'use strict';
@@ -250,7 +288,7 @@ console.log('[NLH-DIAG] GM_addStyle 类型 =', typeof GM_addStyle);
     if (logEl) {
       const entry = document.createElement('div');
       entry.className = `nlh-log-entry nlh-log-${type}`;
-      entry.innerHTML = `<span class="nlh-log-time">${time}</span>${escapeHtml(msg)}`;
+      __setSafeInnerHTML(entry, `<span class="nlh-log-time">${time}</span>${escapeHtml(msg)}`);
       logEl.appendChild(entry);
       while (logEl.children.length > CONFIG.logMaxLines) logEl.removeChild(logEl.firstChild);
       logEl.scrollTop = logEl.scrollHeight;
@@ -360,8 +398,8 @@ console.log('[NLH-DIAG] GM_addStyle 类型 =', typeof GM_addStyle);
       el.dispatchEvent(new Event('input', { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
     } else {
-      // contenteditable
-      el.innerHTML = '';
+      // contenteditable: 用 textContent 清空(不触发 Trusted Types)
+      el.textContent = '';
       // 用 InputEvent 让 React 接收到
       el.textContent = text;
       el.dispatchEvent(new InputEvent('input', {
@@ -549,7 +587,7 @@ console.log('[NLH-DIAG] GM_addStyle 类型 =', typeof GM_addStyle);
   function buildPanel() {
     const panel = document.createElement('div');
     panel.id = 'nlh-panel';
-    panel.innerHTML = `
+    __setSafeInnerHTML(panel, `
       <div id="nlh-header">
         <span class="nlh-dot idle"></span>
         <span class="nlh-title">📓 NotebookLM 助手</span>
@@ -579,7 +617,7 @@ console.log('[NLH-DIAG] GM_addStyle 类型 =', typeof GM_addStyle);
         </div>
         <div id="nlh-log"></div>
       </div>
-    `;
+    `);
     document.body.appendChild(panel);
 
     document.getElementById('nlh-toggle-panel').addEventListener('click', () => {
