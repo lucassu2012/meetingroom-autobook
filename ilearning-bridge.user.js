@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.5.1
+// @version      0.5.2
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.5.2 - 修复缓存抓错(排除user message区) + 加防错入库sanity check + 缓存优先 + 心跳容忍90s
 // v0.5.1 - 修复 SPA 路由问题 (NotebookLM/iLearning 的客户端路由不刷新页面, 之前脚本错过初始化)
 // v0.5.0 - Stage 3: 合并 iLearning + NotebookLM 双端, GM 存储桥接, 开题自动出解析
 
@@ -161,7 +162,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     isNotebookLMAlive() {
       const status = GM_getValue(this.KEY_STATUS, null);
       if (!status || !status.alive) return false;
-      return (Date.now() - status.timestamp) < 10000;
+      // v0.5.2: 90 秒容忍, 应对 Chrome 后台标签页 setInterval 节流
+      return (Date.now() - status.timestamp) < 90000;
     },
 
     /** 调试: 列出所有 ilh:* keys */
@@ -702,14 +704,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     }
 
     function requestExplanation(q) {
-      // 检查 NotebookLM 是否活着
-      if (!Bridge.isNotebookLMAlive()) {
-        showExplain('error', '⚠️ 没检测到 NotebookLM 活动\n\n请确认你已经在另一个标签页打开了对应的 NotebookLM 笔记本, 并且本脚本也加载了它。', '');
-        log('❌ NotebookLM 心跳缺失, 提示用户检查', 'error');
-        return;
-      }
-
-      // 检查缓存
+      // v0.5.2: 缓存优先(命中就秒回, 不依赖 NotebookLM 活跃状态)
       const cached = GM_getValue(`ilh:response:${q.id}`, null);
       if (cached && cached.status === 'done') {
         showExplain('', cached.text, '✅ 缓存命中 · 秒回');
@@ -717,8 +712,15 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         return;
       }
       if (cached && cached.status === 'error') {
-        showExplain('error', cached.error || '上次请求失败', '上次失败 · 点重新请求');
-        log(`⚠️ 缓存了错误响应: ${cached.error}`, 'warn');
+        showExplain('error', cached.error || '上次请求失败 · 点"重新请求"重试', '上次失败');
+        log(`⚠️ 缓存的错误响应, 不重试 (用户可手动重试)`, 'warn');
+        return;
+      }
+
+      // 没缓存才检查 NotebookLM 活动
+      if (!Bridge.isNotebookLMAlive()) {
+        showExplain('error', '⚠️ 没检测到 NotebookLM 活动\n\n请确认你已经在另一个标签页打开了对应的 NotebookLM 笔记本, 并且本脚本也加载了它。\n\n(如果 NotebookLM 标签页一直在后台, Chrome 会节流脚本,可以切到 NotebookLM 标签页激活一下)', '');
+        log('❌ NotebookLM 心跳缺失, 提示用户检查', 'error');
         return;
       }
 
@@ -1130,10 +1132,11 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       return map;
     }
 
-    function findGrowingResponseElement(snapshot, questionText) {
+    function findGrowingResponseElement(snapshot, questionText, excludedNodes) {
       const candidates = [];
       document.querySelectorAll('div, p, article, section, main, span').forEach((el) => {
         if (el.closest('#nlh-panel')) return;
+        if (excludedNodes && excludedNodes.has(el)) return; // v0.5.2: 排除 user message 树
         const newLen = el.textContent.length;
         const oldLen = snapshot.get(el) || 0;
         const growth = newLen - oldLen;
@@ -1152,14 +1155,14 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       return candidates[0].el;
     }
 
-    async function waitForResponse(snapshot, questionText) {
+    async function waitForResponse(snapshot, questionText, excludedNodes) {
       const startTs = Date.now();
       let lastLen = 0;
       let lastChangeTs = Date.now();
       let responseEl = null;
       while (Date.now() - startTs < CONFIG.maxResponseWaitMs) {
         await sleep(CONFIG.pollIntervalMs);
-        const currentEl = findGrowingResponseElement(snapshot, questionText);
+        const currentEl = findGrowingResponseElement(snapshot, questionText, excludedNodes);
         if (currentEl) {
           responseEl = currentEl;
           const currentLen = currentEl.textContent.length;
@@ -1184,7 +1187,6 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       log(`📥 接到题目 ${req.id} (第 ${req.position} 题)`, 'info');
 
       try {
-        // 题目格式化
         const text = formatQuestionForNLM(req);
 
         // 1. 找输入框
@@ -1211,11 +1213,33 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         }
         await sleep(CONFIG.responseInitialDelayMs);
 
+        // 4.5. v0.5.2: 识别 user message 区域并加入排除集
+        // 提交后, NotebookLM 会先把用户消息显示在对话区, 我们要确保不抓到它
+        const userMsgEl = findUserMessageElement(text);
+        const excludedNodes = new Set();
+        if (userMsgEl) {
+          log(`  └ 识别到 user message: ${describeEl(userMsgEl)}`, 'debug');
+          // 自己 + 所有祖先 + 所有后代加入排除
+          let p = userMsgEl;
+          while (p && p !== document.body) { excludedNodes.add(p); p = p.parentElement; }
+          userMsgEl.querySelectorAll('*').forEach((c) => excludedNodes.add(c));
+        } else {
+          log('  ⚠️ 未识别到 user message, 用旧的过滤逻辑', 'warn');
+        }
+
         // 5. 等响应
-        const responseText = await waitForResponse(snapshot, text);
+        const responseText = await waitForResponse(snapshot, text, excludedNodes);
         if (!responseText || responseText.length < CONFIG.minResponseChars) {
           log(`❌ 响应过短 (${responseText?.length || 0} 字符)`, 'error');
           Bridge.writeResponse(req.id, responseText || '', 'error', '响应过短或未抓到');
+          return;
+        }
+
+        // 5.5. v0.5.2: Sanity check - 响应不应该完全是题目本身
+        const fingerprint = text.substring(0, 60).trim();
+        if (fingerprint.length >= 20 && responseText.includes(fingerprint)) {
+          log(`  ⚠️ 响应包含原题指纹, 大概率抓到了 user message 而不是 AI 回答`, 'warn');
+          Bridge.writeResponse(req.id, responseText, 'error', '抓到了用户消息区而非 AI 回答, 请重新请求');
           return;
         }
 
@@ -1232,6 +1256,27 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         updateCurrent(null);
         updateStats();
       }
+    }
+
+    /** v0.5.2: 找包含完整题目指纹的最深 + 最短(最具体)元素 = user message */
+    function findUserMessageElement(questionText) {
+      const fingerprint = questionText.substring(0, 80).replace(/\s+/g, ' ').trim();
+      if (fingerprint.length < 20) return null;
+      const candidates = [];
+      document.querySelectorAll('*').forEach((el) => {
+        if (el.closest('#nlh-panel')) return;
+        const elText = el.textContent.replace(/\s+/g, ' ').trim();
+        if (elText.includes(fingerprint)) {
+          let depth = 0;
+          let p = el;
+          while (p && p !== document.body) { depth++; p = p.parentElement; }
+          candidates.push({ el, depth, len: elText.length });
+        }
+      });
+      if (candidates.length === 0) return null;
+      // 优先短的(纯 user message), 再深的
+      candidates.sort((a, b) => (a.len - b.len) || (b.depth - a.depth));
+      return candidates[0].el;
     }
 
     function formatQuestionForNLM(req) {
