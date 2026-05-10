@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.8.1
+// @version      0.10.0
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,9 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.10.0 - 真正的批量预取 (Stage 3.5): 一个 prompt 含 N 题, NotebookLM 一次返回, 用 ===Q数字=== 分隔; batchSize=20 默认, 失败降级 20→10→5→1
+// v0.9.0 - 策略 B 自动遍历: 脚本启动后自动 click sidebar 每道题, 流水线触发识别+入队 NotebookLM
+//          已识别的题智能跳过 click 但补充入队, 用户可随时取消, 进度显示在 grid header
 // v0.8.1 - UI 紧凑化: ① overview grid 暗色化 ② 删冗余信息 (题目识别状态行/已识别计数/全部识别完成) ③ 批处理控件合并为单行 ④ 题目区扩大
 // v0.8.0 - UX 大改进: ① 加状态灯系统 (sidebar dots + 浮窗 overview grid) ② 修复重复提交 ③ 任意题后台完成后自动通知 + 当前题自动刷新解析
 // v0.7.0 - 抓取算法完全重写: 抛弃 snapshot diff, 改用真实 NotebookLM DOM 选择器 (chat-message-pair + element-list-renderer)
@@ -86,6 +89,10 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     KEY_QUEUE: 'ilh:queue',
     KEY_STATUS: 'ilh:nlm_status', // NotebookLM 端用来报告自己活着
     KEY_NOTIFY: 'ilh:notify',     // v0.8.0: 全局通知 (任何题状态变化都写这里, iLearning 端用一个 listener 监听全部题)
+    // v0.10.0: 批量预取协议
+    KEY_BATCH_REQ: (id) => `ilh:batch_request:${id}`,
+    KEY_BATCH_QUEUE: 'ilh:batch_queue',
+    KEY_BATCH_NOTIFY: 'ilh:batch_notify',  // 批次成功/失败的全局通知
 
     /** iLearning 端: 发 request, 如已有缓存 response 则直接返回 */
     sendRequest(question) {
@@ -175,6 +182,69 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       GM_setValue(this.KEY_STATUS, { alive: true, timestamp: Date.now() });
     },
 
+    /* ───── v0.10.0: 批量预取协议 ───── */
+    /** iLearning 端: 发批量请求 */
+    sendBatch(batchData) {
+      // batchData: { id, prompt, positions, positionMap, batchSize, attempt }
+      GM_setValue(this.KEY_BATCH_REQ(batchData.id), {
+        ...batchData,
+        timestamp: Date.now(),
+        status: 'pending',
+      });
+      const queue = GM_getValue(this.KEY_BATCH_QUEUE, []);
+      if (!queue.includes(batchData.id)) {
+        queue.push(batchData.id);
+        GM_setValue(this.KEY_BATCH_QUEUE, queue);
+      }
+      // 同时为每题写 KEY_REQ pending (让 dot 黄)
+      for (const pos of batchData.positions) {
+        const qId = batchData.positionMap[pos];
+        GM_setValue(this.KEY_REQ(qId), {
+          id: qId,
+          position: pos,
+          timestamp: Date.now(),
+          status: 'pending',
+          batchId: batchData.id,
+        });
+        // 通知 dot 变黄
+        GM_setValue(this.KEY_NOTIFY, { qId, status: 'pending', ts: Date.now() });
+      }
+    },
+
+    /** NotebookLM 端: 监听批量队列 */
+    onBatchRequest(callback) {
+      return GM_addValueChangeListener(
+        this.KEY_BATCH_QUEUE,
+        (key, oldVal, newVal, remote) => {
+          if (newVal && Array.isArray(newVal) && newVal.length > 0) callback();
+        }
+      );
+    },
+
+    /** NotebookLM 端: 取队首批次 */
+    peekNextBatch() {
+      const queue = GM_getValue(this.KEY_BATCH_QUEUE, []);
+      if (queue.length === 0) return null;
+      const batchId = queue[0];
+      return GM_getValue(this.KEY_BATCH_REQ(batchId), null);
+    },
+
+    /** NotebookLM 端: 标记批次完成, 从队列移除 */
+    completeBatch(batchId) {
+      const queue = GM_getValue(this.KEY_BATCH_QUEUE, []);
+      GM_setValue(this.KEY_BATCH_QUEUE, queue.filter((id) => id !== batchId));
+    },
+
+    /** NotebookLM 端: 通知批次结果 (success / partial / failed) */
+    notifyBatchResult(batchId, status, data = {}) {
+      GM_setValue(this.KEY_BATCH_NOTIFY, {
+        batchId,
+        status,
+        ...data,
+        ts: Date.now(),
+      });
+    },
+
     /** iLearning 端: 检查 NotebookLM 是否活着 (10 秒内有心跳) */
     isNotebookLMAlive() {
       const status = GM_getValue(this.KEY_STATUS, null);
@@ -262,6 +332,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         if (resp && resp.status === 'error') return 'error';
         const req = GM_getValue(`ilh:request:${qId}`, null);
         if (req) return 'pending';
+        // v0.10.0: 已识别但还没入队也算 pending (用户期望黄色)
+        if (batchState.identifiedQuestions.has(qId)) return 'pending';
         return 'idle';
       },
       colorFor(s) {
@@ -414,6 +486,293 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       batchStarted: false,                 // 是否已经启动批处理
     };
 
+    /* ───── v0.9.0: 策略 B 自动遍历 ───── */
+    const AutoTraverse = {
+      active: false,
+      cancelled: false,
+      visited: 0,
+      total: 0,
+      currentPos: null,
+
+      // 找指定 position 对应已识别的 q
+      findQuestionByPosition(pos) {
+        for (const q of batchState.identifiedQuestions.values()) {
+          if (q.position === pos) return q;
+        }
+        return null;
+      },
+
+      // v0.10.0: 标记题已识别 (批量模式下不再单题发请求, BatchManager.flushAll 统一处理)
+      ensureQueued(q) {
+        if (!q || !q.id) return false;
+        state.qIdToPosition.set(q.id, q.position);
+        const cached = GM_getValue(`ilh:response:${q.id}`, null);
+        if (cached && (cached.status === 'done' || cached.status === 'error')) {
+          StatusDot.updateOne(q.position, q.id);
+          return false;
+        }
+        const existingReq = GM_getValue(`ilh:request:${q.id}`, null);
+        if (existingReq) {
+          StatusDot.updateOne(q.position, q.id);
+          return false;
+        }
+        // 批量模式: 只标记已识别, 不发单题 (StatusDot.getStatus 会因 identifiedQuestions 含此 qId 返回 pending)
+        if (batchState.enabled) {
+          StatusDot.updateOne(q.position, q.id);  // 触发重算 → 显示 pending (黄)
+          return false;
+        }
+        // 单题模式: 立即发请求
+        Bridge.sendRequest(q);
+        StatusDot.updateOne(q.position, q.id);
+        log(`📤 自动入队 (单题模式): ${q.id} (题号 ${q.position})`, 'info');
+        return true;
+      },
+
+      async start() {
+        if (this.active) return;
+        // 等 sidebar 完全渲染
+        await sleep(2000);
+        const items = StatusDot.findSidebarItems();
+        if (items.size === 0) {
+          log('⚠️ 未识别到 sidebar 题项, 跳过自动遍历 (你也许在非考试页面)', 'warn');
+          return;
+        }
+        const positions = Array.from(items.keys()).sort((a, b) => a - b);
+        this.active = true;
+        this.cancelled = false;
+        this.visited = 0;
+        this.total = positions.length;
+        log(`🤖 开始自动遍历 ${positions.length} 道题 (策略 B 流水线模式)`, 'info');
+        this.updateUI();
+
+        for (const pos of positions) {
+          if (this.cancelled) break;
+          this.visited++;
+          this.currentPos = pos;
+          this.updateUI();
+
+          // 已识别 → 智能跳过 click, 但补充入队
+          if (batchState.identifiedPositions.has(pos)) {
+            const q = this.findQuestionByPosition(pos);
+            if (q) {
+              const queued = this.ensureQueued(q);
+              if (!queued) {
+                // 没新发请求, 至少更新 dot 状态
+                StatusDot.updateOne(pos, q.id);
+              }
+            }
+            continue;  // 不点击 sidebar, 不触发渲染, 节省 ~900ms
+          }
+
+          // 未识别 → 点击 sidebar 触发渲染 + extractQuestion
+          const currItems = StatusDot.findSidebarItems();
+          const el = currItems.get(pos);
+          if (!el) {
+            log(`  ⚠️ 第 ${pos} 题在 sidebar 找不到, 跳过`, 'warn');
+            continue;
+          }
+          const clickable = el.closest('li, button, a, [role="button"]') || el;
+          clickable.click();
+          // 等 iLearning Vue 渲染 + handleQuestionChange (含 350ms debounce) 完成
+          await sleep(900);
+
+          if (this.cancelled) break;
+
+          // 验证当前题是不是预期 → 是 → 入队
+          if (state.currentQuestion && state.currentQuestion.position === pos) {
+            this.ensureQueued(state.currentQuestion);
+          } else {
+            log(`  ⚠️ 切到第 ${pos} 题失败 (当前: ${state.currentQuestion?.position || '无'}), 跳过`, 'warn');
+          }
+        }
+
+        this.active = false;
+        this.currentPos = null;
+        this.updateUI();
+        if (this.cancelled) {
+          log(`⏹️ 自动遍历已取消, 已识别 ${batchState.identifiedQuestions.size} 题`, 'warn');
+          return;
+        }
+        log(`✅ 自动遍历完成: ${this.visited}/${this.total} 题已识别 (batchState 含 ${batchState.identifiedQuestions.size} 题)`, 'success');
+
+        // v0.10.0: 批量模式下, 识别完毕后触发批量预取
+        if (batchState.enabled) {
+          log('🚀 触发批量预取...', 'info');
+          BatchManager.flushAll();
+        }
+      },
+
+      cancel() {
+        if (!this.active) return;
+        this.cancelled = true;
+        log('⏹️ 用户取消自动遍历, 等待当前题处理完再停', 'info');
+      },
+
+      updateUI() {
+        const ind = document.getElementById('ilh-traverse-indicator');
+        const btn = document.getElementById('ilh-traverse-cancel');
+        if (!ind) return;
+        if (this.active) {
+          ind.textContent = `🤖 ${this.visited}/${this.total}` + (this.currentPos ? ` (第 ${this.currentPos} 题)` : '');
+          ind.style.display = 'inline-block';
+          if (btn) btn.style.display = 'inline-block';
+        } else {
+          ind.style.display = 'none';
+          if (btn) btn.style.display = 'none';
+        }
+      },
+    };
+
+    /* ───── v0.10.0: 真正的批量预取管理 ───── */
+    const BatchManager = {
+      currentBatchSize: 20,        // 当前批次大小 (会因失败降级)
+      consecutiveFailures: 0,      // 连续失败次数 (达 2 触发降级)
+      batchHistory: new Map(),     // batchId -> { questions, attempt }
+
+      // 把所有未完成的题按当前 batchSize 切分发送
+      flushAll() {
+        const allQs = Array.from(batchState.identifiedQuestions.values())
+          .sort((a, b) => a.position - b.position);
+        const todoQs = allQs.filter((q) => {
+          const cached = GM_getValue(`ilh:response:${q.id}`, null);
+          if (cached && cached.status === 'done') return false;  // 已完成跳过
+          const req = GM_getValue(`ilh:request:${q.id}`, null);
+          if (req && req.batchId) {
+            // 已经在某批次中
+            const b = GM_getValue(`ilh:batch_request:${req.batchId}`, null);
+            if (b && b.status === 'pending') return false;  // 还在处理中
+          }
+          return true;
+        });
+
+        if (todoQs.length === 0) {
+          log('✅ 所有题已完成或在处理中, 无需批量发送', 'info');
+          return;
+        }
+
+        const batches = [];
+        for (let i = 0; i < todoQs.length; i += this.currentBatchSize) {
+          batches.push(todoQs.slice(i, i + this.currentBatchSize));
+        }
+
+        log(`🚀 准备发 ${batches.length} 个批次, 每批最多 ${this.currentBatchSize} 题 (共 ${todoQs.length} 题)`, 'info');
+        for (const batchQs of batches) {
+          this.sendOne(batchQs);
+        }
+        batchState.batchStarted = true;
+        updateBatchPanel();
+      },
+
+      // 发送单个批次
+      sendOne(questions, attempt = 1) {
+        if (questions.length === 0) return;
+        const batchId = `batch_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+        const positions = questions.map((q) => q.position);
+        const positionMap = {};
+        questions.forEach((q) => { positionMap[q.position] = q.id; });
+
+        const prompt = this.buildPrompt(questions);
+
+        Bridge.sendBatch({
+          id: batchId,
+          prompt: prompt,
+          positions: positions,
+          positionMap: positionMap,
+          batchSize: questions.length,
+          attempt: attempt,
+        });
+
+        this.batchHistory.set(batchId, { questions, attempt });
+
+        // 更新 dots
+        questions.forEach((q) => {
+          state.qIdToPosition.set(q.id, q.position);
+          StatusDot.updateOne(q.position, q.id);
+        });
+
+        log(`📦 发出批次 ${batchId.slice(-8)}: ${questions.length} 题 [${positions.slice(0, 5).join(',')}${positions.length > 5 ? '...' : ''}] (尝试 ${attempt})`, 'info');
+      },
+
+      // 构造批量 prompt
+      buildPrompt(questions) {
+        const N = questions.length;
+        const parts = [
+          `请基于知识库, 严格按以下格式分别给出每道题的正确答案和完整解析。`,
+          `规则:`,
+          `1. 每道题的解析必须以 "===Q数字===" 标记开头, 数字必须严格对应题号 (例如第 5 题用 ===Q5===)`,
+          `2. 不要省略任何一道题, 共 ${N} 题`,
+          `3. 每道题先给"正确答案", 再给"完整解析"`,
+          ``,
+          `下面是 ${N} 道题:`,
+          ``,
+        ];
+        for (const q of questions) {
+          parts.push(`===Q${q.position}===`);
+          parts.push(`[${q.type}] 第 ${q.position}/${q.total} 题`);
+          parts.push(q.stem);
+          if (q.options.length > 0) {
+            for (const o of q.options) {
+              parts.push(`${o.letter}. ${o.content}`);
+            }
+          }
+          parts.push(``);
+        }
+        parts.push(`请严格按 "===Q数字===" 分隔的格式逐题输出, 不要漏题。`);
+        return parts.join('\n');
+      },
+
+      // 批次部分成功 (NotebookLM 端通知)
+      onBatchPartial(batchId, splitResults, failedPositions) {
+        const history = this.batchHistory.get(batchId);
+        if (!history) {
+          log(`⚠️ 收到未知批次结果 ${batchId.slice(-8)}, 忽略`, 'warn');
+          return;
+        }
+        const total = history.questions.length;
+        const successCount = total - failedPositions.length;
+        const successRate = successCount / total;
+
+        if (successRate >= 0.7) {
+          // 整批视为成功 (>= 70%)
+          this.consecutiveFailures = 0;
+          log(`✅ 批次 ${batchId.slice(-8)} 完成: ${successCount}/${total} 题 (${(successRate*100).toFixed(0)}%)`, 'success');
+          // 失败的少数题, 后续单独重试
+          if (failedPositions.length > 0) {
+            const failedQs = failedPositions.map((p) => history.questions.find((q) => q.position === p)).filter(Boolean);
+            if (failedQs.length > 0) {
+              log(`  ↪️ ${failedQs.length} 题没拆出, 单独重试`, 'info');
+              setTimeout(() => {
+                for (const q of failedQs) this.sendOne([q], 2);
+              }, 2000);
+            }
+          }
+        } else {
+          // 整批失败
+          this.consecutiveFailures++;
+          log(`❌ 批次 ${batchId.slice(-8)} 失败: 仅 ${(successRate*100).toFixed(0)}% (连续 ${this.consecutiveFailures} 次失败)`, 'error');
+          if (this.consecutiveFailures >= 2) {
+            const oldSize = this.currentBatchSize;
+            // 降级路径: 20 → 10 → 5 → 1
+            if (this.currentBatchSize > 10) this.currentBatchSize = 10;
+            else if (this.currentBatchSize > 5) this.currentBatchSize = 5;
+            else if (this.currentBatchSize > 1) this.currentBatchSize = 1;
+            else this.currentBatchSize = 1;
+            log(`📉 batchSize 降级: ${oldSize} → ${this.currentBatchSize}`, 'warn');
+            this.consecutiveFailures = 0;
+          }
+          // 重打包失败的题, 按新 batchSize 发
+          const failedQs = failedPositions.map((p) => history.questions.find((q) => q.position === p)).filter(Boolean);
+          if (failedQs.length > 0) {
+            const sortedFailed = failedQs.sort((a, b) => a.position - b.position);
+            for (let i = 0; i < sortedFailed.length; i += this.currentBatchSize) {
+              const newBatch = sortedFailed.slice(i, i + this.currentBatchSize);
+              setTimeout(() => this.sendOne(newBatch, history.attempt + 1), 2000 * (i / this.currentBatchSize + 1));
+            }
+          }
+        }
+      },
+    };
+
     // v0.6.0: 把已识别的题号合并成紧凑 ranges (e.g. "1-3, 5, 7-10")
     function compactRanges(positionsArray) {
       const sorted = Array.from(positionsArray).filter((n) => Number.isInteger(n)).sort((a, b) => a - b);
@@ -550,6 +909,34 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         z-index: 2;
       }
       .ilh-grid-dot.pending { animation: ilh-pulse 1.2s ease-in-out infinite; }
+
+      /* v0.9.0: 自动遍历进度指示 */
+      #ilh-traverse-indicator {
+        margin-left: 8px;
+        padding: 2px 8px;
+        font-size: 10px;
+        color: #fbbf24;
+        background: rgba(251,191,36,0.12);
+        border-radius: 10px;
+        font-weight: 500;
+        animation: ilh-pulse 1.6s ease-in-out infinite;
+      }
+      .ilh-traverse-cancel-btn {
+        margin-left: 5px;
+        padding: 1px 6px;
+        background: rgba(239,68,68,0.2);
+        color: #fca5a5;
+        border: 1px solid rgba(239,68,68,0.3);
+        border-radius: 3px;
+        cursor: pointer;
+        font-size: 10px;
+        line-height: 1.2;
+        transition: background 0.15s;
+      }
+      .ilh-traverse-cancel-btn:hover {
+        background: rgba(239,68,68,0.4);
+        color: #fff;
+      }
       #ilh-header {
         padding: 11px 14px;
         background: rgba(0,0,0,0.28);
@@ -1023,9 +1410,13 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         </div>
         <div id="ilh-overview-grid">
           <div class="ilh-overview-header">
-            <span>🎯 题目状态总览</span>
+            <span>
+              🎯 题目状态总览
+              <span id="ilh-traverse-indicator" style="display:none"></span>
+              <button id="ilh-traverse-cancel" class="ilh-traverse-cancel-btn" style="display:none" title="取消自动遍历">⏹</button>
+            </span>
             <span class="ilh-overview-legend">
-              <span><i style="background:#9ca3af"></i>未开始</span>
+              <span><i style="background:#4a5568"></i>未开始</span>
               <span><i style="background:#eab308"></i>获取中</span>
               <span><i style="background:#22c55e"></i>已就绪</span>
               <span><i style="background:#ef4444"></i>失败</span>
@@ -1137,6 +1528,11 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         } else {
           log(`⚠️ sidebar 找不到第 ${pos} 题, 无法跳转`, 'warn');
         }
+      });
+
+      // v0.9.0: 取消自动遍历按钮
+      document.getElementById('ilh-traverse-cancel').addEventListener('click', () => {
+        AutoTraverse.cancel();
       });
     }
 
@@ -1361,6 +1757,25 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
 
     // v0.8.0: 启动状态灯系统 (sidebar 自动注入 + 全量更新)
     StatusDot.setupAutoInject();
+
+    // v0.9.0: 自动遍历 - 延迟 3 秒后启动 (留时间给 iLearning 渲染 sidebar 和首题)
+    setTimeout(() => {
+      AutoTraverse.start().catch((e) => {
+        log(`❌ 自动遍历异常: ${e.message}`, 'error');
+        AutoTraverse.active = false;
+        AutoTraverse.updateUI();
+      });
+    }, 3000);
+
+    // v0.10.0: 监听批次结果通知
+    GM_addValueChangeListener(Bridge.KEY_BATCH_NOTIFY, (key, oldVal, newVal) => {
+      if (!newVal || !newVal.batchId) return;
+      if (newVal.status === 'partial' || newVal.status === 'failed') {
+        BatchManager.onBatchPartial(newVal.batchId, newVal.splitResults || {}, newVal.failedPositions || []);
+      } else if (newVal.status === 'success') {
+        BatchManager.onBatchPartial(newVal.batchId, newVal.splitResults || {}, []);
+      }
+    });
 
     // v0.8.0: 全局 notify listener - 监听任何题状态变化, 更新 dot + 自动刷新当前题显示
     GM_addValueChangeListener(Bridge.KEY_NOTIFY, (key, oldVal, newVal) => {
@@ -1981,6 +2396,121 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       return lastEl ? extractFormattedText(lastEl) : null;
     }
 
+    // v0.10.0: 拆批量响应 — 用 ===Q\d+=== 切片
+    function splitBatchResponse(responseText, expectedPositions) {
+      const results = {};
+      const pattern = /===\s*Q(\d+)\s*===/g;
+      const matches = [];
+      let m;
+      while ((m = pattern.exec(responseText)) !== null) {
+        matches.push({ pos: parseInt(m[1], 10), index: m.index, length: m[0].length });
+      }
+      log(`  🔍 在响应中找到 ${matches.length} 个 ===Q数字=== 标记`, 'debug');
+      for (let i = 0; i < matches.length; i++) {
+        const pos = matches[i].pos;
+        const start = matches[i].index + matches[i].length;
+        const end = i + 1 < matches.length ? matches[i + 1].index : responseText.length;
+        const content = responseText.slice(start, end).trim();
+        if (content.length >= 30) {
+          results[pos] = content;
+        }
+      }
+      return results;
+    }
+
+    // v0.10.0: 处理一个批次 — 输入打包 prompt, 等响应, 拆解, 写入每题
+    async function processOneBatch(batchReq) {
+      state.busy = true;
+      state.currentRequest = batchReq;
+      const N = batchReq.batchSize;
+      setStatus('busy', `⏳ 处理批次 ${batchReq.id.slice(-8)} (${N} 题)...`);
+      log(`📦 接到批次 ${batchReq.id.slice(-8)}: ${N} 题 [${batchReq.positions.slice(0, 5).join(',')}${batchReq.positions.length > 5 ? '...' : ''}] (尝试 ${batchReq.attempt})`, 'info');
+
+      try {
+        // 1. 找输入框
+        const inputEl = findInputElement();
+        if (!inputEl) {
+          log('❌ 未找到 NotebookLM 输入框', 'error');
+          batchReq.positions.forEach((p) => {
+            const qId = batchReq.positionMap[p];
+            Bridge.writeResponse(qId, '', 'error', '找不到 NotebookLM 输入框');
+          });
+          Bridge.completeBatch(batchReq.id);
+          Bridge.notifyBatchResult(batchReq.id, 'failed', { failedPositions: batchReq.positions });
+          return;
+        }
+
+        // 2. 输入 prompt
+        await setInputValue(inputEl, batchReq.prompt);
+        await sleep(CONFIG.submitWaitMs);
+
+        // 3. 提交
+        const method = await submitMessage(inputEl);
+        if (!method) {
+          log('❌ 批次提交失败', 'error');
+          Bridge.completeBatch(batchReq.id);
+          Bridge.notifyBatchResult(batchReq.id, 'failed', { failedPositions: batchReq.positions });
+          return;
+        }
+        await sleep(CONFIG.responseInitialDelayMs);
+
+        // 4. 等响应 (用 prompt 头部固定字符串作 user msg 指纹)
+        const fakeReq = {
+          stem: '请基于知识库, 严格按以下格式',  // prompt 头 18 字, 稳定指纹
+          type: 'batch',
+          position: '0',
+          total: '0',
+          isBatch: true,
+        };
+        const responseText = await waitForResponse(fakeReq);
+        if (!responseText || responseText.length < 100) {
+          log(`❌ 批次响应过短 (${responseText?.length || 0} 字符)`, 'error');
+          batchReq.positions.forEach((p) => {
+            const qId = batchReq.positionMap[p];
+            Bridge.writeResponse(qId, '', 'error', '批次响应过短或未抓到');
+          });
+          Bridge.completeBatch(batchReq.id);
+          Bridge.notifyBatchResult(batchReq.id, 'failed', { failedPositions: batchReq.positions });
+          return;
+        }
+
+        // 5. 拆响应
+        const splitResults = splitBatchResponse(responseText, batchReq.positions);
+        const successPositions = [];
+        const failedPositions = [];
+
+        for (const pos of batchReq.positions) {
+          const qId = batchReq.positionMap[pos];
+          if (splitResults[pos]) {
+            Bridge.writeResponse(qId, splitResults[pos], 'done');
+            successPositions.push(pos);
+          } else {
+            failedPositions.push(pos);
+            // 不写 error, 留给 iLearning BatchManager 重试 (single 模式)
+            // 但要清掉 KEY_REQ pending 才能重新入队
+          }
+        }
+
+        const successRate = successPositions.length / batchReq.positions.length;
+        log(`📦 批次解析结果: ${successPositions.length}/${batchReq.positions.length} 题 (${(successRate*100).toFixed(0)}%) [失败题号: ${failedPositions.join(',') || '无'}]`, successRate >= 0.7 ? 'success' : 'warn');
+
+        Bridge.completeBatch(batchReq.id);
+        Bridge.notifyBatchResult(batchReq.id,
+          successRate === 1 ? 'success' : (successRate >= 0.7 ? 'partial' : 'failed'),
+          { failedPositions, successCount: successPositions.length, totalCount: batchReq.positions.length });
+
+      } catch (e) {
+        log(`❌ 批次处理异常: ${e.message}`, 'error');
+        Bridge.completeBatch(batchReq.id);
+        Bridge.notifyBatchResult(batchReq.id, 'failed', { failedPositions: batchReq.positions });
+      } finally {
+        state.busy = false;
+        state.currentRequest = null;
+        updateCurrent(null);
+        updateStats();
+      }
+    }
+
     // === 处理一道题 ===
     async function processOneRequest(req) {
       state.busy = true;
@@ -2155,16 +2685,23 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       return t;
     }
 
-    // === 队列循环 ===
+    // === 队列循环 (v0.10.0: 优先批量请求) ===
     async function tryProcessQueue() {
       if (state.busy) return;
+      // 优先处理批量请求
+      const batchReq = Bridge.peekNextBatch();
+      if (batchReq) {
+        await processOneBatch(batchReq);
+        setTimeout(tryProcessQueue, 800);
+        return;
+      }
+      // 然后单题
       const req = Bridge.peekNextRequest();
       if (!req) {
         setStatus('idle', '⏸ 等待 iLearning 发题...');
         return;
       }
       await processOneRequest(req);
-      // 处理完一个再试下一个(顺序处理, 避免并发)
       setTimeout(tryProcessQueue, 500);
     }
 
@@ -2317,7 +2854,13 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
 
     // 监听新 request
     Bridge.onRequest(() => {
-      log('🔔 检测到新请求, 准备处理', 'info');
+      log('🔔 检测到新单题请求', 'info');
+      tryProcessQueue();
+    });
+
+    // v0.10.0: 监听批量请求
+    Bridge.onBatchRequest(() => {
+      log('🔔 检测到新批量请求', 'info');
       tryProcessQueue();
     });
 
