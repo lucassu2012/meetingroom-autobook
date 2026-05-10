@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.12.2
+// @version      0.12.3
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.12.3 - 两个修复: ① 选项重排兼容 v0.12.2 之前的旧缓存 (originalOptions 缺失时回退到 KEY_REQ.options) ② 重新请求按钮同时删 KEY_REQ, 让单题重发不再被卡 '已在处理中'
 // v0.12.2 - 选项重排 A+B 处理 (警告对照表 + 字母自动重映射) + 干掉启动自动去重 (保留函数+手动按钮)
 // v0.12.1 - 三连修复: ① 缓存去重 (旧 q{pos}_xxx 与新 q_xxx 共存导致 1 题多份, 启动时自动跑一次去重 + 手动触发) ② 方向键拦截 (浮窗内按↑↓←→不再误切 iLearning 题) ③ 缓存数 pill 加去重按钮
 // v0.12.0 - 4 个修复: ① qId 不再依赖 position (题号变了仍能命中缓存) ② 修 BatchManager 写 KEY_REQ 没 stem 的 bug ③ 统一 iLearning + NotebookLM CSV 格式 (都从 GM 全缓存读, 含批量 prompt 反查兜底) ④ iLearning 加缓存数 UI
@@ -1590,9 +1591,11 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       });
       document.getElementById('ilh-btn-redo').addEventListener('click', () => {
         if (!state.currentQuestion) return;
-        // 删除缓存, 重新请求
-        GM_deleteValue(`ilh:response:${state.currentQuestion.id}`);
-        log(`🔄 已清除 ${state.currentQuestion.id} 的缓存解析, 重新请求`, 'info');
+        const qId = state.currentQuestion.id;
+        // v0.12.3: 同时删 KEY_RESP 和 KEY_REQ, 否则下面 requestExplanation 看到 KEY_REQ 残留会判定 "已在处理中"
+        GM_deleteValue(`ilh:response:${qId}`);
+        GM_deleteValue(`ilh:request:${qId}`);
+        log(`🔄 已清除 ${qId} 的缓存 (request + response), 重新请求`, 'info');
         requestExplanation(state.currentQuestion);
       });
 
@@ -2145,20 +2148,34 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       contentEl.className = 'ilh-explain-content ' + (kind || '');
 
       // v0.12.2: 选项重排检测 + 字母自动重映射 (仅成功状态 + 有当前题)
+      // v0.12.3: 兼容旧缓存 — originalOptions 缺失时回退到 KEY_REQ.options
       let remapWarningHTML = '';
       let finalStatus = statusText;
       if ((!kind || kind === '') && content && state.currentQuestion) {
-        const cached = GM_getValue(`ilh:response:${state.currentQuestion.id}`, null);
-        if (cached && cached.originalOptions && cached.originalOptions.length > 0) {
-          const remap = detectOptionRemapping(state.currentQuestion.options, cached.originalOptions);
-          if (remap) {
-            content = applyAnswerRemapping(content, remap);
-            remapWarningHTML = buildRemapWarningHTML(remap);
-            finalStatus = '⚠️ 选项已重排 · 字母已调整';
+        const qId = state.currentQuestion.id;
+        const cached = GM_getValue(`ilh:response:${qId}`, null);
+        if (cached) {
+          // 优先用 originalOptions, 没有就 fallback 到 KEY_REQ.options (v0.12.2 之前的缓存)
+          let originalOptions = (cached.originalOptions && cached.originalOptions.length > 0)
+            ? cached.originalOptions
+            : null;
+          if (!originalOptions) {
+            const req = GM_getValue(`ilh:request:${qId}`, null);
+            if (req && req.options && req.options.length > 0) {
+              originalOptions = req.options;
+            }
           }
-        }
-        if (cached && cached.edited && !remapWarningHTML) {
-          finalStatus = '✏️ 已编辑 · 秒回';
+          if (originalOptions) {
+            const remap = detectOptionRemapping(state.currentQuestion.options, originalOptions);
+            if (remap) {
+              content = applyAnswerRemapping(content, remap);
+              remapWarningHTML = buildRemapWarningHTML(remap);
+              finalStatus = '⚠️ 选项已重排 · 字母已调整';
+            }
+          }
+          if (cached.edited && !remapWarningHTML) {
+            finalStatus = '✏️ 已编辑 · 秒回';
+          }
         }
       }
 
