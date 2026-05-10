@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.13.0
+// @version      0.12.8
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,7 +19,8 @@
 // ==/UserScript==
 
 // CHANGELOG
-// v0.13.0 - Apple 风格视觉 makeover (基于 getdesign.md/apple): SF 系统字体, Apple Blue (#0071e3) 单色强调, 8/12/pill 圆角分级, 软阴影, Glass header (backdrop-filter blur), Apple 系统状态色 (#30d158/#ff9f0a/#ff453a), iOS 风格 toggle, 紧凑负 letter-spacing, 8px 间距网格. 不改任何功能逻辑, 仅 CSS 重写.
+// v0.12.8 - UI 稳定性: 浮窗整体固定高度 (不随内容变化伸缩), 解析模块固定高度 (内部滚动), 移除"复制解析"按钮 (操作栏更精简). 用 flex 布局让各功能模块各自固定, 日志区分到剩余空间.
+// v0.12.7 - 回滚 v0.13.0 (Apple 风格 makeover 导致界面错乱), 恢复 v0.12.6 视觉; 新增"📂 导入题库"按钮: 解析 CSV (8列: 题号/题型/题干/选项/解析答案/是否已编辑/答案核对/处理时间), 完全清空原 GM 缓存, 用 CSV 数据重建 KEY_REQ + KEY_RESP, 题号、状态、答案核对一并恢复; 原"📥 CSV"按钮改名为"📤 导出题库"
 // v0.12.6 - 括号内字母重映射纠正: 之前 v0.12.5 只映射第一个字母 (Q32 (A,B)→(B,B) 错误), 现在改为'全部映射' — 预处理时把括号内所有字母都按 mapping 替换 (用户期望)
 // v0.12.5 - ① 模式 8 重做: 括号内多字母用 split 拆分, 只替换第一个匹配字母, 解决 (A, C)/(X, Y) 不全映射 ② 新增'答案核对'功能 (3 选 1: 正确/错误/未验证), 持久化到缓存 ③ CSV 导出新增'答案核对'列
 // v0.12.4 - 字母重映射补 3 个模式: ① 字母+空格+错误/正确 ("D 错误") ② 字母+顿号/逗号 ("D、E错误") ③ 中文+(字母) ("TR5 (E)"); 用 PLACE+字母+SAFE 三明治防链式替换 bug
@@ -337,7 +338,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       minStemLength: 4,
       logMaxLines: 80,
       panelWidth: 420,
-      panelMaxHeight: 780,
+      panelMaxHeight: 820,
       requestTimeoutMs: 90000, // 90 秒等不到响应就报错
       nlmCheckIntervalMs: 5000, // 每 5s 检查 NotebookLM 心跳
     };
@@ -357,8 +358,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         return 'idle';
       },
       colorFor(s) {
-        // v0.13.0: Apple 系统色 (信号性保留, 但用 iOS 系统色精确值)
-        return ({ ready: '#30d158', pending: '#ff9f0a', error: '#ff453a', idle: '#6e6e73' })[s] || '#6e6e73';
+        return ({ ready: '#22c55e', pending: '#eab308', error: '#ef4444', idle: '#9ca3af' })[s] || '#9ca3af';
       },
       labelFor(s) {
         return ({ ready: '✅ 解析已就绪 · 点开秒回', pending: '⏳ 获取中...', error: '❌ 获取失败 · 可重试', idle: '⚫ 未开始' })[s] || s;
@@ -902,569 +902,441 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       }
     }
 
-    // === STYLES (v0.13.0 Apple 风格 makeover) ===
+    // === STYLES ===
     GM_addStyle(`
-      /* === Apple Design Tokens === */
       #ilh-panel {
-        --apple-blue: #0071e3;
-        --apple-blue-hover: #0077ed;
-        --apple-blue-bright: #2997ff;
-
-        --bg-base: rgba(28,28,30,0.92);
-        --bg-elevated: rgba(44,44,46,0.65);
-        --bg-elevated-2: rgba(58,58,60,0.55);
-        --bg-input: rgba(60,60,67,0.36);
-
-        --text-primary: #f5f5f7;
-        --text-secondary: rgba(245,245,247,0.72);
-        --text-tertiary: rgba(245,245,247,0.50);
-        --text-quaternary: rgba(245,245,247,0.30);
-
-        --separator: rgba(255,255,255,0.08);
-        --separator-strong: rgba(255,255,255,0.14);
-
-        --status-green: #30d158;
-        --status-orange: #ff9f0a;
-        --status-yellow: #ffd60a;
-        --status-red: #ff453a;
-        --status-gray: #6e6e73;
-
-        --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "PingFang SC", "Microsoft YaHei", "Helvetica Neue", sans-serif;
-        --font-text: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", "Helvetica Neue", sans-serif;
-        --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "PingFang SC", monospace;
-
-        --radius-xs: 5px;
-        --radius-sm: 8px;
-        --radius-md: 10px;
-        --radius-lg: 12px;
-        --radius-pill: 980px;
-
-        --shadow-floating: 0 16px 56px rgba(0,0,0,0.45), 0 0 0 0.5px rgba(255,255,255,0.06);
-
-        --ease-apple: cubic-bezier(0.4, 0, 0.2, 1);
-        --duration-fast: 150ms;
-        --duration-normal: 220ms;
-
         position: fixed; bottom: 24px; right: 24px;
         width: ${CONFIG.panelWidth}px;
-        max-height: min(${CONFIG.panelMaxHeight}px, calc(100vh - 48px));
-        background: var(--bg-base);
-        -webkit-backdrop-filter: saturate(180%) blur(24px);
-        backdrop-filter: saturate(180%) blur(24px);
-        color: var(--text-primary);
-        font-family: var(--font-text);
+        /* v0.12.8: 固定高度, 不随内容变化伸缩 */
+        height: min(${CONFIG.panelMaxHeight}px, calc(100vh - 48px));
+        background: linear-gradient(135deg, #1a1d2e 0%, #232842 100%);
+        color: #e8eaf6;
+        font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
         font-size: 13px;
-        letter-spacing: -0.01em;
-        border-radius: var(--radius-lg);
-        box-shadow: var(--shadow-floating);
+        border-radius: 12px;
+        box-shadow: 0 12px 40px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,255,255,0.06);
         z-index: 2147483646;
         overflow: hidden;
         display: flex; flex-direction: column;
-        transition: max-height var(--duration-normal) var(--ease-apple);
+        transition: height 0.25s ease;
       }
-      #ilh-panel.collapsed { max-height: 44px; }
+      #ilh-panel.collapsed { height: 44px; }
 
-      /* === Header (Apple Glass) === */
-      #ilh-header {
-        padding: 12px 14px;
-        background: rgba(0,0,0,0.20);
-        -webkit-backdrop-filter: saturate(180%) blur(20px);
-        backdrop-filter: saturate(180%) blur(20px);
-        display: flex; align-items: center; gap: 8px;
-        cursor: move;
-        user-select: none;
-        border-bottom: 0.5px solid var(--separator);
-      }
-      .ilh-dot {
-        width: 8px; height: 8px; border-radius: 50%;
-        background: var(--status-green);
-      }
-      .ilh-dot.idle  { background: var(--status-gray); }
-      .ilh-dot.error { background: var(--status-red); }
-      .ilh-dot.warn  { background: var(--status-orange); }
-      .ilh-dot.busy  { background: var(--apple-blue); animation: ilh-pulse 1.6s ease-in-out infinite; }
-
-      .ilh-title {
-        flex: 1;
-        font-family: var(--font-display);
-        font-weight: 600;
-        font-size: 14px;
-        letter-spacing: -0.022em;
-        color: var(--text-primary);
-      }
-      .ilh-stage {
-        font-size: 10.5px;
-        font-weight: 500;
-        color: var(--text-tertiary);
-        padding: 2px 8px;
-        background: rgba(255,255,255,0.08);
-        border-radius: var(--radius-pill);
-        letter-spacing: 0;
-      }
-      .ilh-toggle {
-        cursor: pointer;
-        padding: 4px 9px;
-        color: var(--text-tertiary);
-        border-radius: var(--radius-sm);
-        font-family: var(--font-mono);
-        font-size: 13px;
-        line-height: 1;
-        transition: all var(--duration-fast) var(--ease-apple);
-      }
-      .ilh-toggle:hover {
-        color: var(--text-primary);
-        background: rgba(255,255,255,0.08);
-      }
-
-      /* === Batch Settings === */
-      .ilh-batch-panel {
-        display: flex; align-items: center; gap: 12px;
-        padding: 10px 14px;
-        border-bottom: 0.5px solid var(--separator);
-        font-size: 12px;
-        flex-wrap: wrap;
-      }
-      .ilh-batch-toggle {
-        display: flex; align-items: center; gap: 7px;
-        cursor: pointer; user-select: none;
-        color: var(--text-secondary);
-        font-size: 12px;
-        letter-spacing: -0.01em;
-      }
-      /* iOS-style switch */
-      .ilh-batch-toggle input[type="checkbox"] {
-        appearance: none; -webkit-appearance: none;
-        width: 30px; height: 18px;
-        background: rgba(120,120,128,0.32);
-        border-radius: var(--radius-pill);
-        position: relative;
-        cursor: pointer;
-        transition: background var(--duration-normal) var(--ease-apple);
+      /* v0.12.8: 各模块固定高度, 不随内容塌缩或撑大 */
+      #ilh-panel > #ilh-header,
+      #ilh-panel > #ilh-batch-panel,
+      #ilh-panel > #ilh-overview-grid {
         flex-shrink: 0;
       }
-      .ilh-batch-toggle input[type="checkbox"]:checked { background: var(--status-green); }
-      .ilh-batch-toggle input[type="checkbox"]::before {
-        content: ''; position: absolute;
-        top: 1px; left: 1px;
-        width: 16px; height: 16px;
-        background: #ffffff;
-        border-radius: 50%;
-        transition: transform var(--duration-normal) var(--ease-apple);
-        box-shadow: 0 2px 4px rgba(0,0,0,0.2), 0 0 1px rgba(0,0,0,0.1);
-      }
-      .ilh-batch-toggle input[type="checkbox"]:checked::before { transform: translateX(12px); }
 
-      .ilh-batch-config {
-        display: flex; align-items: center; gap: 6px;
-        color: var(--text-secondary);
-      }
-      .ilh-batch-config input {
-        width: 38px;
-        padding: 3px 6px;
-        background: var(--bg-input);
-        border: 0.5px solid var(--separator);
-        color: var(--text-primary);
-        font-family: var(--font-mono);
-        font-size: 11.5px;
-        border-radius: var(--radius-xs);
-        text-align: center;
-        outline: none;
-        transition: border-color var(--duration-fast);
-      }
-      .ilh-batch-config input:focus {
-        border-color: var(--apple-blue);
-        box-shadow: 0 0 0 3px rgba(0,113,227,0.25);
-      }
-
-      /* === Overview Grid === */
+      /* v0.8.1: overview grid - 暗色系, 与浮窗一致 */
       #ilh-overview-grid {
-        background: var(--bg-elevated);
-        border: 0.5px solid var(--separator);
-        border-radius: var(--radius-md);
-        padding: 10px 12px 12px;
-        margin: 12px 12px 0;
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.06);
+        border-radius: 6px;
+        padding: 7px 10px 9px;
+        margin: 8px 12px 0;
         font-size: 11px;
       }
       .ilh-overview-header {
-        display: flex; align-items: center; gap: 8px;
-        margin-bottom: 8px;
+        display: flex; justify-content: space-between; align-items: center;
+        margin-bottom: 6px;
+        color: #b0bec5;
         font-weight: 500;
-        color: var(--text-secondary);
-        letter-spacing: -0.01em;
-        flex-wrap: wrap;
+        font-size: 11px;
       }
-      .ilh-overview-legend {
-        font-size: 10px;
-        color: var(--text-tertiary);
-        letter-spacing: 0;
-      }
-      .ilh-overview-legend span { margin-right: 8px; }
+      .ilh-overview-legend { font-size: 9.5px; color: #78909c; }
+      .ilh-overview-legend span { margin-right: 7px; }
       .ilh-overview-legend i {
-        display: inline-block; width: 6px; height: 6px;
-        border-radius: 50%; margin-right: 3px;
-        vertical-align: middle;
+        display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+        margin-right: 3px; vertical-align: middle;
       }
-      .ilh-grid {
+      #ilh-overview-grid-content {
         display: grid;
         grid-template-columns: repeat(10, 1fr);
-        gap: 4px;
+        gap: 3px;
       }
       .ilh-grid-dot {
-        display: flex; align-items: center; justify-content: center;
-        height: 19px;
-        border-radius: var(--radius-xs);
-        background: var(--status-gray);
-        color: rgba(255,255,255,0.92);
-        font-size: 9.5px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 18px;
+        border-radius: 3px;
+        background: #4a5568;
+        color: rgba(255,255,255,0.85);
+        font-size: 9px;
         font-weight: 600;
-        font-family: var(--font-mono);
-        letter-spacing: 0;
         cursor: pointer;
-        transition: transform var(--duration-fast) var(--ease-apple),
-                    box-shadow var(--duration-fast) var(--ease-apple);
+        transition: background 0.3s, transform 0.15s, box-shadow 0.15s;
         user-select: none;
       }
       .ilh-grid-dot:hover {
-        transform: scale(1.15);
+        transform: scale(1.18);
         box-shadow: 0 2px 6px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.18);
         z-index: 2;
       }
-      .ilh-grid-dot.pending { animation: ilh-pulse 1.6s ease-in-out infinite; }
+      .ilh-grid-dot.pending { animation: ilh-pulse 1.2s ease-in-out infinite; }
 
-      /* === Auto Traverse Indicator === */
+      /* v0.9.0: 自动遍历进度指示 */
       #ilh-traverse-indicator {
-        margin-left: auto;
-        padding: 2px 9px;
-        font-size: 10.5px;
+        margin-left: 8px;
+        padding: 2px 8px;
+        font-size: 10px;
+        color: #fbbf24;
+        background: rgba(251,191,36,0.12);
+        border-radius: 10px;
         font-weight: 500;
-        color: var(--status-orange);
-        background: rgba(255,159,10,0.14);
-        border-radius: var(--radius-pill);
-        letter-spacing: -0.01em;
-        animation: ilh-pulse 1.8s ease-in-out infinite;
+        animation: ilh-pulse 1.6s ease-in-out infinite;
       }
       .ilh-traverse-cancel-btn {
-        margin-left: 6px;
-        padding: 2px 9px;
-        background: rgba(255,69,58,0.16);
-        color: #ff7a70;
-        border: 0.5px solid rgba(255,69,58,0.32);
-        border-radius: var(--radius-pill);
+        margin-left: 5px;
+        padding: 1px 6px;
+        background: rgba(239,68,68,0.2);
+        color: #fca5a5;
+        border: 1px solid rgba(239,68,68,0.3);
+        border-radius: 3px;
         cursor: pointer;
         font-size: 10px;
-        font-weight: 500;
         line-height: 1.2;
-        letter-spacing: -0.01em;
-        transition: all var(--duration-fast) var(--ease-apple);
+        transition: background 0.15s;
       }
       .ilh-traverse-cancel-btn:hover {
-        background: rgba(255,69,58,0.28);
-        color: #ffffff;
+        background: rgba(239,68,68,0.4);
+        color: #fff;
       }
+      #ilh-header {
+        padding: 11px 14px;
+        background: rgba(0,0,0,0.28);
+        display: flex; align-items: center; gap: 8px;
+        cursor: move;
+        user-select: none;
+        border-bottom: 1px solid rgba(255,255,255,0.06);
+      }
+      .ilh-dot {
+        width: 8px; height: 8px; border-radius: 50%;
+        background: #4caf50;
+        box-shadow: 0 0 8px #4caf50;
+      }
+      .ilh-dot.idle { background: #888; box-shadow: none; }
+      .ilh-dot.error { background: #f44336; box-shadow: 0 0 8px #f44336; }
+      .ilh-dot.warn  { background: #ff9800; box-shadow: 0 0 8px #ff9800; }
+      .ilh-dot.busy { background: #2196f3; box-shadow: 0 0 8px #2196f3; animation: ilh-pulse 1.2s infinite; }
+      @keyframes ilh-pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
 
-      /* === Question Card === */
-      #ilh-question {
-        background: var(--bg-elevated);
-        border: 0.5px solid var(--separator);
-        border-radius: var(--radius-md);
-        padding: 12px 14px;
-        margin: 12px;
+      .ilh-title { flex: 1; font-weight: 600; letter-spacing: 0.3px; }
+      .ilh-stage {
+        font-size: 10px; opacity: 0.65;
+        padding: 2px 7px;
+        background: rgba(255,255,255,0.07);
+        border-radius: 4px;
       }
-      .ilh-meta {
-        display: flex; gap: 6px; flex-wrap: wrap;
-        margin-bottom: 10px;
+      .ilh-toggle { cursor: pointer; padding: 2px 6px; opacity: 0.5; font-family: monospace; }
+      .ilh-toggle:hover { opacity: 1; }
+
+      /* v0.8.1: batch-panel 单行紧凑布局 */
+      #ilh-batch-panel {
+        padding: 8px 12px;
+        border-bottom: 1px solid rgba(255,255,255,0.06);
+        background: rgba(33,150,243,0.04);
+        font-size: 11px;
+        display: flex;
         align-items: center;
+        gap: 10px;
       }
-      .ilh-pill {
-        font-size: 10.5px;
+      .ilh-batch-toggle {
+        display: flex; align-items: center; gap: 5px;
+        cursor: pointer;
         font-weight: 500;
-        padding: 3px 9px;
-        border-radius: var(--radius-pill);
-        background: var(--bg-elevated-2);
-        color: var(--text-secondary);
-        letter-spacing: -0.01em;
+        opacity: 0.9;
         white-space: nowrap;
       }
-      .ilh-pill.position { background: rgba(255,159,10,0.16); color: #ffb340; }
+      .ilh-batch-toggle input[type="checkbox"] {
+        cursor: pointer;
+      }
+      .ilh-batch-config {
+        display: flex; align-items: center; gap: 5px;
+        opacity: 0.9;
+        white-space: nowrap;
+      }
+      .ilh-batch-config input {
+        width: 44px; padding: 2px 4px;
+        background: rgba(0,0,0,0.28);
+        color: #e8eaf6;
+        border: 1px solid rgba(255,255,255,0.15);
+        border-radius: 3px;
+        font-size: 11px;
+        text-align: center;
+      }
+      #ilh-batch-start {
+        margin-left: auto;
+        font-size: 10.5px;
+        padding: 4px 10px;
+        white-space: nowrap;
+      }
+      #ilh-batch-start:disabled {
+        opacity: 0.32; cursor: not-allowed;
+      }
+      #ilh-batch-panel.disabled {
+        opacity: 0.5;
+      }
+      #ilh-batch-panel.disabled .ilh-batch-config,
+      #ilh-batch-panel.disabled #ilh-batch-start {
+        opacity: 0.5;
+      }
+
+      #ilh-question {
+        /* v0.12.8: 固定高度, 内部滚动 */
+        flex-shrink: 0;
+        height: 180px;
+        padding: 12px 14px;
+        overflow-y: auto;
+      }
+      .ilh-meta { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; align-items: center; }
       .ilh-pill.cache-count {
-        background: rgba(48,209,88,0.14); color: #4cd47b;
+        background: rgba(34,197,94,0.16);
+        color: #86efac;
         cursor: pointer;
         margin-left: auto;
-        transition: background var(--duration-fast);
       }
-      .ilh-pill.cache-count:hover { background: rgba(48,209,88,0.24); }
-
+      .ilh-pill.cache-count:hover { background: rgba(34,197,94,0.28); }
+      .ilh-pill {
+        font-size: 10px; padding: 2px 7px;
+        border-radius: 10px;
+        background: rgba(33,150,243,0.18);
+        color: #90caf9;
+      }
+      .ilh-pill.position { background: rgba(255,193,7,0.18); color: #ffd54f; }
       .ilh-stem {
-        font-size: 13px;
-        line-height: 1.5;
-        letter-spacing: -0.01em;
-        color: var(--text-primary);
-        margin-bottom: 10px;
+        font-size: 13px; line-height: 1.55;
+        margin-bottom: 8px;
+        color: #f0f3ff;
       }
       .ilh-options { display: flex; flex-direction: column; gap: 5px; }
       .ilh-option {
         font-size: 12px;
-        color: var(--text-secondary);
-        padding: 7px 10px;
-        background: var(--bg-elevated-2);
-        border-radius: var(--radius-sm);
+        padding: 6px 10px;
+        background: rgba(255,255,255,0.04);
+        border-radius: 5px;
         line-height: 1.45;
-        letter-spacing: -0.01em;
       }
-      .ilh-option-letter {
-        font-weight: 600;
-        color: var(--apple-blue-bright);
-        margin-right: 6px;
-      }
+      .ilh-option-letter { font-weight: 600; color: #64b5f6; margin-right: 6px; }
 
-      /* === Explain Box === */
       #ilh-explain {
-        margin: 0 12px 12px;
-        padding: 14px;
-        background: var(--bg-elevated);
-        border: 0.5px solid var(--separator);
-        border-radius: var(--radius-md);
+        /* v0.12.8: 固定高度 + flex 布局, 让 explain-content 自动占满剩余空间 */
+        flex-shrink: 0;
+        height: 300px;
+        padding: 12px 14px;
+        border-top: 1px solid rgba(255,255,255,0.06);
+        background: rgba(0,0,0,0.18);
+        display: flex;
+        flex-direction: column;
+        box-sizing: border-box;
       }
       .ilh-explain-header {
+        flex-shrink: 0;
         display: flex; justify-content: space-between; align-items: center;
-        margin-bottom: 10px;
-        font-family: var(--font-display);
-        font-size: 13px;
-        font-weight: 600;
-        letter-spacing: -0.022em;
+        margin-bottom: 8px; font-size: 12px;
       }
-      .ilh-explain-status {
-        font-size: 11px;
-        font-weight: 400;
-        color: var(--text-tertiary);
-        letter-spacing: -0.01em;
-      }
+      .ilh-explain-status { font-size: 10px; opacity: 0.65; }
       .ilh-explain-content {
-        padding: 12px 14px;
-        background: rgba(48,209,88,0.07);
-        border-left: 2.5px solid var(--status-green);
-        border-radius: var(--radius-sm);
-        font-size: 12.5px;
+        /* v0.12.8: 占满剩余空间, 内部滚动 (不再用 max-height) */
+        flex: 1;
+        min-height: 0;
+        background: rgba(34,197,94,0.07);
+        border-left: 2px solid #22c55e;
+        padding: 10px 12px;
+        border-radius: 5px;
+        font-size: 12px;
         line-height: 1.6;
-        letter-spacing: -0.01em;
-        color: var(--text-primary);
-        word-break: break-word;
+        color: #e8f5e9;
         white-space: pre-wrap;
-        max-height: 220px;
+        word-break: break-word;
         overflow-y: auto;
       }
       .ilh-explain-content.waiting {
-        border-left-color: var(--apple-blue);
-        background: rgba(0,113,227,0.08);
-        color: var(--apple-blue-bright);
+        border-left-color: #2196f3;
+        background: rgba(33,150,243,0.07);
+        color: #90caf9;
         font-style: italic;
       }
       .ilh-explain-content.error {
-        border-left-color: var(--status-red);
-        background: rgba(255,69,58,0.08);
-        color: #ff8a80;
+        border-left-color: #ef4444;
+        background: rgba(239,68,68,0.07);
+        color: #fca5a5;
       }
+      /* v0.12.5: 答案核对栏 */
+      .ilh-verify-bar {
+        flex-shrink: 0;
+        display: flex; align-items: center; gap: 6px;
+        padding: 8px 0 4px;
+        margin-top: 4px;
+        font-size: 11px;
+      }
+      .ilh-verify-label { opacity: 0.7; color: #94a3b8; }
+      .ilh-verify-btn {
+        padding: 3px 9px;
+        border-radius: 11px;
+        font-size: 11px;
+        background: rgba(255,255,255,0.05);
+        border: 1px solid rgba(255,255,255,0.10);
+        color: #cbd5e1;
+        cursor: pointer;
+        transition: all 0.15s;
+      }
+      .ilh-verify-btn:hover { background: rgba(255,255,255,0.10); }
+      .ilh-verify-btn.active[data-state="correct"] {
+        background: #22c55e; border-color: #22c55e; color: #fff;
+      }
+      .ilh-verify-btn.active[data-state="incorrect"] {
+        background: #ef4444; border-color: #ef4444; color: #fff;
+      }
+      .ilh-verify-btn.active[data-state="unverified"] {
+        background: rgba(148,163,184,0.3); border-color: #94a3b8; color: #fff;
+      }
+
+      /* v0.12.2: 选项重排警告 */
+      .ilh-remap-warning {
+        flex-shrink: 0;
+        background: rgba(251,191,36,0.08);
+        border-left: 2px solid #fbbf24;
+        padding: 8px 11px;
+        margin-bottom: 9px;
+        border-radius: 4px;
+        font-size: 11.5px;
+      }
+      .ilh-remap-title {
+        color: #fde68a;
+        font-weight: 600;
+        margin-bottom: 4px;
+      }
+      .ilh-remap-details summary {
+        cursor: pointer;
+        color: #94a3b8;
+        font-size: 10.5px;
+        padding: 1px 0;
+        opacity: 0.85;
+      }
+      .ilh-remap-details summary:hover { opacity: 1; }
+      .ilh-remap-details[open] summary { margin-bottom: 4px; }
+      .ilh-remap-row {
+        font-size: 10.5px;
+        padding: 1px 0 1px 12px;
+        line-height: 1.6;
+      }
+      .ilh-remap-orig { color: #94a3b8; font-family: "SF Mono", monospace; }
+      .ilh-remap-arrow { color: #fbbf24; margin-left: 6px; }
+      .ilh-remap-arrow b { color: #fde68a; font-size: 12px; }
+      .ilh-remap-same { color: #6b7280; font-size: 10px; margin-left: 6px; }
+
       .ilh-explain-content[contenteditable="true"] {
         outline: none;
-        background: rgba(0,113,227,0.06);
-        border-left-color: var(--apple-blue);
+        background: rgba(33,150,243,0.05);
+        border-left-color: #2196f3;
         cursor: text;
       }
-      .ilh-explain-content strong {
-        font-weight: 600;
-        color: var(--text-primary);
+      .ilh-mini-btn.ilh-btn-primary {
+        background: #2196f3;
+        border-color: #2196f3;
+        color: #fff;
       }
-      .ilh-explain-content em { font-style: italic; }
-      .ilh-explain-content .ilh-md-line { margin-bottom: 4px; }
+      .ilh-mini-btn.ilh-btn-primary:hover {
+        background: #1e88e5;
+      }
+      .ilh-explain-actions {
+        flex-shrink: 0;
+        display: flex; gap: 6px; margin-top: 8px;
+        align-items: center;
+      }
+      .ilh-mini-btn {
+        padding: 4px 9px;
+        font-size: 11px;
+        background: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.10);
+        color: #e8eaf6;
+        border-radius: 4px;
+        cursor: pointer;
+        font-family: inherit;
+        transition: background 0.15s;
+      }
+      .ilh-mini-btn:hover { background: rgba(255,255,255,0.13); }
+
+      #ilh-log-section {
+        /* v0.12.8: 占用剩余空间, 让浮窗高度稳定 */
+        flex: 1;
+        min-height: 80px;
+        display: flex; flex-direction: column;
+        border-top: 1px solid rgba(255,255,255,0.06);
+        background: rgba(0,0,0,0.20);
+      }
+      #ilh-log-section > #ilh-log-header { flex-shrink: 0; }
+      #ilh-log-section > #ilh-log {
+        flex: 1;
+        min-height: 0;
+      }
+      #ilh-log-header {
+        padding: 7px 14px;
+        font-size: 11px;
+        opacity: 0.65;
+        cursor: pointer;
+        display: flex; justify-content: space-between;
+        user-select: none;
+      }
+      #ilh-log-header:hover { opacity: 1; }
+      #ilh-log {
+        padding: 0 14px 10px;
+        overflow-y: auto;
+        font-family: "SF Mono", Monaco, Consolas, monospace;
+        font-size: 10.5px;
+        line-height: 1.55;
+      }
+      #ilh-log.collapsed { display: none; }
+      .ilh-log-entry { margin-bottom: 1px; opacity: 0.9; }
+      .ilh-log-info    { color: #90caf9; }
+      .ilh-log-success { color: #81c784; }
+      .ilh-log-warn    { color: #ffb74d; }
+      .ilh-log-error   { color: #e57373; }
+      .ilh-log-debug   { color: #b0bec5; opacity: 0.7; }
+      .ilh-log-time    { opacity: 0.4; margin-right: 6px; }
+
+      .ilh-explain-content .ilh-md-line {
+        margin-bottom: 4px;
+      }
       .ilh-explain-content ul.ilh-md-list {
         list-style: disc;
         padding-left: 22px;
         margin: 4px 0;
       }
-      .ilh-explain-content ul.ilh-md-list ul.ilh-md-list { padding-left: 18px; }
-      .ilh-explain-content li { margin-bottom: 2px; }
-      .ilh-explain-content.md-rendered { white-space: normal; }
-
-      /* === Remap Warning === */
-      .ilh-remap-warning {
-        background: rgba(255,159,10,0.10);
-        border-left: 2.5px solid var(--status-orange);
-        border-radius: var(--radius-sm);
-        padding: 10px 12px;
-        margin-bottom: 10px;
-        font-size: 11.5px;
-        letter-spacing: -0.01em;
+      .ilh-explain-content ul.ilh-md-list ul.ilh-md-list {
+        padding-left: 18px;
       }
-      .ilh-remap-title {
-        color: #ffd28d;
+      .ilh-explain-content li {
+        margin-bottom: 2px;
+      }
+      .ilh-explain-content.md-rendered {
+        white-space: normal;
+      }
+      .ilh-explain-content strong {
         font-weight: 600;
-        margin-bottom: 6px;
-        letter-spacing: -0.016em;
+        color: #fff;
       }
-      .ilh-remap-details summary {
-        cursor: pointer;
-        color: var(--text-tertiary);
+      .ilh-explain-content em { font-style: italic; }
+
+      #ilh-empty {
+        padding: 20px 14px;
+        text-align: center;
+        color: #90a4ae;
+        font-size: 12px;
+      }
+      .ilh-hint {
+        display: block;
+        margin-top: 6px;
         font-size: 10.5px;
-        padding: 2px 0;
-        outline: none;
-        list-style: none;
-      }
-      .ilh-remap-details summary::-webkit-details-marker { display: none; }
-      .ilh-remap-details summary::before {
-        content: '▸';
-        display: inline-block;
-        margin-right: 4px;
-        transition: transform var(--duration-fast);
-      }
-      .ilh-remap-details[open] summary::before { transform: rotate(90deg); }
-      .ilh-remap-details summary:hover { color: var(--text-secondary); }
-      .ilh-remap-details[open] summary { margin-bottom: 6px; }
-      .ilh-remap-row {
-        font-size: 10.5px;
-        padding: 2px 0 2px 14px;
-        line-height: 1.6;
-        color: var(--text-secondary);
-      }
-      .ilh-remap-orig { color: var(--text-tertiary); font-family: var(--font-mono); }
-      .ilh-remap-arrow { color: var(--status-orange); margin-left: 6px; }
-      .ilh-remap-arrow b { color: #ffd28d; font-size: 12px; }
-      .ilh-remap-same { color: var(--text-quaternary); font-size: 10px; margin-left: 6px; }
-
-      /* === Verify Bar === */
-      .ilh-verify-bar {
-        display: flex; align-items: center; gap: 8px;
-        padding: 10px 0 4px;
-        margin-top: 4px;
-        font-size: 11px;
-        letter-spacing: -0.01em;
-      }
-      .ilh-verify-label { color: var(--text-tertiary); }
-      .ilh-verify-btn {
-        padding: 4px 11px;
-        border-radius: var(--radius-pill);
-        font-size: 11px;
-        font-weight: 500;
-        background: var(--bg-elevated-2);
-        border: 0.5px solid var(--separator);
-        color: var(--text-secondary);
-        cursor: pointer;
-        letter-spacing: -0.01em;
-        transition: all var(--duration-fast) var(--ease-apple);
-      }
-      .ilh-verify-btn:hover {
-        background: rgba(255,255,255,0.10);
-        color: var(--text-primary);
-      }
-      .ilh-verify-btn.active[data-state="correct"] {
-        background: var(--status-green);
-        border-color: var(--status-green);
-        color: #ffffff;
-      }
-      .ilh-verify-btn.active[data-state="incorrect"] {
-        background: var(--status-red);
-        border-color: var(--status-red);
-        color: #ffffff;
-      }
-      .ilh-verify-btn.active[data-state="unverified"] {
-        background: var(--bg-input);
-        border-color: var(--separator-strong);
-        color: var(--text-primary);
+        opacity: 0.7;
       }
 
-      /* === Action Buttons === */
-      .ilh-explain-actions {
-        display: flex; gap: 7px; margin-top: 10px;
-        align-items: center;
-      }
-      .ilh-mini-btn {
-        padding: 5px 11px;
-        font-size: 11.5px;
-        font-weight: 400;
-        border-radius: var(--radius-sm);
-        background: var(--bg-elevated-2);
-        border: 0.5px solid var(--separator);
-        color: var(--text-secondary);
-        font-family: inherit;
-        letter-spacing: -0.01em;
-        cursor: pointer;
-        transition: all var(--duration-fast) var(--ease-apple);
-      }
-      .ilh-mini-btn:hover {
-        background: rgba(255,255,255,0.10);
-        color: var(--text-primary);
-      }
-      .ilh-mini-btn:active { transform: scale(0.97); }
-      .ilh-mini-btn.ilh-btn-primary {
-        background: var(--apple-blue);
-        border-color: var(--apple-blue);
-        color: #ffffff;
-        font-weight: 500;
-      }
-      .ilh-mini-btn.ilh-btn-primary:hover {
-        background: var(--apple-blue-hover);
-        border-color: var(--apple-blue-hover);
-      }
-
-      /* === Log Section === */
-      #ilh-log-section {
-        border-top: 0.5px solid var(--separator);
-        background: rgba(0,0,0,0.18);
-      }
-      #ilh-log-header {
-        padding: 8px 14px;
-        font-size: 11px;
-        font-weight: 500;
-        color: var(--text-tertiary);
-        letter-spacing: -0.01em;
-        cursor: pointer;
-        display: flex; justify-content: space-between;
-        user-select: none;
-        transition: color var(--duration-fast);
-      }
-      #ilh-log-header:hover { color: var(--text-secondary); }
-      #ilh-log {
-        padding: 0 14px 12px;
-        max-height: 180px;
-        overflow-y: auto;
-        font-family: var(--font-mono);
-        font-size: 10.5px;
-        line-height: 1.55;
-        letter-spacing: 0;
-      }
-      #ilh-log.collapsed { display: none; }
-      .ilh-log-entry { margin-bottom: 1px; opacity: 0.92; }
-      .ilh-log-info    { color: #64b8ff; }
-      .ilh-log-success { color: #4cd47b; }
-      .ilh-log-warn    { color: #ffb340; }
-      .ilh-log-error   { color: #ff7a70; }
-      .ilh-log-debug   { color: var(--text-tertiary); opacity: 0.7; }
-      .ilh-log-time    { color: var(--text-quaternary); margin-right: 6px; }
-
-      /* === Sidebar Dot (注入到 iLearning sidebar 的小点) === */
       .ilh-sidebar-dot {
-        display: inline-block;
-        width: 7px; height: 7px;
-        border-radius: 50%;
-        margin-left: 6px;
-        vertical-align: middle;
-        background: var(--status-gray);
-        box-shadow: none;
+        flex-shrink: 0;
       }
-
-      /* === Animations === */
-      @keyframes ilh-pulse {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.5; }
-      }
-
-      /* === Apple-style Scrollbars === */
-      #ilh-panel ::-webkit-scrollbar { width: 5px; height: 5px; }
-      #ilh-panel ::-webkit-scrollbar-track { background: transparent; }
-      #ilh-panel ::-webkit-scrollbar-thumb {
-        background: rgba(255,255,255,0.18);
-        border-radius: 3px;
-      }
-      #ilh-panel ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.28); }
     `);
 
     // === Markdown 渲染 (v0.5.6) ===
@@ -1745,11 +1617,11 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
             <button class="ilh-verify-btn" data-state="unverified">? 未验证</button>
           </div>
           <div class="ilh-explain-actions" id="ilh-actions-view">
-            <button class="ilh-mini-btn" id="ilh-btn-copy-explain">📋 复制解析</button>
             <button class="ilh-mini-btn" id="ilh-btn-edit">✏️ 编辑</button>
             <button class="ilh-mini-btn" id="ilh-btn-redo">🔄 重新请求</button>
             <span style="flex:1"></span>
-            <button class="ilh-mini-btn" id="ilh-btn-csv" title="导出全部题目和解析为 CSV (Excel 可打开)">📥 CSV</button>
+            <button class="ilh-mini-btn" id="ilh-btn-csv" title="导出全部题目和解析为 CSV (Excel 可打开)">📤 导出题库</button>
+            <button class="ilh-mini-btn" id="ilh-btn-import" title="从 CSV 文件导入题库 (会完全清空当前缓存!)">📂 导入题库</button>
           </div>
           <div class="ilh-explain-actions" id="ilh-actions-edit" style="display:none">
             <button class="ilh-mini-btn ilh-btn-primary" id="ilh-btn-save">💾 保存</button>
@@ -1777,14 +1649,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         document.getElementById('ilh-log').classList.toggle('collapsed', state.logCollapsed);
         document.getElementById('ilh-log-toggle').textContent = state.logCollapsed ? '▶' : '▼';
       });
-      document.getElementById('ilh-btn-copy-explain').addEventListener('click', () => {
-        const el = document.getElementById('ilh-explain-content');
-        if (!el || !el.textContent) return log('⚠️ 暂无解析可复制', 'warn');
-        navigator.clipboard.writeText(el.textContent).then(
-          () => log('✅ 解析已复制', 'success'),
-          (e) => log(`❌ 复制失败: ${e.message}`, 'error')
-        );
-      });
+      // v0.12.8: 移除"复制解析"按钮 (用户可双击解析框选中再复制, 或用浏览器自带功能)
       // v0.12.5: 答案核对按钮组事件 (点击切换状态, 立即保存到 KEY_RESP)
       document.querySelectorAll('#ilh-verify-bar .ilh-verify-btn').forEach((btn) => {
         btn.addEventListener('click', () => {
@@ -1829,6 +1694,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
 
       // v0.11.0: CSV 导出
       document.getElementById('ilh-btn-csv').addEventListener('click', () => exportCSV());
+      document.getElementById('ilh-btn-import').addEventListener('click', () => importCsvAsBank());
 
       // v0.6.0: 批量面板事件
       document.getElementById('ilh-batch-enabled').addEventListener('change', (e) => {
@@ -2404,6 +2270,255 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       exportAllCachedAsCSV(filename, log);
     }
 
+    /* ───── v0.12.7: 题库导入 ─────
+     * CSV 格式 (8 列, UTF-8 BOM):
+     *   1. 题号        - 整数 (可重复, 因不同试卷同位置不同题)
+     *   2. 题型        - "单选题" / "多选题"
+     *   3. 题干        - 字符串
+     *   4. 选项        - "A. xxx\nB. xxx\nC. xxx" (\n 分隔, CSV 标准引号包裹真换行)
+     *   5. 解析答案    - markdown 格式, 含正确答案标记
+     *   6. 是否已编辑  - "是" / "否"
+     *   7. 答案核对    - "✓ 正确" / "✗ 错误" / "未验证"
+     *   8. 处理时间    - 本地时间字符串
+     *
+     * 导入流程:
+     *   1) 弹文件选择框
+     *   2) 二次确认 (会清空 N 条旧缓存, 用 M 题替换)
+     *   3) 清空所有 ilh:request:* / ilh:response:* / ilh:batch_* / ilh:queue
+     *   4) 逐题用 stem hash 算 qId, 写 KEY_REQ + KEY_RESP
+     *   5) 刷新当前页面 (用户感受到题库已切换)
+     */
+    function importCsvAsBank() {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = '.csv,text/csv';
+      input.style.display = 'none';
+      input.addEventListener('change', (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        log(`📂 选择文件: ${file.name} (${(file.size/1024).toFixed(1)} KB)`, 'info');
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          try {
+            doImportFromCsvText(ev.target.result, file.name);
+          } catch (err) {
+            log(`❌ 导入失败: ${err.message}`, 'error');
+            alert(`❌ 导入失败:\n${err.message}`);
+          } finally {
+            input.remove();
+          }
+        };
+        reader.onerror = () => {
+          log(`❌ 文件读取失败`, 'error');
+          alert('❌ 文件读取失败, 请重试');
+          input.remove();
+        };
+        reader.readAsText(file, 'utf-8');
+      });
+      document.body.appendChild(input);
+      input.click();
+    }
+
+    function doImportFromCsvText(text, filename) {
+      // 去 BOM
+      if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+      const rows = parseCsv(text);
+      if (rows.length < 2) throw new Error('CSV 行数太少 (至少需要表头 + 1 行数据)');
+
+      const header = rows[0];
+      const expectedHeader = ['题号', '题型', '题干', '选项', '解析答案', '是否已编辑', '答案核对', '处理时间'];
+      // 不强制完全匹配, 但至少前 5 列要对得上
+      const headerOK = expectedHeader.slice(0, 5).every((h, i) => (header[i] || '').trim() === h);
+      if (!headerOK) {
+        throw new Error(`CSV 表头不匹配, 期望前 5 列为:\n  ${expectedHeader.slice(0,5).join(' | ')}\n实际:\n  ${header.slice(0,5).join(' | ')}`);
+      }
+
+      const dataRows = rows.slice(1).filter((r) => r.some((c) => c && c.trim()));
+      if (dataRows.length === 0) throw new Error('CSV 没有数据行');
+
+      // 先统计现有缓存
+      const allKeys = (typeof Bridge !== 'undefined' && Bridge.listAllKeys)
+        ? Bridge.listAllKeys()
+        : GM_listValues().filter((k) => k.startsWith('ilh:'));
+      const oldReqCount = allKeys.filter((k) => k.startsWith('ilh:request:')).length;
+      const oldRespCount = allKeys.filter((k) => k.startsWith('ilh:response:')).length;
+
+      const ok = confirm(
+        `⚠️ 即将导入题库\n\n` +
+        `文件: ${filename}\n` +
+        `导入: ${dataRows.length} 题\n\n` +
+        `这将完全清空当前缓存:\n` +
+        `  • request 缓存: ${oldReqCount} 条\n` +
+        `  • response 缓存: ${oldRespCount} 条\n` +
+        `  • batch 任务、队列等\n\n` +
+        `用 CSV 数据替换。是否继续?`
+      );
+      if (!ok) {
+        log(`📂 用户取消导入`, 'info');
+        return;
+      }
+
+      // === 1. 清空所有 ilh:* (除 ilh:nlm_status 心跳, 不破坏 NotebookLM 端状态) ===
+      let cleared = 0;
+      for (const k of allKeys) {
+        if (k === 'ilh:nlm_status') continue; // 保留心跳
+        try {
+          GM_deleteValue(k);
+          cleared++;
+        } catch (e) {
+          console.warn(`[ilh] delete ${k} failed:`, e);
+        }
+      }
+      log(`🗑 已清空 ${cleared} 条旧缓存`, 'info');
+
+      // === 2. 逐题写 KEY_REQ + KEY_RESP ===
+      let imported = 0, skipped = 0;
+      const total = dataRows.length;
+      const importTs = Date.now();
+
+      for (const row of dataRows) {
+        try {
+          const [posStr, typeStr, stem, optionsStr, explainText, editedStr, verifyStr, timeStr] = row;
+          if (!stem || stem.trim().length < 2) {
+            skipped++;
+            continue;
+          }
+          const position = parseInt((posStr || '0').trim(), 10) || 0;
+          const type = (typeStr || '').trim() === '多选题' ? 'multi' : 'single';
+          const stemNorm = stem.replace(/\s+/g, '').trim();
+          const qId = `q_${hashString(stemNorm)}`;
+
+          // 解析选项 "A. xxx\nB. xxx\nC. xxx" → [{letter, content}]
+          const options = [];
+          if (optionsStr) {
+            const lines = optionsStr.split(/\r?\n/);
+            for (const ln of lines) {
+              const m = ln.match(/^\s*([A-F])[\.、]\s*(.+)$/);
+              if (m) options.push({ letter: m[1], content: m[2].trim() });
+            }
+          }
+
+          // 解析时间戳
+          let ts = importTs;
+          if (timeStr && timeStr.trim()) {
+            const parsed = Date.parse(timeStr.trim().replace(/\//g, '-'));
+            if (!isNaN(parsed)) ts = parsed;
+          }
+
+          // KEY_REQ
+          GM_setValue(`ilh:request:${qId}`, {
+            id: qId,
+            position,
+            type,
+            stem,
+            options,
+            timestamp: ts,
+            status: 'imported',
+          });
+
+          // KEY_RESP (有解析就 done)
+          if (explainText && explainText.trim()) {
+            const verified = (verifyStr || '').trim();
+            const verifyMap = {
+              '✓ 正确': 'correct',
+              '✗ 错误': 'incorrect',
+              '未验证': 'unverified',
+            };
+            GM_setValue(`ilh:response:${qId}`, {
+              id: qId,
+              text: explainText,
+              status: 'done',
+              error: null,
+              timestamp: ts,
+              edited: (editedStr || '').trim() === '是',
+              verified: verifyMap[verified] || 'unverified',
+              originalOptions: options.slice(),
+              importedFrom: filename,
+            });
+          }
+
+          imported++;
+        } catch (e) {
+          console.warn(`[ilh] import row failed:`, row, e);
+          skipped++;
+        }
+      }
+
+      log(`✅ 导入完成: ${imported}/${total} 题 (跳过 ${skipped})`, 'success');
+      alert(
+        `✅ 题库导入完成!\n\n` +
+        `成功: ${imported} 题\n` +
+        `跳过: ${skipped} 题\n` +
+        `已清空: ${cleared} 条旧缓存\n\n` +
+        `页面将刷新, 请稍候...`
+      );
+
+      // === 3. 刷新页面 ===
+      setTimeout(() => location.reload(), 600);
+    }
+
+    /** 简单 CSV 解析: 支持引号包裹、多行字段、""转义 */
+    function parseCsv(text) {
+      const rows = [];
+      let row = [];
+      let cell = '';
+      let inQuote = false;
+      let i = 0;
+      const n = text.length;
+      while (i < n) {
+        const c = text[i];
+        if (inQuote) {
+          if (c === '"') {
+            if (text[i+1] === '"') {
+              cell += '"';
+              i += 2;
+              continue;
+            }
+            inQuote = false;
+            i++;
+            continue;
+          }
+          cell += c;
+          i++;
+          continue;
+        }
+        // 非引号内
+        if (c === '"') {
+          inQuote = true;
+          i++;
+          continue;
+        }
+        if (c === ',') {
+          row.push(cell);
+          cell = '';
+          i++;
+          continue;
+        }
+        if (c === '\r') {
+          // 跳过 \r, 等待 \n
+          i++;
+          continue;
+        }
+        if (c === '\n') {
+          row.push(cell);
+          rows.push(row);
+          row = [];
+          cell = '';
+          i++;
+          continue;
+        }
+        cell += c;
+        i++;
+      }
+      // 最后一个 cell
+      if (cell || row.length) {
+        row.push(cell);
+        rows.push(row);
+      }
+      return rows;
+    }
+
+
     function showExplain(kind, content = '', statusText = '') {
       const wrap = document.getElementById('ilh-explain');
       const contentEl = document.getElementById('ilh-explain-content');
@@ -2738,147 +2853,76 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
 
     GM_addStyle(`
       #nlh-panel {
-        --apple-blue: #0071e3;
-        --apple-blue-hover: #0077ed;
-        --apple-blue-bright: #2997ff;
-        --bg-base: rgba(28,28,30,0.92);
-        --bg-elevated: rgba(44,44,46,0.65);
-        --bg-elevated-2: rgba(58,58,60,0.55);
-        --text-primary: #f5f5f7;
-        --text-secondary: rgba(245,245,247,0.72);
-        --text-tertiary: rgba(245,245,247,0.50);
-        --separator: rgba(255,255,255,0.08);
-        --status-green: #30d158;
-        --status-orange: #ff9f0a;
-        --status-red: #ff453a;
-        --status-gray: #6e6e73;
-        --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "PingFang SC", "Microsoft YaHei", sans-serif;
-        --font-text: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif;
-        --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-        --radius-sm: 8px;
-        --radius-md: 10px;
-        --radius-lg: 12px;
-        --radius-pill: 980px;
-
         position: fixed; bottom: 24px; right: 24px;
         width: ${CONFIG.panelWidth}px;
         max-height: ${CONFIG.panelMaxHeight}px;
-        background: var(--bg-base);
-        -webkit-backdrop-filter: saturate(180%) blur(24px);
-        backdrop-filter: saturate(180%) blur(24px);
-        color: var(--text-primary);
-        font-family: var(--font-text);
+        background: linear-gradient(135deg, #1a2e2a 0%, #1f3a3f 100%);
+        color: #e0f2f1;
+        font-family: -apple-system, "Segoe UI", "PingFang SC", sans-serif;
         font-size: 13px;
-        letter-spacing: -0.01em;
-        border-radius: var(--radius-lg);
-        box-shadow: 0 16px 56px rgba(0,0,0,0.45), 0 0 0 0.5px rgba(255,255,255,0.06);
+        border-radius: 12px;
+        box-shadow: 0 12px 40px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,255,255,0.06);
         z-index: 2147483646;
         overflow: hidden;
         display: flex; flex-direction: column;
       }
       #nlh-panel.collapsed { max-height: 44px; }
-
       #nlh-header {
-        padding: 12px 14px;
-        background: rgba(0,0,0,0.20);
-        -webkit-backdrop-filter: saturate(180%) blur(20px);
-        backdrop-filter: saturate(180%) blur(20px);
+        padding: 11px 14px;
+        background: rgba(0,0,0,0.28);
         display: flex; align-items: center; gap: 8px;
         cursor: move;
         user-select: none;
-        border-bottom: 0.5px solid var(--separator);
+        border-bottom: 1px solid rgba(255,255,255,0.06);
       }
       .nlh-dot {
         width: 8px; height: 8px; border-radius: 50%;
-        background: var(--status-green);
+        background: #26a69a;
+        box-shadow: 0 0 8px #26a69a;
       }
-      .nlh-dot.idle  { background: var(--status-gray); }
-      .nlh-dot.busy  { background: var(--apple-blue); animation: nlh-pulse 1.6s ease-in-out infinite; }
-      .nlh-dot.error { background: var(--status-red); }
-
-      .nlh-title {
-        flex: 1;
-        font-family: var(--font-display);
-        font-weight: 600;
-        font-size: 14px;
-        letter-spacing: -0.022em;
-      }
+      .nlh-dot.idle { background: #888; box-shadow: none; }
+      .nlh-dot.busy { background: #ffb300; box-shadow: 0 0 8px #ffb300; animation: nlh-pulse 1.2s infinite; }
+      .nlh-dot.error { background: #f44336; box-shadow: 0 0 8px #f44336; }
+      @keyframes nlh-pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+      .nlh-title { flex: 1; font-weight: 600; }
       .nlh-stage {
-        font-size: 10.5px;
-        font-weight: 500;
-        color: var(--text-tertiary);
-        padding: 2px 8px;
-        background: rgba(255,255,255,0.08);
-        border-radius: var(--radius-pill);
+        font-size: 10px; opacity: 0.65;
+        padding: 2px 7px;
+        background: rgba(255,255,255,0.07);
+        border-radius: 4px;
       }
-      .nlh-toggle {
-        cursor: pointer;
-        padding: 4px 9px;
-        color: var(--text-tertiary);
-        border-radius: var(--radius-sm);
-        font-family: var(--font-mono);
-        font-size: 13px;
-        line-height: 1;
-        transition: all 150ms cubic-bezier(0.4,0,0.2,1);
-      }
-      .nlh-toggle:hover {
-        color: var(--text-primary);
-        background: rgba(255,255,255,0.08);
-      }
+      .nlh-toggle { cursor: pointer; padding: 2px 6px; opacity: 0.5; font-family: monospace; }
+      .nlh-toggle:hover { opacity: 1; }
 
       #nlh-status {
         padding: 11px 14px;
-        font-size: 12.5px;
         font-weight: 500;
-        letter-spacing: -0.01em;
-        border-left: 2.5px solid var(--status-green);
-        background: rgba(48,209,88,0.08);
-        margin: 0;
+        border-left: 3px solid #26a69a;
+        background: rgba(38,166,154,0.10);
       }
-      #nlh-status.idle  {
-        border-left-color: var(--status-gray);
-        background: rgba(110,110,115,0.10);
-        color: var(--text-tertiary);
-      }
-      #nlh-status.busy  {
-        border-left-color: var(--apple-blue);
-        background: rgba(0,113,227,0.10);
-        color: var(--apple-blue-bright);
-      }
-      #nlh-status.error {
-        border-left-color: var(--status-red);
-        background: rgba(255,69,58,0.10);
-        color: #ff8a80;
-      }
+      #nlh-status.idle  { border-left-color: #666; background: rgba(255,255,255,0.03); opacity: 0.75; }
+      #nlh-status.busy  { border-left-color: #ffb300; background: rgba(255,179,0,0.10); }
+      #nlh-status.error { border-left-color: #f44336; background: rgba(244,67,54,0.10); }
 
       #nlh-stats {
-        padding: 12px 14px;
+        padding: 10px 14px;
         display: grid;
         grid-template-columns: repeat(3, 1fr);
         gap: 8px;
-        border-bottom: 0.5px solid var(--separator);
+        border-bottom: 1px solid rgba(255,255,255,0.06);
       }
       .nlh-stat {
         text-align: center;
-        padding: 8px;
-        background: var(--bg-elevated);
-        border: 0.5px solid var(--separator);
-        border-radius: var(--radius-sm);
+        padding: 6px;
+        background: rgba(255,255,255,0.03);
+        border-radius: 4px;
       }
       .nlh-stat-num {
-        font-family: var(--font-display);
-        font-size: 20px;
-        font-weight: 600;
-        color: var(--text-primary);
-        letter-spacing: -0.022em;
-        line-height: 1.1;
+        font-size: 18px; font-weight: 600; color: #80cbc4;
       }
       .nlh-stat-label {
-        font-size: 9.5px;
-        color: var(--text-tertiary);
+        font-size: 10px; opacity: 0.7;
         text-transform: uppercase;
-        letter-spacing: 0.04em;
-        margin-top: 2px;
       }
 
       #nlh-current {
@@ -2887,19 +2931,14 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         overflow-y: auto;
       }
       .nlh-current-title {
-        font-size: 11px;
-        color: var(--text-tertiary);
-        letter-spacing: -0.01em;
+        font-size: 11px; opacity: 0.7;
         margin-bottom: 6px;
       }
       .nlh-current-content {
-        font-size: 12px;
-        line-height: 1.55;
-        letter-spacing: -0.01em;
-        padding: 10px 12px;
-        background: var(--bg-elevated);
-        border: 0.5px solid var(--separator);
-        border-radius: var(--radius-sm);
+        font-size: 12px; line-height: 1.5;
+        padding: 8px 10px;
+        background: rgba(255,255,255,0.04);
+        border-radius: 4px;
         white-space: pre-wrap;
         word-break: break-word;
         max-height: 130px;
@@ -2907,76 +2946,50 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       }
 
       #nlh-actions {
-        display: flex; gap: 7px;
-        padding: 0 14px 12px;
+        display: flex; gap: 6px;
+        padding: 0 14px 10px;
       }
       .nlh-btn {
         flex: 1;
         padding: 6px 10px;
-        background: var(--bg-elevated-2);
-        color: var(--text-secondary);
-        border: 0.5px solid var(--separator);
-        border-radius: var(--radius-sm);
-        font-family: inherit;
-        font-size: 11.5px;
-        letter-spacing: -0.01em;
+        background: rgba(255,255,255,0.06);
+        color: #e0f2f1;
+        border: 1px solid rgba(255,255,255,0.1);
+        border-radius: 5px;
+        font-size: 11px;
         cursor: pointer;
-        transition: all 150ms cubic-bezier(0.4,0,0.2,1);
       }
-      .nlh-btn:hover:not(:disabled) {
-        background: rgba(255,255,255,0.10);
-        color: var(--text-primary);
-      }
-      .nlh-btn:active:not(:disabled) { transform: scale(0.97); }
+      .nlh-btn:hover:not(:disabled) { background: rgba(255,255,255,0.13); }
       .nlh-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
       #nlh-log-section {
-        border-top: 0.5px solid var(--separator);
-        background: rgba(0,0,0,0.18);
+        border-top: 1px solid rgba(255,255,255,0.06);
         display: flex; flex-direction: column;
       }
       #nlh-log-header {
-        padding: 8px 14px;
-        font-size: 11px;
-        font-weight: 500;
-        color: var(--text-tertiary);
-        letter-spacing: -0.01em;
+        padding: 7px 14px;
+        font-size: 11px; opacity: 0.7;
         cursor: pointer;
         display: flex; justify-content: space-between;
         user-select: none;
-        transition: color 150ms;
       }
-      #nlh-log-header:hover { color: var(--text-secondary); }
+      #nlh-log-header:hover { opacity: 1; }
       #nlh-log {
-        padding: 0 14px 12px;
+        padding: 0 14px 10px;
         overflow-y: auto;
-        font-family: var(--font-mono);
-        font-size: 10.5px;
+        font-size: 11px;
+        font-family: "SF Mono", Monaco, Consolas, monospace;
         line-height: 1.55;
         max-height: 140px;
-        letter-spacing: 0;
       }
       #nlh-log.collapsed { display: none; }
       .nlh-log-entry { margin-bottom: 1px; opacity: 0.92; }
-      .nlh-log-info    { color: #64b8ff; }
-      .nlh-log-success { color: #4cd47b; }
-      .nlh-log-warn    { color: #ffb340; }
-      .nlh-log-error   { color: #ff7a70; }
-      .nlh-log-debug   { color: var(--text-tertiary); opacity: 0.7; }
-      .nlh-log-time    { color: rgba(245,245,247,0.30); margin-right: 6px; }
-
-      @keyframes nlh-pulse {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.5; }
-      }
-
-      #nlh-panel ::-webkit-scrollbar { width: 5px; height: 5px; }
-      #nlh-panel ::-webkit-scrollbar-track { background: transparent; }
-      #nlh-panel ::-webkit-scrollbar-thumb {
-        background: rgba(255,255,255,0.18);
-        border-radius: 3px;
-      }
-      #nlh-panel ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.28); }
+      .nlh-log-info    { color: #80cbc4; }
+      .nlh-log-success { color: #a5d6a7; }
+      .nlh-log-warn    { color: #ffcc80; }
+      .nlh-log-error   { color: #ef9a9a; }
+      .nlh-log-debug   { color: #b0bec5; opacity: 0.7; }
+      .nlh-log-time    { opacity: 0.4; margin-right: 6px; }
     `);
 
     function log(msg, type = 'info') {
