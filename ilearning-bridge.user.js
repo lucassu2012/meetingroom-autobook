@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.10.2
+// @version      0.11.0
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.11.0 - 新增编辑解析 + CSV 导出: ① 解析区加✏️编辑按钮, 用户可手动改答案 ② CSV 导出全部题目+答案 (UTF-8 BOM, Excel 中文不乱码)
 // v0.10.2 - 修复两个问题: ① MouseEvent view 参数在 Tampermonkey sandbox 报错 → 移除 view 参数 ② startBatchProcessing 仍是阶段A占位 → 改为直接调 BatchManager.flushAll()
 // v0.10.1 - 修复 sidebar 切题失败: iLearning 用 <a href=''> 包题号, 单纯 .click() 被 Vue 忽略 → 改用完整 mousedown/mouseup/click 事件序列, 失败重试 3 次
 // v0.10.0 - 真正的批量预取 (Stage 3.5): 一个 prompt 含 N 题, NotebookLM 一次返回, 用 ===Q数字=== 分隔; batchSize=20 默认, 失败降级 20→10→5→1
@@ -1123,6 +1124,24 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         background: rgba(244,67,54,0.08);
         color: #ef9a9a;
       }
+      .ilh-explain-content[contenteditable="true"] {
+        outline: 2px solid rgba(99,102,241,0.5);
+        outline-offset: -2px;
+        background: rgba(99,102,241,0.06);
+        cursor: text;
+        white-space: pre-wrap;
+        font-family: "SF Mono", Monaco, Consolas, "Microsoft YaHei", monospace;
+        font-size: 12px;
+        line-height: 1.55;
+      }
+      .ilh-mini-btn.ilh-btn-primary {
+        background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+        border-color: #4f46e5;
+        color: #fff;
+      }
+      .ilh-mini-btn.ilh-btn-primary:hover {
+        background: linear-gradient(135deg, #4f46e5 0%, #3730a3 100%);
+      }
       .ilh-explain-actions {
         display: flex; gap: 6px;
         margin-top: 8px;
@@ -1472,9 +1491,18 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
             <span class="ilh-explain-status" id="ilh-explain-status"></span>
           </div>
           <div class="ilh-explain-content" id="ilh-explain-content"></div>
-          <div class="ilh-explain-actions">
+          <div class="ilh-explain-actions" id="ilh-actions-view">
             <button class="ilh-mini-btn" id="ilh-btn-copy-explain">📋 复制解析</button>
+            <button class="ilh-mini-btn" id="ilh-btn-edit">✏️ 编辑</button>
             <button class="ilh-mini-btn" id="ilh-btn-redo">🔄 重新请求</button>
+            <span style="flex:1"></span>
+            <button class="ilh-mini-btn" id="ilh-btn-csv" title="导出全部题目和解析为 CSV (Excel 可打开)">📥 CSV</button>
+          </div>
+          <div class="ilh-explain-actions" id="ilh-actions-edit" style="display:none">
+            <button class="ilh-mini-btn ilh-btn-primary" id="ilh-btn-save">💾 保存</button>
+            <button class="ilh-mini-btn" id="ilh-btn-cancel-edit">❌ 取消</button>
+            <span style="flex:1"></span>
+            <span style="font-size:10px;opacity:0.65;align-self:center">编辑后保存到本地缓存, 下次切回此题秒回</span>
           </div>
         </div>
         <div id="ilh-log-section">
@@ -1511,6 +1539,19 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         log(`🔄 已清除 ${state.currentQuestion.id} 的缓存解析, 重新请求`, 'info');
         requestExplanation(state.currentQuestion);
       });
+
+      // v0.11.0: 编辑解析
+      document.getElementById('ilh-btn-edit').addEventListener('click', () => {
+        if (!state.currentQuestion) return log('⚠️ 当前没有题目可编辑', 'warn');
+        const cached = GM_getValue(`ilh:response:${state.currentQuestion.id}`, null);
+        if (!cached || !cached.text) return log('⚠️ 当前题暂无解析可编辑', 'warn');
+        EditMode.enter(state.currentQuestion.id, cached.text);
+      });
+      document.getElementById('ilh-btn-save').addEventListener('click', () => EditMode.save());
+      document.getElementById('ilh-btn-cancel-edit').addEventListener('click', () => EditMode.cancel());
+
+      // v0.11.0: CSV 导出
+      document.getElementById('ilh-btn-csv').addEventListener('click', () => exportCSV());
 
       // v0.6.0: 批量面板事件
       document.getElementById('ilh-batch-enabled').addEventListener('change', (e) => {
@@ -1618,22 +1659,178 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       `);
     }
 
-    function showExplain(state, content = '', statusText = '') {
+    /* ───── v0.11.0: 编辑模式 ───── */
+    const EditMode = {
+      active: false,
+      qId: null,
+      originalText: null,
+
+      enter(qId, currentText) {
+        this.active = true;
+        this.qId = qId;
+        this.originalText = currentText;
+        const contentEl = document.getElementById('ilh-explain-content');
+        const statusEl = document.getElementById('ilh-explain-status');
+        const viewActions = document.getElementById('ilh-actions-view');
+        const editActions = document.getElementById('ilh-actions-edit');
+        if (!contentEl) return;
+        // 切到纯文本可编辑模式 (markdown 源码)
+        contentEl.classList.remove('md-rendered');
+        contentEl.textContent = currentText;
+        contentEl.setAttribute('contenteditable', 'true');
+        contentEl.focus();
+        statusEl.textContent = '✏️ 编辑模式';
+        viewActions.style.display = 'none';
+        editActions.style.display = 'flex';
+        log(`✏️ 进入编辑模式: ${qId}`, 'info');
+      },
+
+      save() {
+        if (!this.active) return;
+        const contentEl = document.getElementById('ilh-explain-content');
+        const newText = contentEl.textContent.trim();
+        if (newText.length < 5) {
+          log('⚠️ 解析内容过短, 拒绝保存', 'warn');
+          return;
+        }
+        // 写入 GM 缓存, 标记 edited
+        const oldVal = GM_getValue(`ilh:response:${this.qId}`, null);
+        GM_setValue(`ilh:response:${this.qId}`, {
+          ...(oldVal || {}),
+          id: this.qId,
+          text: newText,
+          status: 'done',
+          edited: true,
+          editedAt: Date.now(),
+          textOriginal: oldVal && !oldVal.edited ? oldVal.text : (oldVal && oldVal.textOriginal) || '',
+          timestamp: Date.now(),
+        });
+        // 触发 notify (其他实例如果有也会同步)
+        GM_setValue(Bridge.KEY_NOTIFY, { qId: this.qId, status: 'done', ts: Date.now() });
+        log(`💾 已保存编辑后的解析: ${this.qId} (${newText.length} 字符)`, 'success');
+        this.exit(newText, true);
+      },
+
+      cancel() {
+        if (!this.active) return;
+        log(`❌ 取消编辑: ${this.qId}`, 'info');
+        this.exit(this.originalText, false);
+      },
+
+      exit(displayText, wasEdited) {
+        const contentEl = document.getElementById('ilh-explain-content');
+        const statusEl = document.getElementById('ilh-explain-status');
+        const viewActions = document.getElementById('ilh-actions-view');
+        const editActions = document.getElementById('ilh-actions-edit');
+        if (contentEl) {
+          contentEl.removeAttribute('contenteditable');
+          contentEl.classList.add('md-rendered');
+          setSafeHTML(contentEl, renderMarkdown(displayText));
+        }
+        if (statusEl) {
+          // 如果保存后, 显示"已编辑"标记; 否则查 cached 看是否之前编辑过
+          if (wasEdited) {
+            statusEl.textContent = '✏️ 已编辑 · 已保存';
+          } else {
+            const cached = GM_getValue(`ilh:response:${this.qId}`, null);
+            statusEl.textContent = cached && cached.edited ? '✏️ 已编辑' : '✅ 缓存命中 · 秒回';
+          }
+        }
+        if (viewActions) viewActions.style.display = 'flex';
+        if (editActions) editActions.style.display = 'none';
+        this.active = false;
+        this.qId = null;
+        this.originalText = null;
+      },
+    };
+
+    /* ───── v0.11.0: CSV 导出 ───── */
+    function csvEscape(field) {
+      if (field == null) return '';
+      const s = String(field);
+      // 含逗号 / 双引号 / 换行 → 用双引号包裹, 内部双引号变两个
+      if (/[",\n\r]/.test(s)) {
+        return '"' + s.replace(/"/g, '""') + '"';
+      }
+      return s;
+    }
+
+    function exportCSV() {
+      const allQs = Array.from(batchState.identifiedQuestions.values())
+        .sort((a, b) => a.position - b.position);
+      if (allQs.length === 0) {
+        log('⚠️ 还没识别任何题目, 无法导出', 'warn');
+        alert('还没识别任何题目, 无法导出 CSV');
+        return;
+      }
+      const rows = [];
+      // 表头
+      rows.push(['题号', '题型', '题干', '选项', '解析答案', '是否已编辑', '解析时间'].map(csvEscape).join(','));
+      let withAnswer = 0;
+      let edited = 0;
+      for (const q of allQs) {
+        const cached = GM_getValue(`ilh:response:${q.id}`, null);
+        const optionsText = (q.options || []).map((o) => `${o.letter}. ${o.content}`).join('\n');
+        const explanation = cached && cached.status === 'done' ? cached.text : (cached && cached.status === 'error' ? `[错误] ${cached.error || '解析失败'}` : '[未获取]');
+        const isEdited = cached && cached.edited ? '是' : '否';
+        const timestamp = cached && cached.timestamp ? new Date(cached.timestamp).toLocaleString('zh-CN') : '';
+        if (cached && cached.status === 'done') withAnswer++;
+        if (cached && cached.edited) edited++;
+        rows.push([
+          q.position,
+          q.type || '',
+          q.stem || '',
+          optionsText,
+          explanation,
+          isEdited,
+          timestamp,
+        ].map(csvEscape).join(','));
+      }
+      // 加 BOM (UTF-8 BOM 让 Excel 识别为中文)
+      const csv = '\ufeff' + rows.join('\r\n');
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      // 文件名: iLearning_答案_<考试名>_<时间戳>.csv
+      let examName = '';
+      const titleEl = document.querySelector('.title span[title], .title');
+      if (titleEl) {
+        examName = (titleEl.getAttribute('title') || titleEl.textContent || '').trim().replace(/[\\\/:*?"<>|]/g, '_').slice(0, 40);
+      }
+      const ts = new Date().toISOString().slice(0, 16).replace(/[:T-]/g, '');
+      a.href = url;
+      a.download = `iLearning_答案_${examName || '考试'}_${ts}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      log(`📥 已导出 CSV: ${allQs.length} 题 (含解析 ${withAnswer} 题, 已编辑 ${edited} 题)`, 'success');
+    }
+
+    function showExplain(kind, content = '', statusText = '') {
       const wrap = document.getElementById('ilh-explain');
       const contentEl = document.getElementById('ilh-explain-content');
       const statusEl = document.getElementById('ilh-explain-status');
       if (!wrap) return;
       wrap.style.display = 'block';
-      contentEl.className = 'ilh-explain-content ' + (state || '');
+      contentEl.className = 'ilh-explain-content ' + (kind || '');
       // v0.5.6: 成功状态用 markdown 渲染, 等待/错误状态保持纯文本
-      if ((state === '' || !state) && content) {
+      if ((kind === '' || !kind) && content) {
         contentEl.classList.add('md-rendered');
         setSafeHTML(contentEl, renderMarkdown(content));
       } else {
         contentEl.classList.remove('md-rendered');
         contentEl.textContent = content;
       }
-      statusEl.textContent = statusText;
+      // v0.11.0: 如果当前题已编辑过, 状态条显示"已编辑"标记
+      let finalStatus = statusText;
+      if ((!kind || kind === '') && state.currentQuestion) {
+        const cached = GM_getValue(`ilh:response:${state.currentQuestion.id}`, null);
+        if (cached && cached.edited) {
+          finalStatus = '✏️ 已编辑 · 秒回';
+        }
+      }
+      statusEl.textContent = finalStatus;
     }
 
     function hideExplain() {
