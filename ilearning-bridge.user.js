@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.12.8
+// @version      0.12.9
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.12.9 - 修复 v0.12.8 布局溢出 (explain 内的 verify/actions 跑到 log 区): 取消 #ilh-explain flex column 强制布局, 改为只固定 .ilh-explain-content 的 height (210px), 让 explain 整体走 normal flow; #ilh-question 和 #ilh-log 用 flex:1 + min-height 共享剩余空间, 整体浮窗高度仍固定.
 // v0.12.8 - UI 稳定性: 浮窗整体固定高度 (不随内容变化伸缩), 解析模块固定高度 (内部滚动), 移除"复制解析"按钮 (操作栏更精简). 用 flex 布局让各功能模块各自固定, 日志区分到剩余空间.
 // v0.12.7 - 回滚 v0.13.0 (Apple 风格 makeover 导致界面错乱), 恢复 v0.12.6 视觉; 新增"📂 导入题库"按钮: 解析 CSV (8列: 题号/题型/题干/选项/解析答案/是否已编辑/答案核对/处理时间), 完全清空原 GM 缓存, 用 CSV 数据重建 KEY_REQ + KEY_RESP, 题号、状态、答案核对一并恢复; 原"📥 CSV"按钮改名为"📤 导出题库"
 // v0.12.6 - 括号内字母重映射纠正: 之前 v0.12.5 只映射第一个字母 (Q32 (A,B)→(B,B) 错误), 现在改为'全部映射' — 预处理时把括号内所有字母都按 mapping 替换 (用户期望)
@@ -1085,9 +1086,9 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       }
 
       #ilh-question {
-        /* v0.12.8: 固定高度, 内部滚动 */
-        flex-shrink: 0;
-        height: 180px;
+        /* v0.12.9: flex:1 吃剩余空间 (浮窗高度固定, explain 整体自然高度, log 也 flex:1 共享) */
+        flex: 1 1 0;
+        min-height: 100px;
         padding: 12px 14px;
         overflow-y: auto;
       }
@@ -1122,26 +1123,20 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       .ilh-option-letter { font-weight: 600; color: #64b5f6; margin-right: 6px; }
 
       #ilh-explain {
-        /* v0.12.8: 固定高度 + flex 布局, 让 explain-content 自动占满剩余空间 */
+        /* v0.12.9: 不强制 flex column, 用 normal flow + flex-shrink: 0 (整体高度由内部子元素累加, 但 explain-content 是固定高度的) */
         flex-shrink: 0;
-        height: 300px;
         padding: 12px 14px;
         border-top: 1px solid rgba(255,255,255,0.06);
         background: rgba(0,0,0,0.18);
-        display: flex;
-        flex-direction: column;
-        box-sizing: border-box;
       }
       .ilh-explain-header {
-        flex-shrink: 0;
         display: flex; justify-content: space-between; align-items: center;
         margin-bottom: 8px; font-size: 12px;
       }
       .ilh-explain-status { font-size: 10px; opacity: 0.65; }
       .ilh-explain-content {
-        /* v0.12.8: 占满剩余空间, 内部滚动 (不再用 max-height) */
-        flex: 1;
-        min-height: 0;
+        /* v0.12.9: 固定高度 210px (解析模块尺寸稳定, 不论内容多少都不撑大) */
+        height: 210px;
         background: rgba(34,197,94,0.07);
         border-left: 2px solid #22c55e;
         padding: 10px 12px;
@@ -1152,6 +1147,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         white-space: pre-wrap;
         word-break: break-word;
         overflow-y: auto;
+        box-sizing: border-box;
       }
       .ilh-explain-content.waiting {
         border-left-color: #2196f3;
@@ -1166,7 +1162,6 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       }
       /* v0.12.5: 答案核对栏 */
       .ilh-verify-bar {
-        flex-shrink: 0;
         display: flex; align-items: center; gap: 6px;
         padding: 8px 0 4px;
         margin-top: 4px;
@@ -1196,7 +1191,6 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
 
       /* v0.12.2: 选项重排警告 */
       .ilh-remap-warning {
-        flex-shrink: 0;
         background: rgba(251,191,36,0.08);
         border-left: 2px solid #fbbf24;
         padding: 8px 11px;
@@ -1243,7 +1237,6 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         background: #1e88e5;
       }
       .ilh-explain-actions {
-        flex-shrink: 0;
         display: flex; gap: 6px; margin-top: 8px;
         align-items: center;
       }
