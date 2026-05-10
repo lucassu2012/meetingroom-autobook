@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.12.4
+// @version      0.12.5
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.12.5 - ① 模式 8 重做: 括号内多字母用 split 拆分, 只替换第一个匹配字母, 解决 (A, C)/(X, Y) 不全映射 ② 新增'答案核对'功能 (3 选 1: 正确/错误/未验证), 持久化到缓存 ③ CSV 导出新增'答案核对'列
 // v0.12.4 - 字母重映射补 3 个模式: ① 字母+空格+错误/正确 ("D 错误") ② 字母+顿号/逗号 ("D、E错误") ③ 中文+(字母) ("TR5 (E)"); 用 PLACE+字母+SAFE 三明治防链式替换 bug
 // v0.12.3 - 两个修复: ① 选项重排兼容 v0.12.2 之前的旧缓存 (originalOptions 缺失时回退到 KEY_REQ.options) ② 重新请求按钮同时删 KEY_REQ, 让单题重发不再被卡 '已在处理中'
 // v0.12.2 - 选项重排 A+B 处理 (警告对照表 + 字母自动重映射) + 干掉启动自动去重 (保留函数+手动按钮)
@@ -1146,6 +1147,34 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         background: rgba(244,67,54,0.08);
         color: #ef9a9a;
       }
+      /* v0.12.5: 答案核对栏 */
+      .ilh-verify-bar {
+        display: flex; align-items: center; gap: 6px;
+        padding: 8px 0 4px;
+        font-size: 11px;
+      }
+      .ilh-verify-label { opacity: 0.7; color: #94a3b8; }
+      .ilh-verify-btn {
+        padding: 3px 9px;
+        border-radius: 3px;
+        font-size: 10.5px;
+        background: rgba(255,255,255,0.04);
+        border: 1px solid rgba(255,255,255,0.10);
+        color: #94a3b8;
+        cursor: pointer;
+        transition: all 0.15s;
+      }
+      .ilh-verify-btn:hover { background: rgba(255,255,255,0.10); }
+      .ilh-verify-btn.active[data-state="correct"] {
+        background: rgba(76,175,80,0.20); border-color: #4caf50; color: #81c784; font-weight: 500;
+      }
+      .ilh-verify-btn.active[data-state="incorrect"] {
+        background: rgba(244,67,54,0.20); border-color: #f44336; color: #ef9a9a; font-weight: 500;
+      }
+      .ilh-verify-btn.active[data-state="unverified"] {
+        background: rgba(148,163,184,0.18); border-color: rgba(148,163,184,0.5); color: #cbd5e1;
+      }
+
       /* v0.12.2: 选项重排警告 */
       .ilh-remap-warning {
         background: rgba(251,191,36,0.10);
@@ -1549,6 +1578,12 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
             <span class="ilh-explain-status" id="ilh-explain-status"></span>
           </div>
           <div class="ilh-explain-content" id="ilh-explain-content"></div>
+          <div class="ilh-verify-bar" id="ilh-verify-bar" style="display:none">
+            <span class="ilh-verify-label">答案核对:</span>
+            <button class="ilh-verify-btn" data-state="correct">✓ 正确</button>
+            <button class="ilh-verify-btn" data-state="incorrect">✗ 错误</button>
+            <button class="ilh-verify-btn" data-state="unverified">? 未验证</button>
+          </div>
           <div class="ilh-explain-actions" id="ilh-actions-view">
             <button class="ilh-mini-btn" id="ilh-btn-copy-explain">📋 复制解析</button>
             <button class="ilh-mini-btn" id="ilh-btn-edit">✏️ 编辑</button>
@@ -1590,6 +1625,28 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           (e) => log(`❌ 复制失败: ${e.message}`, 'error')
         );
       });
+      // v0.12.5: 答案核对按钮组事件 (点击切换状态, 立即保存到 KEY_RESP)
+      document.querySelectorAll('#ilh-verify-bar .ilh-verify-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          if (!state.currentQuestion) return;
+          const qId = state.currentQuestion.id;
+          const newState = btn.dataset.state;
+          const cached = GM_getValue(`ilh:response:${qId}`, null);
+          if (!cached) {
+            log('⚠️ 当前题没有缓存解析, 无法标记答案核对状态', 'warn');
+            return;
+          }
+          cached.verified = newState;
+          GM_setValue(`ilh:response:${qId}`, cached);
+          // 更新 UI
+          document.querySelectorAll('#ilh-verify-bar .ilh-verify-btn').forEach((b) => {
+            b.classList.toggle('active', b.dataset.state === newState);
+          });
+          const stateLabel = { correct: '✓ 正确', incorrect: '✗ 错误', unverified: '? 未验证' }[newState];
+          log(`📝 第 ${state.currentQuestion.position} 题 答案核对: ${stateLabel}`, 'info');
+        });
+      });
+
       document.getElementById('ilh-btn-redo').addEventListener('click', () => {
         if (!state.currentQuestion) return;
         const qId = state.currentQuestion.id;
@@ -1880,48 +1937,73 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       return changed ? { forward: fwd, originalOptions } : null;
     }
 
-    // v0.12.4: 把解析里的字母替换为重映射后的字母
-    // 用 PLACE + 字母 + SAFE 三明治结构防链式替换 (新插入的字母不会被后续模式再次命中)
+    // v0.12.5b: 字母重映射 (3 步式)
+    //   ① 预处理: 括号内非首位字母用 PLACE/SAFE 包裹保护, 防止被列表模式 (9) 误伤
+    //   ② 主循环 9 个模式精准替换
+    //   ③ 清理占位符
     function applyAnswerRemapping(text, mapping) {
       if (!text || !mapping || !mapping.forward) return text;
       const fwd = mapping.forward;
       const PLACE = '\uE000';  // 字母前占位符
-      const SAFE = '\uE001';   // 字母后占位符 (让所有模式都无法识别 PLACE+字母+SAFE 中的字母)
+      const SAFE = '\uE001';   // 字母后占位符
       let result = text;
+
+      // ===== ① 预处理: 保护括号内非首位字母 =====
+      // 例如 "(A, C)" → 第一个 A 留给主循环处理, 第二个 C 包裹为 \uE000C\uE001 防止被模式 9 误伤
+      result = result.replace(/([\(（])([^\(（\)）]+?)([\)）])/g, (match, lp, inner, rp) => {
+        const parts = inner.split(/([,，、,])/);  // 含英文逗号
+        let firstFound = false;
+        let changed = false;
+        for (let i = 0; i < parts.length; i += 2) {
+          const trimmed = parts[i].trim();
+          if (/^[A-F]$/.test(trimmed)) {
+            if (!firstFound) {
+              firstFound = true;  // 第一个字母不动, 留给主循环
+            } else {
+              parts[i] = parts[i].replace(/[A-F]/, PLACE + '$&' + SAFE);
+              changed = true;
+            }
+          }
+        }
+        return changed ? lp + parts.join('') + rp : match;
+      });
+
+      // ===== ② 主循环: 9 个模式 =====
       for (const [origL, newL] of fwd) {
         if (origL === newL) continue;
         const o = origL;
-        const W = PLACE + newL + SAFE;  // 包裹后的新字母 (不会被后续替换匹配)
+        const W = PLACE + newL + SAFE;
 
-        // 1. 行首/换行后 字母+点/顿号 (e.g. "A. xxx", "B、 xxx")
+        // 1. 行首/换行后 字母+点/顿号
         result = result.replace(new RegExp(`(^|[\\n\\r])${o}([\\.、])`, 'g'), `$1${W}$2`);
         // 2. 加粗 **字母. 或 **字母**
         result = result.replace(new RegExp(`\\*\\*${o}(\\.|\\*\\*)`, 'g'), `**${W}$1`);
-        // 3. (正确)答案 ... 字母 (字母后必须非字母数字)
+        // 3. (正确)答案 + 字母
         result = result.replace(new RegExp(`(?<=(?:正确)?答案[:：\\s]?\\s*)${o}(?![a-zA-Z0-9_])`, 'g'), W);
-        // 4. "选项 字母" / "选 字母"
+        // 4. 选项/选 + 字母
         result = result.replace(new RegExp(`(?<=选(?:项)?\\s*[:：]?\\s*)${o}(?![a-zA-Z0-9_])`, 'g'), W);
         // 5. 字母 + "选项"
         result = result.replace(new RegExp(`(^|[^a-zA-Z0-9])${o}(\\s*选项)`, 'g'), `$1${W}$2`);
-        // v0.12.4 新增 6. 字母 + 顿号/逗号/分号 (列表分隔, e.g. "D、E、F" / "D, E, F" / "D；E")
+        // 6. 字母 + 顿号/逗号/分号
         result = result.replace(new RegExp(`(^|[^a-zA-Z0-9])${o}(\\s*[、，；])`, 'g'), `$1${W}$2`);
-        // v0.12.4 新增 7. 字母 + (可选空格) + 评价词 (e.g. "D 错误", "E错误" 无空白也算)
+        // 7. 字母 + (可选空白) + 评价词
         result = result.replace(
           new RegExp(`(^|[^a-zA-Z0-9])${o}(\\s*(?:错误|正确|不正确|不准确|是错|是对|对|不对))`, 'g'),
           `$1${W}$2`
         );
-        // v0.12.4 新增 8. 中文/数字 + (字母) — 解析里 "TR5 (E)" / "整体项目管理 (D)"
-        result = result.replace(
-          new RegExp(`([\\u4e00-\\u9fa5\\d])(\\s*)([\\(（])\\s*${o}\\s*([\\)）])`, 'g'),
-          `$1$2$3${W}$4`
-        );
-        // v0.12.4 新增 9. 列表分隔符 + 字母 (e.g. "A、B、C" 中 C 是末尾, 它前面是顿号)
+        // 8. 括号内"第一个字母"(预处理已把非首位包裹保护)
+        //    要求: ( + (空白)? + 字母 + lookahead(空白/分隔符/闭括号)
+        result = result.replace(/([\(（])\s*([A-F])(?=[\s,，、,\)）])/g, (m, lp, firstLetter) => {
+          return firstLetter === o ? lp + W : m;
+        });
+        // 9. 列表分隔符 + 字母 (e.g. "A、B、C" 末尾 C, 它前面是顿号)
         result = result.replace(
           new RegExp(`([、，；,])(\\s*)${o}(?![a-zA-Z0-9_])`, 'g'),
           `$1$2${W}`
         );
       }
-      // 清理占位符
+
+      // ===== ③ 清理占位符 =====
       return result.replace(new RegExp(`[${PLACE}${SAFE}]`, 'g'), '');
     }
 
@@ -2090,6 +2172,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           status: resp ? resp.status : 'pending',
           text: resp ? (resp.text || '') : '',
           edited: !!(resp && resp.edited),
+          verified: resp ? (resp.verified || 'unverified') : 'unverified',
           error: resp ? (resp.error || '') : '',
           timestamp: resp ? resp.timestamp : (req.timestamp || 0),
         });
@@ -2105,16 +2188,20 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       allQuestions.sort((a, b) => (a.position - b.position) || (a.timestamp - b.timestamp));
 
       const rows = [];
-      rows.push(['题号', '题型', '题干', '选项', '解析答案', '是否已编辑', '处理时间'].map(csvEscape).join(','));
-      let stat = { total: allQuestions.length, withAnswer: 0, edited: 0, withStem: 0 };
+      // v0.12.5: 新增 "答案核对" 列
+      rows.push(['题号', '题型', '题干', '选项', '解析答案', '是否已编辑', '答案核对', '处理时间'].map(csvEscape).join(','));
+      let stat = { total: allQuestions.length, withAnswer: 0, edited: 0, withStem: 0, verified: 0 };
+      const verifyMap = { correct: '✓ 正确', incorrect: '✗ 错误', unverified: '未验证' };
       for (const q of allQuestions) {
         const optionsText = (q.options || []).map((o) => `${o.letter}. ${o.content}`).join('\n');
         const explanation = q.status === 'done' ? q.text : (q.status === 'error' ? `[错误] ${q.error || '解析失败'}` : '[未获取]');
         const isEdited = q.edited ? '是' : '否';
+        const verifyText = verifyMap[q.verified] || '未验证';
         const ts = q.timestamp ? new Date(q.timestamp).toLocaleString('zh-CN') : '';
         if (q.status === 'done') stat.withAnswer++;
         if (q.edited) stat.edited++;
         if (q.stem) stat.withStem++;
+        if (q.verified && q.verified !== 'unverified') stat.verified++;
         rows.push([
           q.position || '',
           q.type || '',
@@ -2122,6 +2209,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           optionsText,
           explanation,
           isEdited,
+          verifyText,
           ts,
         ].map(csvEscape).join(','));
       }
@@ -2135,7 +2223,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       a.click();
       document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(url), 1000);
-      log_(`📥 已导出 CSV: ${stat.total} 题 (含题干 ${stat.withStem}, 含解析 ${stat.withAnswer}, 已编辑 ${stat.edited})`, 'success');
+      log_(`📥 已导出 CSV: ${stat.total} 题 (含题干 ${stat.withStem}, 含解析 ${stat.withAnswer}, 已编辑 ${stat.edited}, 已核对 ${stat.verified})`, 'success');
     }
 
     /* ───── v0.11.0: CSV 导出 ───── */
@@ -2213,6 +2301,21 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         contentEl.textContent = content;
       }
       statusEl.textContent = finalStatus;
+
+      // v0.12.5: 渲染答案核对栏 (仅成功状态显示)
+      const verifyBar = document.getElementById('ilh-verify-bar');
+      if (verifyBar) {
+        if ((!kind || kind === '') && content && state.currentQuestion) {
+          verifyBar.style.display = 'flex';
+          const cached = GM_getValue(`ilh:response:${state.currentQuestion.id}`, null);
+          const verifyState = (cached && cached.verified) || 'unverified';
+          verifyBar.querySelectorAll('.ilh-verify-btn').forEach((b) => {
+            b.classList.toggle('active', b.dataset.state === verifyState);
+          });
+        } else {
+          verifyBar.style.display = 'none';
+        }
+      }
     }
 
     function hideExplain() {
@@ -2835,6 +2938,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           status: resp ? resp.status : 'pending',
           text: resp ? (resp.text || '') : '',
           edited: !!(resp && resp.edited),
+          verified: resp ? (resp.verified || 'unverified') : 'unverified',
           error: resp ? (resp.error || '') : '',
           timestamp: resp ? resp.timestamp : (req.timestamp || 0),
         });
@@ -2848,17 +2952,20 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         const s = String(field == null ? '' : field);
         return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
       };
-      const rows = [['题号', '题型', '题干', '选项', '解析答案', '是否已编辑', '处理时间'].map(csvEsc).join(',')];
-      let stat = { total: allQuestions.length, withAnswer: 0, edited: 0, withStem: 0 };
+      const rows = [['题号', '题型', '题干', '选项', '解析答案', '是否已编辑', '答案核对', '处理时间'].map(csvEsc).join(',')];
+      let stat = { total: allQuestions.length, withAnswer: 0, edited: 0, withStem: 0, verified: 0 };
+      const verifyMap = { correct: '✓ 正确', incorrect: '✗ 错误', unverified: '未验证' };
       for (const q of allQuestions) {
         const optionsText = (q.options || []).map((o) => `${o.letter}. ${o.content}`).join('\n');
         const explanation = q.status === 'done' ? q.text : (q.status === 'error' ? `[错误] ${q.error || '解析失败'}` : '[未获取]');
         const isEdited = q.edited ? '是' : '否';
+        const verifyText = verifyMap[q.verified] || '未验证';
         const ts = q.timestamp ? new Date(q.timestamp).toLocaleString('zh-CN') : '';
         if (q.status === 'done') stat.withAnswer++;
         if (q.edited) stat.edited++;
         if (q.stem) stat.withStem++;
-        rows.push([q.position || '', q.type || '', q.stem || '', optionsText, explanation, isEdited, ts].map(csvEsc).join(','));
+        if (q.verified && q.verified !== 'unverified') stat.verified++;
+        rows.push([q.position || '', q.type || '', q.stem || '', optionsText, explanation, isEdited, verifyText, ts].map(csvEsc).join(','));
       }
       const csv = '\ufeff' + rows.join('\r\n');
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
@@ -2870,7 +2977,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       a.click();
       document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(url), 1000);
-      log_(`📥 已导出 CSV: ${stat.total} 题 (含题干 ${stat.withStem}, 含解析 ${stat.withAnswer}, 已编辑 ${stat.edited})`, 'success');
+      log_(`📥 已导出 CSV: ${stat.total} 题 (含题干 ${stat.withStem}, 含解析 ${stat.withAnswer}, 已编辑 ${stat.edited}, 已核对 ${stat.verified})`, 'success');
     }
 
     function describeEl(el) {
