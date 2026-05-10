@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.12.0
+// @version      0.12.2
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,8 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.12.2 - 选项重排 A+B 处理 (警告对照表 + 字母自动重映射) + 干掉启动自动去重 (保留函数+手动按钮)
+// v0.12.1 - 三连修复: ① 缓存去重 (旧 q{pos}_xxx 与新 q_xxx 共存导致 1 题多份, 启动时自动跑一次去重 + 手动触发) ② 方向键拦截 (浮窗内按↑↓←→不再误切 iLearning 题) ③ 缓存数 pill 加去重按钮
 // v0.12.0 - 4 个修复: ① qId 不再依赖 position (题号变了仍能命中缓存) ② 修 BatchManager 写 KEY_REQ 没 stem 的 bug ③ 统一 iLearning + NotebookLM CSV 格式 (都从 GM 全缓存读, 含批量 prompt 反查兜底) ④ iLearning 加缓存数 UI
 // v0.11.0 - 新增编辑解析 + CSV 导出: ① 解析区加✏️编辑按钮, 用户可手动改答案 ② CSV 导出全部题目+答案 (UTF-8 BOM, Excel 中文不乱码)
 // v0.10.2 - 修复两个问题: ① MouseEvent view 参数在 Tampermonkey sandbox 报错 → 移除 view 参数 ② startBatchProcessing 仍是阶段A占位 → 改为直接调 BatchManager.flushAll()
@@ -168,16 +170,19 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
 
     /** NotebookLM 端: 写 response, 从队列移除该题 */
     writeResponse(qId, text, status = 'done', error = null) {
+      // v0.12.2: 同时保存 originalOptions/originalStem 快照, 用于后续选项重排检测
+      const req = GM_getValue(this.KEY_REQ(qId), null);
       GM_setValue(this.KEY_RESP(qId), {
         id: qId,
         text,
         status,
         error,
         timestamp: Date.now(),
+        originalOptions: req && req.options ? req.options : [],
+        originalStem: req && req.stem ? req.stem : '',
       });
       const queue = GM_getValue(this.KEY_QUEUE, []);
       GM_setValue(this.KEY_QUEUE, queue.filter((id) => id !== qId));
-      // v0.8.0: 写全局通知 (iLearning 端会立即更新 status dot 和当前题显示)
       GM_setValue(this.KEY_NOTIFY, { qId, status, ts: Date.now() });
     },
 
@@ -1139,6 +1144,40 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         background: rgba(244,67,54,0.08);
         color: #ef9a9a;
       }
+      /* v0.12.2: 选项重排警告 */
+      .ilh-remap-warning {
+        background: rgba(251,191,36,0.10);
+        border-left: 3px solid #fbbf24;
+        border-radius: 4px;
+        padding: 8px 10px;
+        margin-bottom: 10px;
+        font-size: 11.5px;
+      }
+      .ilh-remap-title {
+        color: #fde68a;
+        font-weight: 500;
+        margin-bottom: 4px;
+      }
+      .ilh-remap-details summary {
+        cursor: pointer;
+        opacity: 0.8;
+        font-size: 10.5px;
+        padding: 2px 0;
+        outline: none;
+      }
+      .ilh-remap-details summary:hover { opacity: 1; }
+      .ilh-remap-details[open] summary { margin-bottom: 4px; }
+      .ilh-remap-row {
+        font-size: 10.5px;
+        padding: 1px 0 1px 8px;
+        line-height: 1.6;
+        opacity: 0.85;
+      }
+      .ilh-remap-orig { color: #94a3b8; font-family: "SF Mono", monospace; }
+      .ilh-remap-arrow { color: #fbbf24; margin-left: 6px; }
+      .ilh-remap-arrow b { color: #fde68a; font-size: 12px; }
+      .ilh-remap-same { color: #6b7280; font-size: 10px; margin-left: 6px; }
+
       .ilh-explain-content[contenteditable="true"] {
         outline: 2px solid rgba(99,102,241,0.5);
         outline-offset: -2px;
@@ -1686,10 +1725,30 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         const allKeys = Bridge.listAllKeys();
         const cacheCount = allKeys.filter((k) => k.startsWith('ilh:response:')).length;
         el.textContent = `📚 缓存 ${cacheCount}`;
-        el.title = `GM 缓存中已有 ${cacheCount} 题解析 (跨试卷共享)`;
+        el.title = `GM 缓存中已有 ${cacheCount} 题解析 (跨试卷共享)\n点击: 检查并清理重复缓存`;
+        el.style.cursor = 'pointer';
       } catch (e) {
         el.textContent = '📚 缓存 ?';
       }
+    }
+
+    // v0.12.1: 点击缓存 pill 触发去重
+    function setupCacheDedupClick() {
+      // 用事件委托 (因为 ilh-cache-count 是 renderQuestion 时动态生成的)
+      const panel = document.getElementById('ilh-panel');
+      if (!panel || panel.__dedupBound) return;
+      panel.__dedupBound = true;
+      panel.addEventListener('click', (e) => {
+        const el = e.target.closest('#ilh-cache-count');
+        if (!el) return;
+        const allKeys = Bridge.listAllKeys();
+        const before = allKeys.filter((k) => k.startsWith('ilh:response:')).length;
+        if (!confirm(`扫描 GM 缓存中的重复题目并去重?\n\n当前缓存: ${before} 题\n规则: 题干相同视为同题, 优先保留 [已编辑 > 完成解析 > 新格式 > 最新时间] 的版本`)) return;
+        const r = deduplicateCache(log);
+        const after = Bridge.listAllKeys().filter((k) => k.startsWith('ilh:response:')).length;
+        alert(`✅ 去重完成\n\n扫描: ${r.total} 条\n重复组: ${r.dupGroups}\n删除: ${r.removed} 条\n剩余缓存: ${after} 题`);
+        updateCacheCount();
+      });
     }
 
     /* ───── v0.11.0: 编辑模式 ───── */
@@ -1798,6 +1857,158 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         if (!stem) stem = line;
       }
       return { type, stem, options };
+    }
+
+    /* ───── v0.12.2: 选项重排检测 + 答案字母自动重映射 ───── */
+    function detectOptionRemapping(currentOptions, originalOptions) {
+      if (!Array.isArray(currentOptions) || !Array.isArray(originalOptions)) return null;
+      if (currentOptions.length === 0 || originalOptions.length === 0) return null;
+      if (currentOptions.length !== originalOptions.length) return null;
+      const norm = (s) => (s || '').replace(/\s+/g, '').trim();
+      const fwd = new Map();  // 原 letter → 当前 letter
+      let changed = false;
+      for (const orig of originalOptions) {
+        const found = currentOptions.find((c) => norm(c.content) === norm(orig.content));
+        if (!found) return null;  // 内容对不上 (可能选项内容也变了, 不安全, 不重映射)
+        fwd.set(orig.letter, found.letter);
+        if (orig.letter !== found.letter) changed = true;
+      }
+      return changed ? { forward: fwd, originalOptions } : null;
+    }
+
+    // 把解析里的字母替换为重映射后的字母 (精准模式, 避免误伤)
+    function applyAnswerRemapping(text, mapping) {
+      if (!text || !mapping || !mapping.forward) return text;
+      const fwd = mapping.forward;
+      const PLACE = '\uE000';  // 私有占位符, 防止链式替换 (e.g. A→B, B→A 不会循环)
+      let result = text;
+      for (const [origL, newL] of fwd) {
+        if (origL === newL) continue;
+        const o = origL;
+        // 1. 行首/换行后 字母+点/顿号 (e.g. "A. xxx", "B、 xxx")
+        result = result.replace(new RegExp(`(^|[\\n\\r])${o}([\\.、])`, 'g'), `$1${PLACE}${newL}$2`);
+        // 2. 加粗 **字母. 或 **字母**
+        result = result.replace(new RegExp(`\\*\\*${o}(\\.|\\*\\*)`, 'g'), `**${PLACE}${newL}$1`);
+        // 3. (正确)答案 ... 字母 (字母后必须非字母数字, 避免 D5 / DA 等误伤)
+        result = result.replace(new RegExp(`(?<=(?:正确)?答案[:：\\s]?\\s*)${o}(?![a-zA-Z0-9_])`, 'g'), PLACE + newL);
+        // 4. "选项 字母" / "选 字母"
+        result = result.replace(new RegExp(`(?<=选(?:项)?\\s*[:：]?\\s*)${o}(?![a-zA-Z0-9_])`, 'g'), PLACE + newL);
+        // 5. 字母 + "选项" (e.g. "D 选项", "D选项错的原因")
+        result = result.replace(new RegExp(`(^|[^a-zA-Z0-9])${o}(\\s*选项)`, 'g'), `$1${PLACE}${newL}$2`);
+      }
+      return result.replace(new RegExp(PLACE, 'g'), '');
+    }
+
+    // 生成重映射对照表 HTML (用于警告区)
+    function buildRemapWarningHTML(mapping) {
+      if (!mapping || !mapping.forward) return '';
+      const lines = [];
+      for (const orig of mapping.originalOptions) {
+        const newL = mapping.forward.get(orig.letter);
+        const sameOrChanged = (newL === orig.letter)
+          ? '<span class="ilh-remap-same">(位置不变)</span>'
+          : `<span class="ilh-remap-arrow">→ <b>${newL}</b></span>`;
+        const contentShort = (orig.content || '').slice(0, 40) + ((orig.content || '').length > 40 ? '…' : '');
+        lines.push(`<div class="ilh-remap-row"><span class="ilh-remap-orig">原 ${orig.letter}</span> · ${contentShort} ${sameOrChanged}</div>`);
+      }
+      return `<div class="ilh-remap-warning">
+        <div class="ilh-remap-title">⚠️ 选项顺序与缓存时不同 — 解析中字母已自动调整</div>
+        <details class="ilh-remap-details"><summary>查看映射 (${mapping.originalOptions.length} 项)</summary>
+          ${lines.join('')}
+        </details>
+      </div>`;
+    }
+
+    /* ───── v0.12.1: 缓存去重 ───── */
+    function deduplicateCache(logFn) {
+      const log_ = logFn || ((msg) => console.log(msg));
+      const allKeys = (typeof Bridge !== 'undefined' && Bridge.listAllKeys)
+        ? Bridge.listAllKeys()
+        : GM_listValues().filter((k) => k.startsWith('ilh:'));
+      // 收集所有 qId
+      const qIds = new Set();
+      const batchReqs = {};
+      allKeys.forEach((k) => {
+        if (k.startsWith('ilh:request:')) qIds.add(k.slice('ilh:request:'.length));
+        else if (k.startsWith('ilh:response:')) qIds.add(k.slice('ilh:response:'.length));
+        else if (k.startsWith('ilh:batch_request:')) batchReqs[k.slice('ilh:batch_request:'.length)] = GM_getValue(k, null);
+      });
+
+      // 按 normalized stem hash 分组
+      const groups = new Map();
+      let withoutStem = 0;
+      for (const qId of qIds) {
+        const req = GM_getValue(`ilh:request:${qId}`, null);
+        const resp = GM_getValue(`ilh:response:${qId}`, null);
+        let stem = (req && req.stem) || '';
+        // 兜底: 从 batch prompt 反查
+        if (!stem && req && req.batchId && batchReqs[req.batchId]) {
+          const batchReq = batchReqs[req.batchId];
+          if (batchReq.questions && Array.isArray(batchReq.questions)) {
+            const q = batchReq.questions.find((qq) => qq.id === qId || qq.position === req.position);
+            if (q && q.stem) stem = q.stem;
+          }
+          if (!stem && batchReq.prompt && req.position) {
+            const startMarker = `===Q${req.position}===`;
+            const startIdx = batchReq.prompt.indexOf(startMarker);
+            if (startIdx >= 0) {
+              const afterStart = startIdx + startMarker.length;
+              const rest = batchReq.prompt.slice(afterStart);
+              const nm = rest.match(/===\s*Q\d+\s*===/);
+              const segment = nm ? rest.slice(0, nm.index) : rest;
+              const lines = segment.split('\n').map((l) => l.trim()).filter(Boolean);
+              for (const line of lines) {
+                if (/^\[(.+?)\]\s*第\s*\d+/.test(line)) continue;
+                if (/^[A-Z][\.、]/.test(line)) continue;
+                if (line) { stem = line; break; }
+              }
+            }
+          }
+        }
+        if (!stem) {
+          withoutStem++;
+          continue;
+        }
+        const stemNorm = stem.replace(/\s+/g, '').trim();
+        const stemHash = hashString(stemNorm);
+        if (!groups.has(stemHash)) groups.set(stemHash, []);
+        groups.get(stemHash).push({
+          qId,
+          stem,
+          hasResp: !!resp,
+          status: resp ? resp.status : null,
+          edited: !!(resp && resp.edited),
+          timestamp: (resp && resp.timestamp) || (req && req.timestamp) || 0,
+          isNewFormat: qId.startsWith('q_'),
+        });
+      }
+
+      // 处理重复
+      let dupGroups = 0;
+      let removed = 0;
+      let totalRedundant = 0;
+      for (const [stemHash, items] of groups) {
+        if (items.length <= 1) continue;
+        dupGroups++;
+        totalRedundant += items.length - 1;
+        // 排序: 已编辑 > 有 done 解析 > 新格式 qId > 最新时间
+        items.sort((a, b) => {
+          if (a.edited !== b.edited) return a.edited ? -1 : 1;
+          const aDone = a.status === 'done', bDone = b.status === 'done';
+          if (aDone !== bDone) return aDone ? -1 : 1;
+          if (a.isNewFormat !== b.isNewFormat) return a.isNewFormat ? -1 : 1;
+          return b.timestamp - a.timestamp;
+        });
+        const keep = items[0];
+        for (let i = 1; i < items.length; i++) {
+          const dropQid = items[i].qId;
+          GM_deleteValue(`ilh:request:${dropQid}`);
+          GM_deleteValue(`ilh:response:${dropQid}`);
+          removed++;
+        }
+      }
+      log_(`🧹 缓存去重: 总计 ${qIds.size} 条, 发现 ${dupGroups} 组重复 (冗余 ${totalRedundant} 条), 删除 ${removed} 条, 无题干跳过 ${withoutStem} 条`, dupGroups > 0 ? 'success' : 'info');
+      return { total: qIds.size, dupGroups, removed, withoutStem };
     }
 
     /* ───── v0.12.0: 统一的 CSV 导出 (iLearning + NotebookLM 共用) ───── */
@@ -1932,21 +2143,34 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       if (!wrap) return;
       wrap.style.display = 'block';
       contentEl.className = 'ilh-explain-content ' + (kind || '');
+
+      // v0.12.2: 选项重排检测 + 字母自动重映射 (仅成功状态 + 有当前题)
+      let remapWarningHTML = '';
+      let finalStatus = statusText;
+      if ((!kind || kind === '') && content && state.currentQuestion) {
+        const cached = GM_getValue(`ilh:response:${state.currentQuestion.id}`, null);
+        if (cached && cached.originalOptions && cached.originalOptions.length > 0) {
+          const remap = detectOptionRemapping(state.currentQuestion.options, cached.originalOptions);
+          if (remap) {
+            content = applyAnswerRemapping(content, remap);
+            remapWarningHTML = buildRemapWarningHTML(remap);
+            finalStatus = '⚠️ 选项已重排 · 字母已调整';
+          }
+        }
+        if (cached && cached.edited && !remapWarningHTML) {
+          finalStatus = '✏️ 已编辑 · 秒回';
+        }
+      }
+
       // v0.5.6: 成功状态用 markdown 渲染, 等待/错误状态保持纯文本
       if ((kind === '' || !kind) && content) {
         contentEl.classList.add('md-rendered');
-        setSafeHTML(contentEl, renderMarkdown(content));
+        // 警告 HTML 放在 markdown 渲染结果之前
+        const html = remapWarningHTML + renderMarkdown(content);
+        setSafeHTML(contentEl, html);
       } else {
         contentEl.classList.remove('md-rendered');
         contentEl.textContent = content;
-      }
-      // v0.11.0: 如果当前题已编辑过, 状态条显示"已编辑"标记
-      let finalStatus = statusText;
-      if ((!kind || kind === '') && state.currentQuestion) {
-        const cached = GM_getValue(`ilh:response:${state.currentQuestion.id}`, null);
-        if (cached && cached.edited) {
-          finalStatus = '✏️ 已编辑 · 秒回';
-        }
       }
       statusEl.textContent = finalStatus;
     }
@@ -2109,6 +2333,28 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
 
     // v0.8.0: 启动状态灯系统 (sidebar 自动注入 + 全量更新)
     StatusDot.setupAutoInject();
+
+    // v0.12.2: 删除启动自动去重 (v0.12.0 之后新数据不会重复, 仅保留手动按钮)
+    // 绑定缓存 pill 点击 → 手动触发去重
+    setTimeout(setupCacheDedupClick, 1500);
+
+    // v0.12.1: 方向键拦截 - 浮窗内按 ↑↓←→ 不再误切 iLearning 题目
+    // 在 capture 阶段于 window 上监听, 比 iLearning 更早抓到, 用 stopImmediatePropagation 阻止后续 listener
+    const ARROW_KEYS = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'PageUp', 'PageDown'];
+    const blockArrows = (e) => {
+      if (!ARROW_KEYS.includes(e.key)) return;
+      const tgt = e.target;
+      if (tgt && tgt.closest && tgt.closest('#ilh-panel')) {
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        // 注: 不调 preventDefault, 让浮窗内 input/textarea 的方向键光标移动正常工作
+      }
+    };
+    window.addEventListener('keydown', blockArrows, true);
+    window.addEventListener('keyup', blockArrows, true);
+    document.addEventListener('keydown', blockArrows, true);
+    document.addEventListener('keyup', blockArrows, true);
+    log('⌨️  已启用浮窗方向键拦截 (浮窗内按 ↑↓←→ 不会切 iLearning 题)', 'debug');
 
     // v0.9.0: 自动遍历 - 延迟 3 秒后启动 (留时间给 iLearning 渲染 sidebar 和首题)
     setTimeout(() => {
@@ -2413,6 +2659,80 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       const filename = `iLearning_全部题库_${new Date().toISOString().slice(0, 16).replace(/[:T-]/g, '')}.csv`;
       // 同 iLearning 端共享的函数 (定义在 iLearning 分支, 但 NotebookLM 分支也能调到 — 通过 helper 直接 inline 一份)
       __exportAllCachedAsCSV_shared(filename, log);
+    }
+
+    /* v0.12.1: NotebookLM 端 inline 缓存去重逻辑 */
+    function __deduplicateCache_shared(logFn) {
+      const log_ = logFn || ((msg) => console.log(msg));
+      const hashStr = (s) => {
+        let h = 0; for (let i = 0; i < s.length; i++) { h = ((h << 5) - h) + s.charCodeAt(i); h |= 0; }
+        return Math.abs(h).toString(36);
+      };
+      const allKeys = Bridge.listAllKeys();
+      const qIds = new Set();
+      const batchReqs = {};
+      allKeys.forEach((k) => {
+        if (k.startsWith('ilh:request:')) qIds.add(k.slice('ilh:request:'.length));
+        else if (k.startsWith('ilh:response:')) qIds.add(k.slice('ilh:response:'.length));
+        else if (k.startsWith('ilh:batch_request:')) batchReqs[k.slice('ilh:batch_request:'.length)] = GM_getValue(k, null);
+      });
+      const groups = new Map();
+      let withoutStem = 0;
+      for (const qId of qIds) {
+        const req = GM_getValue(`ilh:request:${qId}`, null);
+        const resp = GM_getValue(`ilh:response:${qId}`, null);
+        let stem = (req && req.stem) || '';
+        if (!stem && req && req.batchId && batchReqs[req.batchId]) {
+          const batchReq = batchReqs[req.batchId];
+          if (batchReq.questions && Array.isArray(batchReq.questions)) {
+            const q = batchReq.questions.find((qq) => qq.id === qId || qq.position === req.position);
+            if (q && q.stem) stem = q.stem;
+          }
+          if (!stem && batchReq.prompt && req.position) {
+            const startMarker = `===Q${req.position}===`;
+            const startIdx = batchReq.prompt.indexOf(startMarker);
+            if (startIdx >= 0) {
+              const rest = batchReq.prompt.slice(startIdx + startMarker.length);
+              const nm = rest.match(/===\s*Q\d+\s*===/);
+              const segment = nm ? rest.slice(0, nm.index) : rest;
+              const lines = segment.split('\n').map((l) => l.trim()).filter(Boolean);
+              for (const line of lines) {
+                if (/^\[(.+?)\]\s*第\s*\d+/.test(line)) continue;
+                if (/^[A-Z][\.、]/.test(line)) continue;
+                if (line) { stem = line; break; }
+              }
+            }
+          }
+        }
+        if (!stem) { withoutStem++; continue; }
+        const stemHash = hashStr(stem.replace(/\s+/g, '').trim());
+        if (!groups.has(stemHash)) groups.set(stemHash, []);
+        groups.get(stemHash).push({
+          qId,
+          edited: !!(resp && resp.edited),
+          status: resp ? resp.status : null,
+          timestamp: (resp && resp.timestamp) || (req && req.timestamp) || 0,
+          isNewFormat: qId.startsWith('q_'),
+        });
+      }
+      let dupGroups = 0, removed = 0;
+      for (const [_, items] of groups) {
+        if (items.length <= 1) continue;
+        dupGroups++;
+        items.sort((a, b) => {
+          if (a.edited !== b.edited) return a.edited ? -1 : 1;
+          const aDone = a.status === 'done', bDone = b.status === 'done';
+          if (aDone !== bDone) return aDone ? -1 : 1;
+          if (a.isNewFormat !== b.isNewFormat) return a.isNewFormat ? -1 : 1;
+          return b.timestamp - a.timestamp;
+        });
+        for (let i = 1; i < items.length; i++) {
+          GM_deleteValue(`ilh:request:${items[i].qId}`);
+          GM_deleteValue(`ilh:response:${items[i].qId}`);
+          removed++;
+        }
+      }
+      return { total: qIds.size, dupGroups, removed, withoutStem };
     }
 
     /* v0.12.0: NotebookLM 端 inline 一份共享 CSV 导出逻辑 (因为函数定义在 iLearning 分支) */
@@ -3246,6 +3566,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
 
     // 启动时也试一次(防止启动前已有积压)
     setTimeout(tryProcessQueue, 1500);
+
+    // v0.12.2: 删除启动自动去重 (v0.12.0 之后新数据不会重复)
 
     // 定期更新统计
     setInterval(updateStats, 2000);
