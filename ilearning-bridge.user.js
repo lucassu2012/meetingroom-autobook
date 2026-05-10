@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.12.5
+// @version      0.12.6
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.12.6 - 括号内字母重映射纠正: 之前 v0.12.5 只映射第一个字母 (Q32 (A,B)→(B,B) 错误), 现在改为'全部映射' — 预处理时把括号内所有字母都按 mapping 替换 (用户期望)
 // v0.12.5 - ① 模式 8 重做: 括号内多字母用 split 拆分, 只替换第一个匹配字母, 解决 (A, C)/(X, Y) 不全映射 ② 新增'答案核对'功能 (3 选 1: 正确/错误/未验证), 持久化到缓存 ③ CSV 导出新增'答案核对'列
 // v0.12.4 - 字母重映射补 3 个模式: ① 字母+空格+错误/正确 ("D 错误") ② 字母+顿号/逗号 ("D、E错误") ③ 中文+(字母) ("TR5 (E)"); 用 PLACE+字母+SAFE 三明治防链式替换 bug
 // v0.12.3 - 两个修复: ① 选项重排兼容 v0.12.2 之前的旧缓存 (originalOptions 缺失时回退到 KEY_REQ.options) ② 重新请求按钮同时删 KEY_REQ, 让单题重发不再被卡 '已在处理中'
@@ -1937,38 +1938,36 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       return changed ? { forward: fwd, originalOptions } : null;
     }
 
-    // v0.12.5b: 字母重映射 (3 步式)
-    //   ① 预处理: 括号内非首位字母用 PLACE/SAFE 包裹保护, 防止被列表模式 (9) 误伤
-    //   ② 主循环 9 个模式精准替换
+    // v0.12.6: 字母重映射 (3 步式, 括号内所有字母都映射)
+    //   ① 预处理: 把括号内所有 [A-F] 单字母按 mapping 一次性替换为 PLACE+新字母+SAFE
+    //      (这样后续主循环不会再处理这些字母, 也不会被列表模式 9 误伤)
+    //   ② 主循环 8 个模式 (模式 8 不再需要, 已被预处理覆盖)
     //   ③ 清理占位符
     function applyAnswerRemapping(text, mapping) {
       if (!text || !mapping || !mapping.forward) return text;
       const fwd = mapping.forward;
-      const PLACE = '\uE000';  // 字母前占位符
-      const SAFE = '\uE001';   // 字母后占位符
+      const PLACE = '\uE000';
+      const SAFE = '\uE001';
       let result = text;
 
-      // ===== ① 预处理: 保护括号内非首位字母 =====
-      // 例如 "(A, C)" → 第一个 A 留给主循环处理, 第二个 C 包裹为 \uE000C\uE001 防止被模式 9 误伤
+      // ===== ① 预处理: 括号内所有字母都按 mapping 替换 (一次性处理) =====
+      // 例: "(A, B)" mapping {A→B, B→A} → "(\uE000B\uE001, \uE000A\uE001)" → 清理后 "(B, A)"
+      // 即使 newL === trimmed (恒等映射), 也要包裹保护, 防止后续 for 循环误伤
       result = result.replace(/([\(（])([^\(（\)）]+?)([\)）])/g, (match, lp, inner, rp) => {
-        const parts = inner.split(/([,，、,])/);  // 含英文逗号
-        let firstFound = false;
-        let changed = false;
+        const parts = inner.split(/([,，、,])/);
+        let touched = false;
         for (let i = 0; i < parts.length; i += 2) {
           const trimmed = parts[i].trim();
-          if (/^[A-F]$/.test(trimmed)) {
-            if (!firstFound) {
-              firstFound = true;  // 第一个字母不动, 留给主循环
-            } else {
-              parts[i] = parts[i].replace(/[A-F]/, PLACE + '$&' + SAFE);
-              changed = true;
-            }
+          if (/^[A-F]$/.test(trimmed) && fwd.has(trimmed)) {
+            const newL = fwd.get(trimmed);
+            parts[i] = parts[i].replace(/[A-F]/, PLACE + newL + SAFE);
+            touched = true;
           }
         }
-        return changed ? lp + parts.join('') + rp : match;
+        return touched ? lp + parts.join('') + rp : match;
       });
 
-      // ===== ② 主循环: 9 个模式 =====
+      // ===== ② 主循环: 8 个模式 (取消模式 8) =====
       for (const [origL, newL] of fwd) {
         if (origL === newL) continue;
         const o = origL;
@@ -1991,12 +1990,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           new RegExp(`(^|[^a-zA-Z0-9])${o}(\\s*(?:错误|正确|不正确|不准确|是错|是对|对|不对))`, 'g'),
           `$1${W}$2`
         );
-        // 8. 括号内"第一个字母"(预处理已把非首位包裹保护)
-        //    要求: ( + (空白)? + 字母 + lookahead(空白/分隔符/闭括号)
-        result = result.replace(/([\(（])\s*([A-F])(?=[\s,，、,\)）])/g, (m, lp, firstLetter) => {
-          return firstLetter === o ? lp + W : m;
-        });
-        // 9. 列表分隔符 + 字母 (e.g. "A、B、C" 末尾 C, 它前面是顿号)
+        // (模式 8 已删除 — 括号已被预处理覆盖)
+        // 9. 列表分隔符 + 字母 (e.g. "A、B、C" 末尾 C)
         result = result.replace(
           new RegExp(`([、，；,])(\\s*)${o}(?![a-zA-Z0-9_])`, 'g'),
           `$1$2${W}`
