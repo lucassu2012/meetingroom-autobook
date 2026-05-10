@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.10.0
+// @version      0.10.1
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.10.1 - 修复 sidebar 切题失败: iLearning 用 <a href=''> 包题号, 单纯 .click() 被 Vue 忽略 → 改用完整 mousedown/mouseup/click 事件序列, 失败重试 3 次
 // v0.10.0 - 真正的批量预取 (Stage 3.5): 一个 prompt 含 N 题, NotebookLM 一次返回, 用 ===Q数字=== 分隔; batchSize=20 默认, 失败降级 20→10→5→1
 // v0.9.0 - 策略 B 自动遍历: 脚本启动后自动 click sidebar 每道题, 流水线触发识别+入队 NotebookLM
 //          已识别的题智能跳过 click 但补充入队, 用户可随时取消, 进度显示在 grid header
@@ -571,18 +572,27 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
             log(`  ⚠️ 第 ${pos} 题在 sidebar 找不到, 跳过`, 'warn');
             continue;
           }
-          const clickable = el.closest('li, button, a, [role="button"]') || el;
-          clickable.click();
-          // 等 iLearning Vue 渲染 + handleQuestionChange (含 350ms debounce) 完成
-          await sleep(900);
+          // v0.10.1: 用完整 mouse 事件序列 + 多目标重试 (iLearning 是 Vue + <a href=''>, .click() 不生效)
+          let switched = false;
+          for (let attempt = 1; attempt <= 3 && !switched && !this.cancelled; attempt++) {
+            this.robustClick(el, pos);
+            // 等 iLearning Vue 渲染 + handleQuestionChange (含 350ms debounce)
+            await sleep(attempt === 1 ? 1000 : 1500);
+            if (state.currentQuestion && state.currentQuestion.position === pos) {
+              switched = true;
+              break;
+            }
+            if (attempt < 3) {
+              log(`  🔄 第 ${pos} 题尝试 ${attempt} 失败, 重试...`, 'debug');
+            }
+          }
 
           if (this.cancelled) break;
 
-          // 验证当前题是不是预期 → 是 → 入队
-          if (state.currentQuestion && state.currentQuestion.position === pos) {
+          if (switched) {
             this.ensureQueued(state.currentQuestion);
           } else {
-            log(`  ⚠️ 切到第 ${pos} 题失败 (当前: ${state.currentQuestion?.position || '无'}), 跳过`, 'warn');
+            log(`  ⚠️ 切到第 ${pos} 题失败 (当前: ${state.currentQuestion?.position || '无'}, 重试 3 次仍失败), 跳过`, 'warn');
           }
         }
 
@@ -599,6 +609,38 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         if (batchState.enabled) {
           log('🚀 触发批量预取...', 'info');
           BatchManager.flushAll();
+        }
+      },
+
+      // v0.10.1: 强力点击 — 完整 mousedown/mouseup/click 事件序列, 优先 <li> 避开 <a href="">
+      robustClick(el, pos) {
+        // 找候选目标 (按优先级)
+        const li = el.matches('li') ? el : el.closest('li');
+        const a = el.matches('a') ? el : (li ? li.querySelector('a') : el.querySelector('a'));
+        const span = el.matches('span') ? el : el.querySelector('span');
+        const candidates = [li, a, span, el].filter(Boolean);
+
+        // 在第一个候选目标上 dispatch 完整鼠标事件序列
+        const target = candidates[0];
+        const opts = {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          button: 0,
+          buttons: 1,
+          clientX: 0,
+          clientY: 0,
+        };
+        try {
+          target.dispatchEvent(new MouseEvent('mousedown', opts));
+          target.dispatchEvent(new MouseEvent('mouseup', opts));
+          target.dispatchEvent(new MouseEvent('click', opts));
+          // 双保险: 同时调原生 click()
+          if (typeof target.click === 'function') target.click();
+          // 如果是 <a href="">, preventDefault 防止意外刷新页面
+          // (上面 dispatch 已自带 cancelable, 接收方可调 preventDefault)
+        } catch (e) {
+          log(`  ⚠️ click dispatch 异常: ${e.message}`, 'warn');
         }
       },
 
@@ -1513,7 +1555,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
 
       // v0.8.0: 初始化 overview grid (默认 40 题, 第一题识别后会按 q.total 重建)
       StatusDot.buildOverviewGrid(40);
-      // 点击 grid 上的题号 → 模拟点击 sidebar 跳过去
+      // 点击 grid 上的题号 → 模拟点击 sidebar 跳过去 (v0.10.1: 用 robustClick)
       document.getElementById('ilh-overview-grid-content').addEventListener('click', (e) => {
         const dot = e.target.closest('.ilh-grid-dot');
         if (!dot) return;
@@ -1521,9 +1563,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         const items = StatusDot.findSidebarItems();
         const sbEl = items.get(pos);
         if (sbEl) {
-          // 找最近的可点击祖先 (li / button / a)
-          const clickable = sbEl.closest('li, button, a, [role="button"]') || sbEl;
-          clickable.click();
+          AutoTraverse.robustClick(sbEl, pos);
           log(`🎯 跳到第 ${pos} 题`, 'info');
         } else {
           log(`⚠️ sidebar 找不到第 ${pos} 题, 无法跳转`, 'warn');
