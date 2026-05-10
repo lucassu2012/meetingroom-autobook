@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.10.1
+// @version      0.10.2
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.10.2 - 修复两个问题: ① MouseEvent view 参数在 Tampermonkey sandbox 报错 → 移除 view 参数 ② startBatchProcessing 仍是阶段A占位 → 改为直接调 BatchManager.flushAll()
 // v0.10.1 - 修复 sidebar 切题失败: iLearning 用 <a href=''> 包题号, 单纯 .click() 被 Vue 忽略 → 改用完整 mousedown/mouseup/click 事件序列, 失败重试 3 次
 // v0.10.0 - 真正的批量预取 (Stage 3.5): 一个 prompt 含 N 题, NotebookLM 一次返回, 用 ===Q数字=== 分隔; batchSize=20 默认, 失败降级 20→10→5→1
 // v0.9.0 - 策略 B 自动遍历: 脚本启动后自动 click sidebar 每道题, 流水线触发识别+入队 NotebookLM
@@ -612,35 +613,34 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         }
       },
 
-      // v0.10.1: 强力点击 — 完整 mousedown/mouseup/click 事件序列, 优先 <li> 避开 <a href="">
+      // v0.10.2: 强力点击 - mousedown/mouseup/click + native click 多目标重试
+      // 注意: Tampermonkey sandbox 下 window 不是真 Window, MouseEvent 不能传 view 参数
       robustClick(el, pos) {
-        // 找候选目标 (按优先级)
         const li = el.matches('li') ? el : el.closest('li');
         const a = el.matches('a') ? el : (li ? li.querySelector('a') : el.querySelector('a'));
         const span = el.matches('span') ? el : el.querySelector('span');
-        const candidates = [li, a, span, el].filter(Boolean);
+        // 优先 <li> (避开 <a href=""> 的 navigation 默认行为)
+        const candidates = [li, a, span, el].filter((x, i, arr) => x && arr.indexOf(x) === i);
 
-        // 在第一个候选目标上 dispatch 完整鼠标事件序列
-        const target = candidates[0];
+        // 在每个候选目标上都 dispatch 一次, 提高命中率
         const opts = {
           bubbles: true,
           cancelable: true,
-          view: window,
           button: 0,
           buttons: 1,
           clientX: 0,
           clientY: 0,
         };
-        try {
-          target.dispatchEvent(new MouseEvent('mousedown', opts));
-          target.dispatchEvent(new MouseEvent('mouseup', opts));
-          target.dispatchEvent(new MouseEvent('click', opts));
-          // 双保险: 同时调原生 click()
-          if (typeof target.click === 'function') target.click();
-          // 如果是 <a href="">, preventDefault 防止意外刷新页面
-          // (上面 dispatch 已自带 cancelable, 接收方可调 preventDefault)
-        } catch (e) {
-          log(`  ⚠️ click dispatch 异常: ${e.message}`, 'warn');
+        for (const target of candidates) {
+          try {
+            target.dispatchEvent(new MouseEvent('mousedown', opts));
+            target.dispatchEvent(new MouseEvent('mouseup', opts));
+            target.dispatchEvent(new MouseEvent('click', opts));
+            // 双保险: 同时调原生 click()
+            if (typeof target.click === 'function') target.click();
+          } catch (e) {
+            log(`  ⚠️ click dispatch 异常 (${target.tagName}): ${e.message}`, 'warn');
+          }
         }
       },
 
@@ -874,14 +874,11 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
 
     function startBatchProcessing() {
       if (batchState.batchStarted) return;
-      batchState.batchStarted = true;
-      const total = batchState.identifiedQuestions.size;
-      const numBatches = Math.ceil(total / batchState.batchSize);
-      log(`🚀 (阶段A) 模拟启动批处理: ${total} 题, 每批 ${batchState.batchSize}, 共 ${numBatches} 批`, 'info');
-      log(`   阶段 B 接通 NotebookLM 后会真正发批量 prompt`, 'warn');
-      updateBatchPanel();
+      // v0.10.2: 直接调 BatchManager 真正发批次
+      log(`🚀 全部题已识别完毕, 启动真正的批量预取...`, 'info');
+      BatchManager.flushAll();
       if (state.currentQuestion) {
-        showExplain('waiting', `🚀 批处理已启动\n\n${total} 道题分 ${numBatches} 批, 每批 ${batchState.batchSize} 题\n\n(阶段 A: 仅 UI 模拟, 阶段 B 接通后真正发送)`, '批处理中');
+        showExplain('waiting', `🚀 批处理已启动\n\n${batchState.identifiedQuestions.size} 道题分批发给 NotebookLM, 每批 ${BatchManager.currentBatchSize} 题\n\n(NotebookLM 处理完会自动同步, 通常 2-3 分钟)`, '批处理中');
       }
     }
 
