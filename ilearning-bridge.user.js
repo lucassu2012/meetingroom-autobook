@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.11.0
+// @version      0.12.0
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.12.0 - 4 个修复: ① qId 不再依赖 position (题号变了仍能命中缓存) ② 修 BatchManager 写 KEY_REQ 没 stem 的 bug ③ 统一 iLearning + NotebookLM CSV 格式 (都从 GM 全缓存读, 含批量 prompt 反查兜底) ④ iLearning 加缓存数 UI
 // v0.11.0 - 新增编辑解析 + CSV 导出: ① 解析区加✏️编辑按钮, 用户可手动改答案 ② CSV 导出全部题目+答案 (UTF-8 BOM, Excel 中文不乱码)
 // v0.10.2 - 修复两个问题: ① MouseEvent view 参数在 Tampermonkey sandbox 报错 → 移除 view 参数 ② startBatchProcessing 仍是阶段A占位 → 改为直接调 BatchManager.flushAll()
 // v0.10.1 - 修复 sidebar 切题失败: iLearning 用 <a href=''> 包题号, 单纯 .click() 被 Vue 忽略 → 改用完整 mousedown/mouseup/click 事件序列, 失败重试 3 次
@@ -188,7 +189,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     /* ───── v0.10.0: 批量预取协议 ───── */
     /** iLearning 端: 发批量请求 */
     sendBatch(batchData) {
-      // batchData: { id, prompt, positions, positionMap, batchSize, attempt }
+      // batchData: { id, prompt, positions, positionMap, batchSize, attempt, questions[] }
       GM_setValue(this.KEY_BATCH_REQ(batchData.id), {
         ...batchData,
         timestamp: Date.now(),
@@ -199,17 +200,23 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         queue.push(batchData.id);
         GM_setValue(this.KEY_BATCH_QUEUE, queue);
       }
-      // 同时为每题写 KEY_REQ pending (让 dot 黄)
+      // v0.12.0: KEY_REQ 写完整 question 数据 (含 stem/options/type), 之前只写了 {id, position} 导致 CSV 题干为空
+      const questionsByPos = {};
+      (batchData.questions || []).forEach((q) => { questionsByPos[q.position] = q; });
       for (const pos of batchData.positions) {
         const qId = batchData.positionMap[pos];
+        const q = questionsByPos[pos];
         GM_setValue(this.KEY_REQ(qId), {
           id: qId,
           position: pos,
+          type: q ? q.type : '',
+          stem: q ? q.stem : '',
+          options: q ? q.options : [],
+          total: q ? q.total : 0,
           timestamp: Date.now(),
           status: 'pending',
           batchId: batchData.id,
         });
-        // 通知 dot 变黄
         GM_setValue(this.KEY_NOTIFY, { qId, status: 'pending', ts: Date.now() });
       }
     },
@@ -723,6 +730,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           positionMap: positionMap,
           batchSize: questions.length,
           attempt: attempt,
+          questions: questions,  // v0.12.0: 传完整 questions, 让 KEY_REQ 含 stem/options
         });
 
         this.batchHistory.set(batchId, { questions, attempt });
@@ -1066,7 +1074,14 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         overflow-y: auto;
         max-height: 380px;  /* v0.8.1: 释放出来的空间给题目 */
       }
-      .ilh-meta { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+      .ilh-meta { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; align-items: center; }
+      .ilh-pill.cache-count {
+        margin-left: auto;
+        background: rgba(34,197,94,0.12);
+        color: #86efac;
+        border-color: rgba(34,197,94,0.25);
+        font-size: 10.5px;
+      }
       .ilh-pill {
         padding: 3px 9px; border-radius: 11px;
         font-size: 11px; font-weight: 500;
@@ -1302,7 +1317,9 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         const stem = findStem(positionInfo.position);
         if (!stem || stem.length < CONFIG.minStemLength) return null;
         const options = findOptions();
-        const id = `q${positionInfo.position}_${hashString(stem.substring(0, 60))}`;
+        // v0.12.0: qId 不再含 position, 用 stem 完整内容的 hash; 同一题在不同试卷不同位置也能命中缓存
+        const stemNorm = stem.replace(/\s+/g, '').trim();
+        const id = `q_${hashString(stemNorm)}`;
         return {
           id, type: questionType,
           position: positionInfo.position,
@@ -1653,10 +1670,26 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         <div class="ilh-meta">
           <span class="ilh-pill">${escapeHtml(q.type)}</span>
           <span class="ilh-pill position">第 ${q.position}/${q.total} 题</span>
+          <span class="ilh-pill cache-count" id="ilh-cache-count" title="GM 缓存中已有的题目数">📚 缓存 …</span>
         </div>
         <div class="ilh-stem">${escapeHtml(q.stem)}</div>
         ${optionsHtml}
       `);
+      updateCacheCount();
+    }
+
+    // v0.12.0: 更新 iLearning 浮窗的缓存数显示 (与 NotebookLM 端 nlh-stat-cache 一致)
+    function updateCacheCount() {
+      const el = document.getElementById('ilh-cache-count');
+      if (!el) return;
+      try {
+        const allKeys = Bridge.listAllKeys();
+        const cacheCount = allKeys.filter((k) => k.startsWith('ilh:response:')).length;
+        el.textContent = `📚 缓存 ${cacheCount}`;
+        el.title = `GM 缓存中已有 ${cacheCount} 题解析 (跨试卷共享)`;
+      } catch (e) {
+        el.textContent = '📚 缓存 ?';
+      }
     }
 
     /* ───── v0.11.0: 编辑模式 ───── */
@@ -1744,6 +1777,130 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       },
     };
 
+    /* ───── v0.12.0: 从 batch prompt 反查 stem (兜底) ───── */
+    function parseStemFromBatchPrompt(prompt, position) {
+      if (!prompt) return null;
+      const startMarker = `===Q${position}===`;
+      const startIdx = prompt.indexOf(startMarker);
+      if (startIdx < 0) return null;
+      const afterStart = startIdx + startMarker.length;
+      const restPrompt = prompt.slice(afterStart);
+      const nextMatch = restPrompt.match(/===\s*Q\d+\s*===/);
+      const segment = nextMatch ? restPrompt.slice(0, nextMatch.index) : restPrompt;
+      const lines = segment.split('\n').map((l) => l.trim()).filter(Boolean);
+      let type = '', stem = '';
+      const options = [];
+      for (const line of lines) {
+        const tm = line.match(/^\[(.+?)\]\s*第\s*\d+/);
+        if (tm) { type = tm[1]; continue; }
+        const om = line.match(/^([A-Z])[\.、]\s*(.+)/);
+        if (om) { options.push({ letter: om[1], content: om[2] }); continue; }
+        if (!stem) stem = line;
+      }
+      return { type, stem, options };
+    }
+
+    /* ───── v0.12.0: 统一的 CSV 导出 (iLearning + NotebookLM 共用) ───── */
+    function exportAllCachedAsCSV(filename, logFn) {
+      const log_ = logFn || ((msg) => console.log(msg));
+      const allKeys = (typeof Bridge !== 'undefined' && Bridge.listAllKeys)
+        ? Bridge.listAllKeys()
+        : GM_listValues().filter((k) => k.startsWith('ilh:'));
+      const requests = {}, responses = {}, batchReqs = {};
+      allKeys.forEach((k) => {
+        const v = GM_getValue(k, null);
+        if (k.startsWith('ilh:request:')) requests[k.slice('ilh:request:'.length)] = v;
+        else if (k.startsWith('ilh:response:')) responses[k.slice('ilh:response:'.length)] = v;
+        else if (k.startsWith('ilh:batch_request:')) batchReqs[k.slice('ilh:batch_request:'.length)] = v;
+      });
+
+      // 收集所有题 (有 request 或 response 的都算)
+      const allQIds = new Set([...Object.keys(requests), ...Object.keys(responses)]);
+      const allQuestions = [];
+      for (const qId of allQIds) {
+        const req = requests[qId] || {};
+        const resp = responses[qId] || null;
+        let position = req.position || 0;
+        let type = req.type || '';
+        let stem = req.stem || '';
+        let options = (req.options && req.options.length) ? req.options : [];
+
+        // 兜底: stem 为空 + 有 batchId → 从 batch prompt 反查
+        if (!stem && req.batchId && batchReqs[req.batchId]) {
+          const batchReq = batchReqs[req.batchId];
+          // 新格式: batchReq.questions
+          if (batchReq.questions && Array.isArray(batchReq.questions)) {
+            const q = batchReq.questions.find((qq) => qq.id === qId || qq.position === position);
+            if (q) {
+              type = type || q.type;
+              stem = stem || q.stem;
+              options = options.length ? options : (q.options || []);
+            }
+          }
+          // 旧格式: 解析 prompt
+          if (!stem && batchReq.prompt) {
+            const parsed = parseStemFromBatchPrompt(batchReq.prompt, position);
+            if (parsed) {
+              type = type || parsed.type;
+              stem = parsed.stem || stem;
+              options = options.length ? options : (parsed.options || []);
+            }
+          }
+        }
+
+        allQuestions.push({
+          qId, position, type, stem, options,
+          status: resp ? resp.status : 'pending',
+          text: resp ? (resp.text || '') : '',
+          edited: !!(resp && resp.edited),
+          error: resp ? (resp.error || '') : '',
+          timestamp: resp ? resp.timestamp : (req.timestamp || 0),
+        });
+      }
+
+      if (allQuestions.length === 0) {
+        log_('⚠️ GM 缓存为空, 无可导出', 'warn');
+        alert('缓存为空, 无可导出');
+        return;
+      }
+
+      // 排序: 先按 position, 再按 timestamp
+      allQuestions.sort((a, b) => (a.position - b.position) || (a.timestamp - b.timestamp));
+
+      const rows = [];
+      rows.push(['题号', '题型', '题干', '选项', '解析答案', '是否已编辑', '处理时间'].map(csvEscape).join(','));
+      let stat = { total: allQuestions.length, withAnswer: 0, edited: 0, withStem: 0 };
+      for (const q of allQuestions) {
+        const optionsText = (q.options || []).map((o) => `${o.letter}. ${o.content}`).join('\n');
+        const explanation = q.status === 'done' ? q.text : (q.status === 'error' ? `[错误] ${q.error || '解析失败'}` : '[未获取]');
+        const isEdited = q.edited ? '是' : '否';
+        const ts = q.timestamp ? new Date(q.timestamp).toLocaleString('zh-CN') : '';
+        if (q.status === 'done') stat.withAnswer++;
+        if (q.edited) stat.edited++;
+        if (q.stem) stat.withStem++;
+        rows.push([
+          q.position || '',
+          q.type || '',
+          q.stem || '',
+          optionsText,
+          explanation,
+          isEdited,
+          ts,
+        ].map(csvEscape).join(','));
+      }
+      const csv = '\ufeff' + rows.join('\r\n');
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      log_(`📥 已导出 CSV: ${stat.total} 题 (含题干 ${stat.withStem}, 含解析 ${stat.withAnswer}, 已编辑 ${stat.edited})`, 'success');
+    }
+
     /* ───── v0.11.0: CSV 导出 ───── */
     function csvEscape(field) {
       if (field == null) return '';
@@ -1756,55 +1913,16 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     }
 
     function exportCSV() {
-      const allQs = Array.from(batchState.identifiedQuestions.values())
-        .sort((a, b) => a.position - b.position);
-      if (allQs.length === 0) {
-        log('⚠️ 还没识别任何题目, 无法导出', 'warn');
-        alert('还没识别任何题目, 无法导出 CSV');
-        return;
-      }
-      const rows = [];
-      // 表头
-      rows.push(['题号', '题型', '题干', '选项', '解析答案', '是否已编辑', '解析时间'].map(csvEscape).join(','));
-      let withAnswer = 0;
-      let edited = 0;
-      for (const q of allQs) {
-        const cached = GM_getValue(`ilh:response:${q.id}`, null);
-        const optionsText = (q.options || []).map((o) => `${o.letter}. ${o.content}`).join('\n');
-        const explanation = cached && cached.status === 'done' ? cached.text : (cached && cached.status === 'error' ? `[错误] ${cached.error || '解析失败'}` : '[未获取]');
-        const isEdited = cached && cached.edited ? '是' : '否';
-        const timestamp = cached && cached.timestamp ? new Date(cached.timestamp).toLocaleString('zh-CN') : '';
-        if (cached && cached.status === 'done') withAnswer++;
-        if (cached && cached.edited) edited++;
-        rows.push([
-          q.position,
-          q.type || '',
-          q.stem || '',
-          optionsText,
-          explanation,
-          isEdited,
-          timestamp,
-        ].map(csvEscape).join(','));
-      }
-      // 加 BOM (UTF-8 BOM 让 Excel 识别为中文)
-      const csv = '\ufeff' + rows.join('\r\n');
-      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      // 文件名: iLearning_答案_<考试名>_<时间戳>.csv
-      let examName = '';
-      const titleEl = document.querySelector('.title span[title], .title');
-      if (titleEl) {
-        examName = (titleEl.getAttribute('title') || titleEl.textContent || '').trim().replace(/[\\\/:*?"<>|]/g, '_').slice(0, 40);
-      }
-      const ts = new Date().toISOString().slice(0, 16).replace(/[:T-]/g, '');
-      a.href = url;
-      a.download = `iLearning_答案_${examName || '考试'}_${ts}.csv`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-      log(`📥 已导出 CSV: ${allQs.length} 题 (含解析 ${withAnswer} 题, 已编辑 ${edited} 题)`, 'success');
+      const filename = (() => {
+        let examName = '';
+        const titleEl = document.querySelector('.title span[title], .title');
+        if (titleEl) {
+          examName = (titleEl.getAttribute('title') || titleEl.textContent || '').trim().replace(/[\\\/:*?"<>|]/g, '_').slice(0, 40);
+        }
+        const ts = new Date().toISOString().slice(0, 16).replace(/[:T-]/g, '');
+        return `iLearning_答案_${examName || '全部题库'}_${ts}.csv`;
+      })();
+      exportAllCachedAsCSV(filename, log);
     }
 
     function showExplain(kind, content = '', statusText = '') {
@@ -2016,6 +2134,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       if (!newVal || !newVal.qId) return;
       // 更新对应 dot
       StatusDot.updateByQId(newVal.qId);
+      // v0.12.0: 任何题状态变化都刷新缓存数 UI (NotebookLM 写 done 后 iLearning 端能立刻看到 +1)
+      if (typeof updateCacheCount === 'function') updateCacheCount();
       // 如果是当前显示的题且状态变 done/error, 自动刷新解析显示
       if (state.currentQuestion && state.currentQuestion.id === newVal.qId) {
         const cached = GM_getValue(`ilh:response:${newVal.qId}`, null);
@@ -2288,83 +2408,109 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         .trim();
     }
 
-    /** v0.5.5: 导出缓存为 CSV (Excel 友好) */
+    /* v0.12.0: 复用 iLearning 端的统一 exportAllCachedAsCSV 函数 (格式与 iLearning CSV 完全一致) */
     function exportCacheCSV() {
+      const filename = `iLearning_全部题库_${new Date().toISOString().slice(0, 16).replace(/[:T-]/g, '')}.csv`;
+      // 同 iLearning 端共享的函数 (定义在 iLearning 分支, 但 NotebookLM 分支也能调到 — 通过 helper 直接 inline 一份)
+      __exportAllCachedAsCSV_shared(filename, log);
+    }
+
+    /* v0.12.0: NotebookLM 端 inline 一份共享 CSV 导出逻辑 (因为函数定义在 iLearning 分支) */
+    function __exportAllCachedAsCSV_shared(filename, logFn) {
+      const log_ = logFn || ((msg) => console.log(msg));
       const allKeys = Bridge.listAllKeys();
-      const requests = {}, responses = {};
-      let counts = { total: 0, done: 0, error: 0, pending: 0 };
+      const requests = {}, responses = {}, batchReqs = {};
       allKeys.forEach((k) => {
         const v = GM_getValue(k, null);
-        if (k.startsWith('ilh:request:')) {
-          requests[k.replace('ilh:request:', '')] = v;
-        } else if (k.startsWith('ilh:response:')) {
-          responses[k.replace('ilh:response:', '')] = v;
-          counts.total++;
-          if (v && v.status) counts[v.status] = (counts[v.status] || 0) + 1;
-        }
+        if (k.startsWith('ilh:request:')) requests[k.slice('ilh:request:'.length)] = v;
+        else if (k.startsWith('ilh:response:')) responses[k.slice('ilh:response:'.length)] = v;
+        else if (k.startsWith('ilh:batch_request:')) batchReqs[k.slice('ilh:batch_request:'.length)] = v;
       });
-      const combined = [];
-      for (const qId in requests) {
-        const req = requests[qId];
-        const resp = responses[qId];
-        combined.push({
-          position: req.position || 0,
-          type: req.type || '',
-          stem: req.stem || '',
-          options: req.options || [],
+      const allQIds = new Set([...Object.keys(requests), ...Object.keys(responses)]);
+      const allQuestions = [];
+      for (const qId of allQIds) {
+        const req = requests[qId] || {};
+        const resp = responses[qId] || null;
+        let position = req.position || 0;
+        let type = req.type || '';
+        let stem = req.stem || '';
+        let options = (req.options && req.options.length) ? req.options : [];
+        // 兜底: 从 batch_request 反查
+        if (!stem && req.batchId && batchReqs[req.batchId]) {
+          const batchReq = batchReqs[req.batchId];
+          if (batchReq.questions && Array.isArray(batchReq.questions)) {
+            const q = batchReq.questions.find((qq) => qq.id === qId || qq.position === position);
+            if (q) {
+              type = type || q.type;
+              stem = stem || q.stem;
+              options = options.length ? options : (q.options || []);
+            }
+          }
+          if (!stem && batchReq.prompt) {
+            const startMarker = `===Q${position}===`;
+            const startIdx = batchReq.prompt.indexOf(startMarker);
+            if (startIdx >= 0) {
+              const afterStart = startIdx + startMarker.length;
+              const rest = batchReq.prompt.slice(afterStart);
+              const nm = rest.match(/===\s*Q\d+\s*===/);
+              const segment = nm ? rest.slice(0, nm.index) : rest;
+              const lines = segment.split('\n').map((l) => l.trim()).filter(Boolean);
+              let parsedType = '', parsedStem = '';
+              const parsedOpts = [];
+              for (const line of lines) {
+                const tm = line.match(/^\[(.+?)\]\s*第\s*\d+/);
+                if (tm) { parsedType = tm[1]; continue; }
+                const om = line.match(/^([A-Z])[\.、]\s*(.+)/);
+                if (om) { parsedOpts.push({ letter: om[1], content: om[2] }); continue; }
+                if (!parsedStem) parsedStem = line;
+              }
+              type = type || parsedType;
+              stem = stem || parsedStem;
+              options = options.length ? options : parsedOpts;
+            }
+          }
+        }
+        allQuestions.push({
+          qId, position, type, stem, options,
           status: resp ? resp.status : 'pending',
           text: resp ? (resp.text || '') : '',
+          edited: !!(resp && resp.edited),
           error: resp ? (resp.error || '') : '',
-          at: resp ? new Date(resp.timestamp).toLocaleString('zh-CN') : '',
+          timestamp: resp ? resp.timestamp : (req.timestamp || 0),
         });
       }
-      combined.sort((a, b) => a.position - b.position);
-
-      // 选项可能多于 4 个(多选), 算最大数量
-      const maxOpts = combined.reduce((m, q) => Math.max(m, (q.options || []).length), 4);
-      const optHeaders = [];
-      for (let i = 0; i < maxOpts; i++) {
-        optHeaders.push(`选项${String.fromCharCode(65 + i)}`);
+      if (allQuestions.length === 0) {
+        log_('⚠️ GM 缓存为空, 无可导出', 'warn');
+        return;
       }
-      const headers = ['题号', '题型', '题干', ...optHeaders, '状态', '解析', '错误', '处理时间'];
-      const rows = [headers];
-      for (const q of combined) {
-        const opts = (q.options || []).map((o) => o.content || '');
-        while (opts.length < maxOpts) opts.push('');
-        rows.push([
-          q.position || '',
-          q.type || '',
-          q.stem || '',
-          ...opts,
-          q.status || '',
-          q.text || '',
-          q.error || '',
-          q.at || '',
-        ]);
+      allQuestions.sort((a, b) => (a.position - b.position) || (a.timestamp - b.timestamp));
+      const csvEsc = (field) => {
+        const s = String(field == null ? '' : field);
+        return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+      };
+      const rows = [['题号', '题型', '题干', '选项', '解析答案', '是否已编辑', '处理时间'].map(csvEsc).join(',')];
+      let stat = { total: allQuestions.length, withAnswer: 0, edited: 0, withStem: 0 };
+      for (const q of allQuestions) {
+        const optionsText = (q.options || []).map((o) => `${o.letter}. ${o.content}`).join('\n');
+        const explanation = q.status === 'done' ? q.text : (q.status === 'error' ? `[错误] ${q.error || '解析失败'}` : '[未获取]');
+        const isEdited = q.edited ? '是' : '否';
+        const ts = q.timestamp ? new Date(q.timestamp).toLocaleString('zh-CN') : '';
+        if (q.status === 'done') stat.withAnswer++;
+        if (q.edited) stat.edited++;
+        if (q.stem) stat.withStem++;
+        rows.push([q.position || '', q.type || '', q.stem || '', optionsText, explanation, isEdited, ts].map(csvEsc).join(','));
       }
-      // CSV 转换: 含逗号/引号/换行的字段用引号包起来, 内部引号双写转义
-      const csv = rows.map((row) =>
-        row.map((field) => {
-          const s = String(field == null ? '' : field);
-          if (/[",\n\r]/.test(s)) {
-            return '"' + s.replace(/"/g, '""') + '"';
-          }
-          return s;
-        }).join(',')
-      ).join('\r\n'); // CRLF, Excel/Windows 友好
-
-      // UTF-8 BOM 让 Excel 正确识别中文
-      const csvWithBOM = '\ufeff' + csv;
-      const blob = new Blob([csvWithBOM], { type: 'text/csv;charset=utf-8' });
+      const csv = '\ufeff' + rows.join('\r\n');
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `ilearning-questions-${new Date().toISOString().slice(0, 19).replace(/[:.]/g, '-')}.csv`;
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-      log(`📥 已导出 ${combined.length} 道题为 CSV (done: ${counts.done}, error: ${counts.error})`, 'success');
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      log_(`📥 已导出 CSV: ${stat.total} 题 (含题干 ${stat.withStem}, 含解析 ${stat.withAnswer}, 已编辑 ${stat.edited})`, 'success');
     }
 
     function describeEl(el) {
