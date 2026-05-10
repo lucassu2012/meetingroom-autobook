@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.12.3
+// @version      0.12.4
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.12.4 - 字母重映射补 3 个模式: ① 字母+空格+错误/正确 ("D 错误") ② 字母+顿号/逗号 ("D、E错误") ③ 中文+(字母) ("TR5 (E)"); 用 PLACE+字母+SAFE 三明治防链式替换 bug
 // v0.12.3 - 两个修复: ① 选项重排兼容 v0.12.2 之前的旧缓存 (originalOptions 缺失时回退到 KEY_REQ.options) ② 重新请求按钮同时删 KEY_REQ, 让单题重发不再被卡 '已在处理中'
 // v0.12.2 - 选项重排 A+B 处理 (警告对照表 + 字母自动重映射) + 干掉启动自动去重 (保留函数+手动按钮)
 // v0.12.1 - 三连修复: ① 缓存去重 (旧 q{pos}_xxx 与新 q_xxx 共存导致 1 题多份, 启动时自动跑一次去重 + 手动触发) ② 方向键拦截 (浮窗内按↑↓←→不再误切 iLearning 题) ③ 缓存数 pill 加去重按钮
@@ -1879,27 +1880,49 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       return changed ? { forward: fwd, originalOptions } : null;
     }
 
-    // 把解析里的字母替换为重映射后的字母 (精准模式, 避免误伤)
+    // v0.12.4: 把解析里的字母替换为重映射后的字母
+    // 用 PLACE + 字母 + SAFE 三明治结构防链式替换 (新插入的字母不会被后续模式再次命中)
     function applyAnswerRemapping(text, mapping) {
       if (!text || !mapping || !mapping.forward) return text;
       const fwd = mapping.forward;
-      const PLACE = '\uE000';  // 私有占位符, 防止链式替换 (e.g. A→B, B→A 不会循环)
+      const PLACE = '\uE000';  // 字母前占位符
+      const SAFE = '\uE001';   // 字母后占位符 (让所有模式都无法识别 PLACE+字母+SAFE 中的字母)
       let result = text;
       for (const [origL, newL] of fwd) {
         if (origL === newL) continue;
         const o = origL;
+        const W = PLACE + newL + SAFE;  // 包裹后的新字母 (不会被后续替换匹配)
+
         // 1. 行首/换行后 字母+点/顿号 (e.g. "A. xxx", "B、 xxx")
-        result = result.replace(new RegExp(`(^|[\\n\\r])${o}([\\.、])`, 'g'), `$1${PLACE}${newL}$2`);
+        result = result.replace(new RegExp(`(^|[\\n\\r])${o}([\\.、])`, 'g'), `$1${W}$2`);
         // 2. 加粗 **字母. 或 **字母**
-        result = result.replace(new RegExp(`\\*\\*${o}(\\.|\\*\\*)`, 'g'), `**${PLACE}${newL}$1`);
-        // 3. (正确)答案 ... 字母 (字母后必须非字母数字, 避免 D5 / DA 等误伤)
-        result = result.replace(new RegExp(`(?<=(?:正确)?答案[:：\\s]?\\s*)${o}(?![a-zA-Z0-9_])`, 'g'), PLACE + newL);
+        result = result.replace(new RegExp(`\\*\\*${o}(\\.|\\*\\*)`, 'g'), `**${W}$1`);
+        // 3. (正确)答案 ... 字母 (字母后必须非字母数字)
+        result = result.replace(new RegExp(`(?<=(?:正确)?答案[:：\\s]?\\s*)${o}(?![a-zA-Z0-9_])`, 'g'), W);
         // 4. "选项 字母" / "选 字母"
-        result = result.replace(new RegExp(`(?<=选(?:项)?\\s*[:：]?\\s*)${o}(?![a-zA-Z0-9_])`, 'g'), PLACE + newL);
-        // 5. 字母 + "选项" (e.g. "D 选项", "D选项错的原因")
-        result = result.replace(new RegExp(`(^|[^a-zA-Z0-9])${o}(\\s*选项)`, 'g'), `$1${PLACE}${newL}$2`);
+        result = result.replace(new RegExp(`(?<=选(?:项)?\\s*[:：]?\\s*)${o}(?![a-zA-Z0-9_])`, 'g'), W);
+        // 5. 字母 + "选项"
+        result = result.replace(new RegExp(`(^|[^a-zA-Z0-9])${o}(\\s*选项)`, 'g'), `$1${W}$2`);
+        // v0.12.4 新增 6. 字母 + 顿号/逗号/分号 (列表分隔, e.g. "D、E、F" / "D, E, F" / "D；E")
+        result = result.replace(new RegExp(`(^|[^a-zA-Z0-9])${o}(\\s*[、，；])`, 'g'), `$1${W}$2`);
+        // v0.12.4 新增 7. 字母 + (可选空格) + 评价词 (e.g. "D 错误", "E错误" 无空白也算)
+        result = result.replace(
+          new RegExp(`(^|[^a-zA-Z0-9])${o}(\\s*(?:错误|正确|不正确|不准确|是错|是对|对|不对))`, 'g'),
+          `$1${W}$2`
+        );
+        // v0.12.4 新增 8. 中文/数字 + (字母) — 解析里 "TR5 (E)" / "整体项目管理 (D)"
+        result = result.replace(
+          new RegExp(`([\\u4e00-\\u9fa5\\d])(\\s*)([\\(（])\\s*${o}\\s*([\\)）])`, 'g'),
+          `$1$2$3${W}$4`
+        );
+        // v0.12.4 新增 9. 列表分隔符 + 字母 (e.g. "A、B、C" 中 C 是末尾, 它前面是顿号)
+        result = result.replace(
+          new RegExp(`([、，；,])(\\s*)${o}(?![a-zA-Z0-9_])`, 'g'),
+          `$1$2${W}`
+        );
       }
-      return result.replace(new RegExp(PLACE, 'g'), '');
+      // 清理占位符
+      return result.replace(new RegExp(`[${PLACE}${SAFE}]`, 'g'), '');
     }
 
     // 生成重映射对照表 HTML (用于警告区)
