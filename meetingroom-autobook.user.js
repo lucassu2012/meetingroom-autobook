@@ -1,14 +1,15 @@
 // ==UserScript==
-// @name         会议室自动抢订-v12
-// @namespace    meetingroom-autobook
-// @version      0.12.0
-// @description  在系统开放预订时刻自动抢订会议室。带并发限制的工作队列 / 提前连续重试 / 精确对时 / Apple 风格界面 / GUI 配置
+// @name         华为会议室自动抢订
+// @namespace    huawei-meetingroom-autobook
+// @version      0.13.0
+// @description  在系统开放预订时刻自动抢订会议室。带并发限制的工作队列 / 提前连续重试 / 精确对时 / Apple 风格界面 / GUI 配置。
 // @author       Lucas
 // @match        https://inner.welink.huawei.com/meetingroom/*
 // @grant        none
 // @run-at       document-start
-// @updateURL    https://raw.githubusercontent.com/lucassu2012/meetingroom-autobook/main/meetingroom-autobook.user.js
-// @downloadURL  https://raw.githubusercontent.com/lucassu2012/meetingroom-autobook/main/meetingroom-autobook.user.js
+// 把下面两行的 URL 替换成实际托管地址(以 .user.js 结尾),粘贴时去掉前面的 //
+// // @updateURL    https://YOUR_INTERNAL_HOST/huawei-meetingroom-autobook.user.js
+// // @downloadURL  https://YOUR_INTERNAL_HOST/huawei-meetingroom-autobook.user.js
 // ==/UserScript==
 
 (function () {
@@ -24,9 +25,9 @@
       bookingOpenTime: '08:30:00',
       daysAhead: 7,                 // "滚动模式": 在执行那一刻 today + daysAhead 算预订日期
       targetDate: null,             // "固定日期模式": ISO 字符串如 '2026-05-18',若设置则覆盖 daysAhead
-      preTriggerMs: 300,            // 提前 N 毫秒开始尝试 (默认 300ms)
-                                    // 实战调优: 提前太多 (如 1000ms) 会浪费令牌桶限流额度
-                                    // 提前太少 (如 0ms) 又可能因网络抖动错过开放瞬间
+      preTriggerMs: 100,            // 提前 N 毫秒开始尝试 (默认 100ms)
+                                    // 实战数据: 300ms 浪费 3 个 bucket 令牌, 100ms 是最佳平衡
+                                    // 进一步可调 50/0ms 更激进, 但需要时钟同步精度好
       maxAttemptDurationSec: 90,    // 最长持续重试 90 秒
     },
     meeting: {
@@ -85,6 +86,10 @@
         // 用户如果手动设过其它值(500, 800 等)则保留
         if (cfg.timing && cfg.timing.preTriggerMs === 1000) {
           cfg.timing.preTriggerMs = 300;
+        }
+        // v0.12 → v0.13 迁移: 真实 8:30 实战发现 300ms 浪费 3 个 bucket 令牌, 改为 100ms
+        if (cfg.timing && cfg.timing.preTriggerMs === 300) {
+          cfg.timing.preTriggerMs = 100;
         }
         return cfg;
       }
@@ -835,7 +840,7 @@
     panel.id = 'mr-panel';
     panel.innerHTML = `
       <div class="h">
-        <span class="tt">📅 会议室自动抢订 v0.12</span>
+        <span class="tt">📅 会议室自动抢订 v0.13</span>
         <span class="tg" id="tg">−</span>
       </div>
       <div class="body" id="body">
@@ -1240,8 +1245,8 @@
         <button id="set-reset" style="color:#c62828">恢复默认</button>
       </div>
       <div class="warn-text" id="set-warn" style="display:none"></div>
-      <div class="help">💡 服务器有 ~4 并发限制。"提前ms"让脚本提前几毫秒开始尝试,被拒绝就重试,直到 8:30 真正开放。<br>
-      <b>实战推荐:提前 ms = 200~500</b>(太大会浪费令牌桶限流额度)。<br>
+      <div class="help">💡 服务器限流:令牌桶 ~4 令牌 / 4 令牌/秒。"提前ms"小则不浪费令牌,但要够大兜住时钟漂移。<br>
+      <b>实战推荐:提前 ms = 50~150</b>(实战 8:30 数据:300ms 浪费 3 个令牌、丢失关键 400ms 抢订窗口)。<br>
       <b>📅 提前天数</b>:≤7 = 滚动模式(每天抢 N 天后);&gt;7 = 固定日期模式(锁定特定那天,自动选合适执行日)。
       </div>`;
 
@@ -1527,7 +1532,7 @@
       return;
     }
     buildUI();
-    log('✅ 会议室自动抢订 v0.12.0 已加载');
+    log('✅ 会议室自动抢订 v0.13.0 已加载');
     log(`📋 已配置 ${CONFIG.bookings.length} 个任务 / ${CONFIG.rooms.length} 个房间`);
 
     setTimeout(() => {
@@ -1547,4 +1552,3 @@
     init();
   }
 })();
-
