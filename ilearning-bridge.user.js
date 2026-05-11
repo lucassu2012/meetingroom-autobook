@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.12.9
+// @version      0.13.0
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.13.0 - [BREAKING] qId 公式变更: 从 hash(stem) 改为 hash(stem + sorted-options-content). 修复"题干相同选项不同"被算同一题的 silent bug (例如 Q19/Q21). 选项按内容字母序排序后参与 hash, 让"打乱顺序的同一题"仍命中同一 qId, 与 detectOptionRemapping 字母重映射功能完美配合. 旧缓存全部失效 (qId 不匹配新公式), 建议导入 CSV 一键重建; 提供 window.__migrateLegacyCache() 控制台辅助函数清空孤儿缓存.
 // v0.12.9 - 修复 v0.12.8 布局溢出 (explain 内的 verify/actions 跑到 log 区): 取消 #ilh-explain flex column 强制布局, 改为只固定 .ilh-explain-content 的 height (210px), 让 explain 整体走 normal flow; #ilh-question 和 #ilh-log 用 flex:1 + min-height 共享剩余空间, 整体浮窗高度仍固定.
 // v0.12.8 - UI 稳定性: 浮窗整体固定高度 (不随内容变化伸缩), 解析模块固定高度 (内部滚动), 移除"复制解析"按钮 (操作栏更精简). 用 flex 布局让各功能模块各自固定, 日志区分到剩余空间.
 // v0.12.7 - 回滚 v0.13.0 (Apple 风格 makeover 导致界面错乱), 恢复 v0.12.6 视觉; 新增"📂 导入题库"按钮: 解析 CSV (8列: 题号/题型/题干/选项/解析答案/是否已编辑/答案核对/处理时间), 完全清空原 GM 缓存, 用 CSV 数据重建 KEY_REQ + KEY_RESP, 题号、状态、答案核对一并恢复; 原"📥 CSV"按钮改名为"📤 导出题库"
@@ -1412,9 +1413,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         const stem = findStem(positionInfo.position);
         if (!stem || stem.length < CONFIG.minStemLength) return null;
         const options = findOptions();
-        // v0.12.0: qId 不再含 position, 用 stem 完整内容的 hash; 同一题在不同试卷不同位置也能命中缓存
-        const stemNorm = stem.replace(/\s+/g, '').trim();
-        const id = `q_${hashString(stemNorm)}`;
+        // v0.13.0: qId = hash(stem + sorted-options-content), 修复 Q19/Q21 撞 ID; 选项打乱顺序仍命中同一 qId
+        const id = computeQId(stem, options);
         return {
           id, type: questionType,
           position: positionInfo.position,
@@ -1555,6 +1555,59 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       let h = 0;
       for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
       return Math.abs(h).toString(36);
+    }
+
+    /**
+     * v0.13.0: 统一的 qId 计算函数 (整个脚本唯一入口, 不要直接调 hashString)
+     *
+     * 公式: hash(stem_normalized + '||' + options_content_sorted_joined)
+     *
+     * 为什么按内容排序?
+     *   - 同一题不同试卷, 选项 ABCD 顺序常被打乱 (防背答案)
+     *   - 按内容排序后, "A.红 B.绿 C.蓝" 和 "A.绿 B.红 C.蓝" 算同一 qId
+     *   - 与 detectOptionRemapping 配合: 缓存命中 + 字母自动重映射
+     *
+     * 为什么这能修 Q19/Q21 bug?
+     *   - 题干相同但选项**内容不同** (Q19: 路标/设计/算法/专利 vs Q21: 客户/货源/产销/招标)
+     *   - 内容集合不同 -> 排序后字符串不同 -> hash 不同 -> 不同 qId -> 不撞车
+     */
+    function computeQId(stem, options) {
+      const stemNorm = (stem || '').replace(/\s+/g, '').trim();
+      const optionsKey = (options || [])
+        .map((o) => (o && o.content) ? o.content.replace(/\s+/g, '').trim() : '')
+        .filter((c) => c.length > 0)
+        .sort()
+        .join('|');
+      return `q_${hashString(stemNorm + '||' + optionsKey)}`;
+    }
+
+    /**
+     * v0.13.0: 控制台辅助函数 - 清空旧公式的孤儿缓存
+     * 在 Console 里输入 __migrateLegacyCache() 即可调用
+     * 不强制清空, 让用户自己拍板
+     */
+    if (typeof unsafeWindow !== 'undefined') {
+      unsafeWindow.__migrateLegacyCache = function() {
+        const allKeys = GM_listValues().filter((k) => k.startsWith('ilh:'));
+        const orphans = [];
+        for (const k of allKeys) {
+          if (!k.startsWith('ilh:request:') && !k.startsWith('ilh:response:')) continue;
+          const qId = k.split(':')[2];
+          const req = GM_getValue(`ilh:request:${qId}`, null);
+          if (!req || !req.stem) continue;
+          const newQId = computeQId(req.stem, req.options);
+          if (newQId !== qId) orphans.push(k);
+        }
+        console.log(`[ilh] 找到 ${orphans.length} 条旧公式孤儿缓存`);
+        const ok = confirm(`清空 ${orphans.length} 条旧公式缓存? 这些 qId 已无法被新公式匹配, 占用 GM 存储空间.`);
+        if (!ok) return console.log('[ilh] 用户取消');
+        let cleared = 0;
+        for (const k of orphans) {
+          try { GM_deleteValue(k); cleared++; } catch (e) {}
+        }
+        console.log(`[ilh] 已清空 ${cleared}/${orphans.length} 条`);
+        alert(`✅ 已清空 ${cleared} 条旧公式缓存\n建议: 导入之前导出的 CSV 一键重建`);
+      };
     }
 
     // === UI ===
@@ -2090,10 +2143,11 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           withoutStem++;
           continue;
         }
-        const stemNorm = stem.replace(/\s+/g, '').trim();
-        const stemHash = hashString(stemNorm);
-        if (!groups.has(stemHash)) groups.set(stemHash, []);
-        groups.get(stemHash).push({
+        // v0.13.0: 按完整 qId 分组 (stem + sorted options), 不再单看 stem (避免错认 Q19/Q21 为重复)
+        const opts = (req && req.options) || [];
+        const groupKey = computeQId(stem, opts);
+        if (!groups.has(groupKey)) groups.set(groupKey, []);
+        groups.get(groupKey).push({
           qId,
           stem,
           hasResp: !!resp,
@@ -2378,8 +2432,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           }
           const position = parseInt((posStr || '0').trim(), 10) || 0;
           const type = (typeStr || '').trim() === '多选题' ? 'multi' : 'single';
-          const stemNorm = stem.replace(/\s+/g, '').trim();
-          const qId = `q_${hashString(stemNorm)}`;
+          // v0.13.0: 用统一 computeQId, 包含选项内容; "题干同选项异" 的题会被算成不同 qId
+          const qId = computeQId(stem, options);
 
           // 解析选项 "A. xxx\nB. xxx\nC. xxx" → [{letter, content}]
           const options = [];
