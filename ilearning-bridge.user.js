@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.13.2
+// @version      0.13.3
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.13.3 - 修复 4 个问题: (1) 启动迁移冲突时不再跳过, 改为合并 (选 status=done 优先 / 时间戳新优先), 清理 v0.13.2 留下的孤儿双份 entry; (2) 撤销自动 fillCourseContext 行为, 改为 cache 命中时按需补全 (新题自动带 courseName/examId, 旧题保持空白直到下次被命中); (3) CSV 导出题型规范化为中文 "单选题/多选题/判断题" (不再 multi/single); CSV 导入识别中文题型保留原值; (4) 移除 "🔧 修复" 按钮 + fixCacheInteractive / fillCourseContext / __fixCacheNow.
 // v0.13.2 - 修复 v0.13.0/v0.13.1 升级后两个问题: (1) 自动迁移旧 qId 公式 (脚本启动时静默扫描旧 cache, 用新公式重新算 qId 并改名, 保留所有 req+resp 数据, 解决"之前缓存的题被识别成新题"); (2) 新增"🔧 修复"按钮 (在导入按钮旁), 一键补全 KEY_REQ 缺失的 courseName/examId, 解决"导出 CSV 课程名空白". 旧 console 函数 __migrateLegacyCache 已弃用 (重命名为 __fixCacheNow 走同一逻辑).
 // v0.13.1 - CSV 增加"课程名称"和"考试ID"两列, 让每条题目能追溯到具体考试. 课程名称从页面标题 (.title 选择器) 自动提取, 考试ID 从 URL 的 examId 参数解析. 这两个字段同步存储到 KEY_REQ, NotebookLM 端导出也带这两列. 导入功能向下兼容: 旧 CSV (8 列) 仍可导入, 新 CSV (10 列) 自动识别后两列.
 // v0.13.0 - [BREAKING] qId 公式变更: 从 hash(stem) 改为 hash(stem + sorted-options-content). 修复"题干相同选项不同"被算同一题的 silent bug (例如 Q19/Q21). 选项按内容字母序排序后参与 hash, 让"打乱顺序的同一题"仍命中同一 qId, 与 detectOptionRemapping 字母重映射功能完美配合. 旧缓存全部失效 (qId 不匹配新公式), 建议导入 CSV 一键重建; 提供 window.__migrateLegacyCache() 控制台辅助函数清空孤儿缓存.
@@ -74,6 +75,16 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     return null;
   })();
 
+  // v0.13.3: 共享 helper - 题型规范化为中文 (iLearning + NotebookLM 两端都能用)
+  function normalizeTypeToChinese(t) {
+    const s = String(t || '').trim();
+    if (s === 'multi' || s === 'multiple') return '多选题';
+    if (s === 'single') return '单选题';
+    if (s === 'judge' || s === 'tof' || s === 'truefalse') return '判断题';
+    if (['单选题', '多选题', '判断题'].includes(s)) return s;
+    return s || '单选题';
+  }
+
   function setSafeHTML(el, html) {
     if (__ttPolicy) {
       el.innerHTML = __ttPolicy.createHTML(html);
@@ -113,7 +124,26 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     /** iLearning 端: 发 request, 如已有缓存 response 则直接返回 */
     sendRequest(question) {
       const cached = GM_getValue(this.KEY_RESP(question.id), null);
-      if (cached && cached.status === 'done') return cached;
+      if (cached && cached.status === 'done') {
+        // v0.13.3: cache 命中时, 如果旧 KEY_REQ 没有 courseName/examId, 用当前 question 的值补上
+        // (用户要求: 历史缓存等被命中时再补全, 不要全局错误标记)
+        try {
+          const existingReq = GM_getValue(this.KEY_REQ(question.id), null);
+          if (existingReq) {
+            let dirty = false;
+            if (!existingReq.courseName && question.courseName) {
+              existingReq.courseName = question.courseName;
+              dirty = true;
+            }
+            if (!existingReq.examId && question.examId) {
+              existingReq.examId = question.examId;
+              dirty = true;
+            }
+            if (dirty) GM_setValue(this.KEY_REQ(question.id), existingReq);
+          }
+        } catch (e) { /* 静默 */ }
+        return cached;
+      }
 
       GM_setValue(this.KEY_REQ(question.id), {
         ...question,
@@ -1565,6 +1595,23 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       return Math.abs(h).toString(36);
     }
 
+    /** v0.13.3: 在两个 resp 里选"最好"的一份 (合并去重时用)
+     *  规则: status=done 优先 > edited=true 优先 > verified=correct 优先 > timestamp 新优先
+     */
+    function selectBestResp(a, b) {
+      if (!a) return b;
+      if (!b) return a;
+      const da = a.status === 'done', db = b.status === 'done';
+      if (da && !db) return a;
+      if (db && !da) return b;
+      if (a.edited && !b.edited) return a;
+      if (b.edited && !a.edited) return b;
+      const va = a.verified === 'correct', vb = b.verified === 'correct';
+      if (va && !vb) return a;
+      if (vb && !va) return b;
+      return (a.timestamp || 0) >= (b.timestamp || 0) ? a : b;
+    }
+
     /**
      * v0.13.0: 统一的 qId 计算函数 (整个脚本唯一入口, 不要直接调 hashString)
      *
@@ -1620,17 +1667,17 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     }
 
     /**
-     * v0.13.2: 迁移旧 qId 到新公式 (不删数据, 改 key 名)
-     * - 扫描所有 ilh:request:<qId>
-     * - 用 computeQId(stem, options) 重新算 qId
-     * - 如果新旧不同 → 把 req + resp 复制到新 key, 删旧 key
-     * - 完全无副作用: 所有答案/解析/状态保留
-     * 返回 { scanned, migrated, skippedNoStem, conflicts }
+     * v0.13.3: 迁移 + 合并 旧 qId 到新公式
+     * - 扫所有 ilh:request:<qId>
+     * - 用 computeQId(stem, options) 重算
+     * - 如果新旧不同:
+     *   - 新 qId 未占用 → 简单改名 (req + resp 一起搬)
+     *   - 新 qId 已占用 → 合并 (选最佳 resp + 合并 courseName/examId 字段), 然后删旧 entry
+     * 返回 { scanned, renamed, mergedConflicts, skipped }
      */
     function migrateLegacyQIds() {
-      const allKeys = GM_listValues().filter((k) => k.startsWith('ilh:'));
-      const reqKeys = allKeys.filter((k) => k.startsWith('ilh:request:'));
-      let migrated = 0, skipped = 0, conflicts = 0;
+      const reqKeys = GM_listValues().filter((k) => k.startsWith('ilh:request:'));
+      let renamed = 0, mergedConflicts = 0, skipped = 0;
 
       for (const k of reqKeys) {
         const oldQId = k.slice('ilh:request:'.length);
@@ -1640,126 +1687,115 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           continue;
         }
         const newQId = computeQId(req.stem, req.options);
-        if (newQId === oldQId) continue; // 已经是新公式
+        if (newQId === oldQId) continue;
 
-        // 检查新 qId 是否已存在 (不冲突的话才迁)
-        if (GM_getValue(`ilh:request:${newQId}`, null)) {
-          conflicts++;
-          // 冲突时不迁, 让两份共存 (虽然旧 qId 用不到, 但保留数据更安全)
-          continue;
-        }
+        const existingNewReq = GM_getValue(`ilh:request:${newQId}`, null);
+        const oldResp = GM_getValue(`ilh:response:${oldQId}`, null);
 
-        // 迁移 req
-        try {
-          GM_setValue(`ilh:request:${newQId}`, { ...req, id: newQId });
-          GM_deleteValue(`ilh:request:${oldQId}`);
-          // 迁移 resp (如果有)
-          const resp = GM_getValue(`ilh:response:${oldQId}`, null);
-          if (resp) {
-            GM_setValue(`ilh:response:${newQId}`, { ...resp, id: newQId });
-            GM_deleteValue(`ilh:response:${oldQId}`);
+        if (!existingNewReq) {
+          // 无冲突: 简单改名
+          try {
+            GM_setValue(`ilh:request:${newQId}`, { ...req, id: newQId });
+            GM_deleteValue(`ilh:request:${oldQId}`);
+            if (oldResp) {
+              GM_setValue(`ilh:response:${newQId}`, { ...oldResp, id: newQId });
+              GM_deleteValue(`ilh:response:${oldQId}`);
+            }
+            renamed++;
+          } catch (e) {
+            console.warn('[ilh] migrate rename failed for', oldQId, e);
           }
-          migrated++;
+        } else {
+          // 冲突: 合并去重 (v0.13.3 关键修复)
+          try {
+            // req: 用 existingNew 为底, 补全 courseName/examId
+            const mergedReq = { ...existingNewReq, id: newQId };
+            if (!mergedReq.courseName && req.courseName) mergedReq.courseName = req.courseName;
+            if (!mergedReq.examId && req.examId) mergedReq.examId = req.examId;
+            GM_setValue(`ilh:request:${newQId}`, mergedReq);
+
+            // resp: 选最佳
+            const newResp = GM_getValue(`ilh:response:${newQId}`, null);
+            const bestResp = selectBestResp(newResp, oldResp);
+            if (bestResp) {
+              GM_setValue(`ilh:response:${newQId}`, { ...bestResp, id: newQId });
+            }
+
+            // 删除旧 entry
+            GM_deleteValue(`ilh:request:${oldQId}`);
+            GM_deleteValue(`ilh:response:${oldQId}`);
+            mergedConflicts++;
+          } catch (e) {
+            console.warn('[ilh] migrate merge failed for', oldQId, e);
+          }
+        }
+      }
+      return { scanned: reqKeys.length, renamed, mergedConflicts, skipped };
+    }
+
+    /**
+     * v0.13.3: 一次性扫描 cache, 把所有 "应该是同一 qId 但实际是分开 entry" 的合并掉
+     * (清理 v0.13.2 留下的孤儿)
+     * 与 migrateLegacyQIds 的区别:
+     *   migrateLegacyQIds: 处理 oldQId !== newQId 的迁移
+     *   deduplicateNewQIds: 处理 oldQId === newQId 但有多个 entry 算出相同 newQId 的情况
+     */
+    function deduplicateNewQIds() {
+      const reqKeys = GM_listValues().filter((k) => k.startsWith('ilh:request:'));
+      const groups = new Map(); // newQId → [{qId, req}, ...]
+
+      for (const k of reqKeys) {
+        const qId = k.slice('ilh:request:'.length);
+        const req = GM_getValue(k, null);
+        if (!req || !req.stem || !req.options || req.options.length === 0) continue;
+        const newQId = computeQId(req.stem, req.options);
+        if (!groups.has(newQId)) groups.set(newQId, []);
+        groups.get(newQId).push({ qId, req });
+      }
+
+      let merged = 0, totalGroups = 0;
+      for (const [newQId, items] of groups) {
+        if (items.length <= 1) continue;
+        totalGroups++;
+
+        // 选最完整的 req (含 courseName/examId 优先)
+        let bestReq = items[0].req;
+        for (const it of items) {
+          // courseName 优先
+          if (!bestReq.courseName && it.req.courseName) bestReq = it.req;
+          // examId 同时优先
+          else if (!bestReq.examId && it.req.examId) bestReq = it.req;
+        }
+        const finalReq = { ...bestReq, id: newQId };
+        // 把所有 items 的 courseName/examId 合并到 finalReq
+        for (const it of items) {
+          if (!finalReq.courseName && it.req.courseName) finalReq.courseName = it.req.courseName;
+          if (!finalReq.examId && it.req.examId) finalReq.examId = it.req.examId;
+        }
+
+        // 选最佳 resp
+        let bestResp = null;
+        for (const it of items) {
+          const resp = GM_getValue(`ilh:response:${it.qId}`, null);
+          bestResp = selectBestResp(bestResp, resp);
+        }
+
+        try {
+          GM_setValue(`ilh:request:${newQId}`, finalReq);
+          if (bestResp) GM_setValue(`ilh:response:${newQId}`, { ...bestResp, id: newQId });
+
+          // 删除其他 items
+          for (const it of items) {
+            if (it.qId === newQId) continue;
+            GM_deleteValue(`ilh:request:${it.qId}`);
+            GM_deleteValue(`ilh:response:${it.qId}`);
+            merged++;
+          }
         } catch (e) {
-          console.warn('[ilh] migrate failed for', oldQId, e);
+          console.warn('[ilh] dedup failed for', newQId, e);
         }
       }
-      return { scanned: reqKeys.length, migrated, skipped, conflicts };
-    }
-
-    /**
-     * v0.13.2: 补全 KEY_REQ 缺失的 courseName / examId
-     * 用当前页面的值兜底 (用户在某试卷页面点修复时, 该试卷的所有缓存题被标记)
-     * 返回 { totalMissing, filled, currentCourse, currentExamId }
-     */
-    function fillCourseContext() {
-      const currentCourse = getCourseName();
-      const currentExamId = getExamId();
-      const reqKeys = GM_listValues().filter((k) => k.startsWith('ilh:request:'));
-      let totalMissing = 0, filled = 0;
-
-      for (const k of reqKeys) {
-        const req = GM_getValue(k, null);
-        if (!req) continue;
-        const missCourse = !req.courseName;
-        const missExam = !req.examId;
-        if (!missCourse && !missExam) continue;
-        totalMissing++;
-        let changed = false;
-        if (missCourse && currentCourse) { req.courseName = currentCourse; changed = true; }
-        if (missExam && currentExamId) { req.examId = currentExamId; changed = true; }
-        if (changed) {
-          GM_setValue(k, req);
-          filled++;
-        }
-      }
-      return { totalMissing, filled, currentCourse, currentExamId };
-    }
-
-    /**
-     * v0.13.2: 浮窗 "🔧 修复" 按钮的入口
-     * 一键: (1) 迁移旧 qId; (2) 补全课程信息
-     * 弹 dialog 让用户看到详情后确认
-     */
-    function fixCacheInteractive() {
-      // 先看一下当前页面能拿到的课程信息
-      const currentCourse = getCourseName();
-      const currentExamId = getExamId();
-
-      // Step 1: qId 迁移 (无副作用, 直接做)
-      const mig = migrateLegacyQIds();
-
-      // Step 2: 看缺课程信息的题
-      const reqKeys = GM_listValues().filter((k) => k.startsWith('ilh:request:'));
-      let missing = 0;
-      for (const k of reqKeys) {
-        const req = GM_getValue(k, null);
-        if (req && (!req.courseName || !req.examId)) missing++;
-      }
-
-      // 拼汇报
-      let msg = '🔧 缓存修复完成\n\n';
-      msg += `[Step 1] qId 公式迁移:\n`;
-      msg += `  扫描: ${mig.scanned} 条 request\n`;
-      msg += `  迁移: ${mig.migrated} 条 (旧公式 → 新公式)\n`;
-      if (mig.skipped > 0) msg += `  跳过: ${mig.skipped} 条 (缺 stem/options)\n`;
-      if (mig.conflicts > 0) msg += `  冲突: ${mig.conflicts} 条 (新 qId 已存在, 保留双份)\n`;
-      msg += `\n[Step 2] 课程信息补全:\n`;
-      msg += `  当前课程: ${currentCourse || '(无法提取)'}\n`;
-      msg += `  当前 examId: ${currentExamId || '(无法提取)'}\n`;
-      msg += `  缺课程信息的题: ${missing} 条\n`;
-
-      if (missing === 0) {
-        msg += '\n✅ 所有题目都有课程信息, 无需补全';
-        alert(msg);
-        log(`🔧 qId 迁移: ${mig.migrated} 题, 课程信息: 无需补全`, 'success');
-        return;
-      }
-      if (!currentCourse && !currentExamId) {
-        msg += '\n⚠️ 当前页面提取不到课程信息, 请先打开 iLearning 考试页面';
-        alert(msg);
-        log(`🔧 qId 迁移: ${mig.migrated} 题, 课程信息: 无法补全`, 'warn');
-        return;
-      }
-
-      msg += `\n是否用上面"当前"的值补全这 ${missing} 条?\n`;
-      msg += `⚠️ 警告: 如果缓存里有其他试卷的题, 它们会被错误标记为当前试卷.`;
-      if (!confirm(msg)) {
-        log(`🔧 qId 迁移: ${mig.migrated} 题, 课程信息: 用户取消补全`, 'info');
-        return;
-      }
-
-      const fill = fillCourseContext();
-      alert(`✅ 已补全 ${fill.filled} 题课程信息`);
-      log(`🔧 修复完成: qId 迁移 ${mig.migrated} 题, 课程信息补全 ${fill.filled} 题`, 'success');
-    }
-
-    /**
-     * v0.13.2: Console 入口 (兼容老用法)
-     */
-    if (typeof unsafeWindow !== 'undefined') {
-      unsafeWindow.__fixCacheNow = fixCacheInteractive;
-      unsafeWindow.__migrateLegacyCache = fixCacheInteractive; // 兼容旧名
+      return { dupGroups: totalGroups, merged };
     }
 
     // === UI ===
@@ -1820,7 +1856,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
             <span style="flex:1"></span>
             <button class="ilh-mini-btn" id="ilh-btn-csv" title="导出全部题目和解析为 CSV (Excel 可打开)">📤 导出题库</button>
             <button class="ilh-mini-btn" id="ilh-btn-import" title="从 CSV 文件导入题库 (会完全清空当前缓存!)">📂 导入题库</button>
-            <button class="ilh-mini-btn" id="ilh-btn-fix" title="迁移旧 qId 公式 + 补全 KEY_REQ 缺失的课程信息">🔧 修复</button>
+
           </div>
           <div class="ilh-explain-actions" id="ilh-actions-edit" style="display:none">
             <button class="ilh-mini-btn ilh-btn-primary" id="ilh-btn-save">💾 保存</button>
@@ -1894,7 +1930,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       // v0.11.0: CSV 导出
       document.getElementById('ilh-btn-csv').addEventListener('click', () => exportCSV());
       document.getElementById('ilh-btn-import').addEventListener('click', () => importCsvAsBank());
-      document.getElementById('ilh-btn-fix').addEventListener('click', () => fixCacheInteractive());
+
 
       // v0.6.0: 批量面板事件
       document.getElementById('ilh-batch-enabled').addEventListener('change', (e) => {
@@ -2429,7 +2465,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         if (q.verified && q.verified !== 'unverified') stat.verified++;
         rows.push([
           q.position || '',
-          q.type || '',
+          normalizeTypeToChinese(q.type),
           q.stem || '',
           optionsText,
           explanation,
@@ -2592,7 +2628,9 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
             continue;
           }
           const position = parseInt((posStr || '0').trim(), 10) || 0;
-          const type = (typeStr || '').trim() === '多选题' ? 'multi' : 'single';
+          // v0.13.3: 保留中文题型, 不再 multi/single
+          const typeText = (typeStr || '').trim();
+          const type = ['单选题', '多选题', '判断题'].includes(typeText) ? typeText : '单选题';
           // v0.13.0: 用统一 computeQId, 包含选项内容; "题干同选项异" 的题会被算成不同 qId
           const qId = computeQId(stem, options);
 
@@ -2948,13 +2986,19 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     buildPanel();
     log(`✅ iLearning 端 v${VERSION} 已加载`, 'success');
 
-    // v0.13.2: 启动时静默迁移旧 qId 公式 (修复 v0.13.0 升级后"旧缓存识别成新题"问题)
+    // v0.13.3: 启动时静默执行 qId 迁移 + 去重 (修复 v0.13.2 留下的孤儿)
     try {
       const mig = migrateLegacyQIds();
-      if (mig.migrated > 0) {
-        log(`🔄 自动迁移旧 qId: ${mig.migrated} 题 (扫描 ${mig.scanned}, 跳过 ${mig.skipped}, 冲突 ${mig.conflicts})`, 'success');
-      } else if (mig.scanned > 0) {
-        log(`✓ qId 缓存检查: ${mig.scanned} 条都是新公式, 无需迁移`, 'debug');
+      const parts = [];
+      if (mig.renamed > 0) parts.push(`改名 ${mig.renamed}`);
+      if (mig.mergedConflicts > 0) parts.push(`合并冲突 ${mig.mergedConflicts}`);
+      if (parts.length > 0) {
+        log(`🔄 qId 迁移: ${parts.join(', ')} (扫描 ${mig.scanned})`, 'success');
+      }
+
+      const dedup = deduplicateNewQIds();
+      if (dedup.merged > 0) {
+        log(`♻️ qId 去重: 合并 ${dedup.merged} 条孤儿 (${dedup.dupGroups} 组)`, 'success');
       }
     } catch (e) {
       log(`⚠️ qId 自动迁移失败: ${e.message}`, 'warn');
@@ -3432,6 +3476,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           verified: resp ? (resp.verified || 'unverified') : 'unverified',
           error: resp ? (resp.error || '') : '',
           timestamp: resp ? resp.timestamp : (req.timestamp || 0),
+          courseName: req.courseName || '',
+          examId: req.examId || '',
         });
       }
       if (allQuestions.length === 0) {
@@ -3443,7 +3489,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         const s = String(field == null ? '' : field);
         return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
       };
-      const rows = [['题号', '题型', '题干', '选项', '解析答案', '是否已编辑', '答案核对', '处理时间'].map(csvEsc).join(',')];
+      const rows = [['题号', '题型', '题干', '选项', '解析答案', '是否已编辑', '答案核对', '处理时间', '课程名称', '考试ID'].map(csvEsc).join(',')];
       let stat = { total: allQuestions.length, withAnswer: 0, edited: 0, withStem: 0, verified: 0 };
       const verifyMap = { correct: '✓ 正确', incorrect: '✗ 错误', unverified: '未验证' };
       for (const q of allQuestions) {
@@ -3456,7 +3502,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         if (q.edited) stat.edited++;
         if (q.stem) stat.withStem++;
         if (q.verified && q.verified !== 'unverified') stat.verified++;
-        rows.push([q.position || '', q.type || '', q.stem || '', optionsText, explanation, isEdited, verifyText, ts].map(csvEsc).join(','));
+        rows.push([q.position || '', normalizeTypeToChinese(q.type), q.stem || '', optionsText, explanation, isEdited, verifyText, ts, q.courseName || '', q.examId || ''].map(csvEsc).join(','));
       }
       const csv = '\ufeff' + rows.join('\r\n');
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
