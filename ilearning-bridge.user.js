@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.13.0
+// @version      0.13.1
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.13.1 - CSV 增加"课程名称"和"考试ID"两列, 让每条题目能追溯到具体考试. 课程名称从页面标题 (.title 选择器) 自动提取, 考试ID 从 URL 的 examId 参数解析. 这两个字段同步存储到 KEY_REQ, NotebookLM 端导出也带这两列. 导入功能向下兼容: 旧 CSV (8 列) 仍可导入, 新 CSV (10 列) 自动识别后两列.
 // v0.13.0 - [BREAKING] qId 公式变更: 从 hash(stem) 改为 hash(stem + sorted-options-content). 修复"题干相同选项不同"被算同一题的 silent bug (例如 Q19/Q21). 选项按内容字母序排序后参与 hash, 让"打乱顺序的同一题"仍命中同一 qId, 与 detectOptionRemapping 字母重映射功能完美配合. 旧缓存全部失效 (qId 不匹配新公式), 建议导入 CSV 一键重建; 提供 window.__migrateLegacyCache() 控制台辅助函数清空孤儿缓存.
 // v0.12.9 - 修复 v0.12.8 布局溢出 (explain 内的 verify/actions 跑到 log 区): 取消 #ilh-explain flex column 强制布局, 改为只固定 .ilh-explain-content 的 height (210px), 让 explain 整体走 normal flow; #ilh-question 和 #ilh-log 用 flex:1 + min-height 共享剩余空间, 整体浮窗高度仍固定.
 // v0.12.8 - UI 稳定性: 浮窗整体固定高度 (不随内容变化伸缩), 解析模块固定高度 (内部滚动), 移除"复制解析"按钮 (操作栏更精简). 用 flex 布局让各功能模块各自固定, 日志区分到剩余空间.
@@ -226,6 +227,9 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           stem: q ? q.stem : '',
           options: q ? q.options : [],
           total: q ? q.total : 0,
+          // v0.13.1: 批量模式也带课程上下文
+          courseName: q ? (q.courseName || '') : '',
+          examId: q ? (q.examId || '') : '',
           timestamp: Date.now(),
           status: 'pending',
           batchId: batchData.id,
@@ -1420,6 +1424,9 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           position: positionInfo.position,
           total: positionInfo.total,
           stem, options,
+          // v0.13.1: 携带课程上下文, CSV 导出时能追溯到具体考试
+          courseName: getCourseName(),
+          examId: getExamId(),
           extractedAt: Date.now(),
         };
       } catch (e) {
@@ -1579,6 +1586,36 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         .sort()
         .join('|');
       return `q_${hashString(stemNorm + '||' + optionsKey)}`;
+    }
+
+    /**
+     * v0.13.1: 从页面 DOM 提取课程名称
+     * - 优先用 .title 元素的 title 属性 (完整文本, 不被截断)
+     * - 兜底用 textContent
+     * - 去掉首尾空格, 保留括号和特殊字符 (CSV 会自动转义)
+     */
+    function getCourseName() {
+      try {
+        const el = document.querySelector('.title span[title], .title');
+        if (!el) return '';
+        const raw = (el.getAttribute('title') || el.textContent || '').trim();
+        return raw;
+      } catch (e) {
+        return '';
+      }
+    }
+
+    /**
+     * v0.13.1: 从 URL 提取考试 ID
+     * URL 形如: https://ilearning.huawei.com/iexam/100000/examContent?examId=1836939435779674113
+     */
+    function getExamId() {
+      try {
+        const params = new URLSearchParams(location.search);
+        return params.get('examId') || '';
+      } catch (e) {
+        return '';
+      }
     }
 
     /**
@@ -2242,6 +2279,9 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           verified: resp ? (resp.verified || 'unverified') : 'unverified',
           error: resp ? (resp.error || '') : '',
           timestamp: resp ? resp.timestamp : (req.timestamp || 0),
+          // v0.13.1: 课程上下文 (从 KEY_REQ 读, 若没有则空)
+          courseName: req.courseName || '',
+          examId: req.examId || '',
         });
       }
 
@@ -2256,7 +2296,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
 
       const rows = [];
       // v0.12.5: 新增 "答案核对" 列
-      rows.push(['题号', '题型', '题干', '选项', '解析答案', '是否已编辑', '答案核对', '处理时间'].map(csvEscape).join(','));
+      // v0.13.1: 新增 "课程名称" + "考试ID" 两列
+      rows.push(['题号', '题型', '题干', '选项', '解析答案', '是否已编辑', '答案核对', '处理时间', '课程名称', '考试ID'].map(csvEscape).join(','));
       let stat = { total: allQuestions.length, withAnswer: 0, edited: 0, withStem: 0, verified: 0 };
       const verifyMap = { correct: '✓ 正确', incorrect: '✗ 错误', unverified: '未验证' };
       for (const q of allQuestions) {
@@ -2278,6 +2319,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           isEdited,
           verifyText,
           ts,
+          q.courseName || '',
+          q.examId || '',
         ].map(csvEscape).join(','));
       }
       const csv = '\ufeff' + rows.join('\r\n');
@@ -2373,12 +2416,13 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       if (rows.length < 2) throw new Error('CSV 行数太少 (至少需要表头 + 1 行数据)');
 
       const header = rows[0];
-      const expectedHeader = ['题号', '题型', '题干', '选项', '解析答案', '是否已编辑', '答案核对', '处理时间'];
-      // 不强制完全匹配, 但至少前 5 列要对得上
+      const expectedHeader = ['题号', '题型', '题干', '选项', '解析答案', '是否已编辑', '答案核对', '处理时间', '课程名称', '考试ID'];
+      // 至少前 5 列要对得上 (后 5 列向下兼容: 8 列旧版 / 10 列新版都接受)
       const headerOK = expectedHeader.slice(0, 5).every((h, i) => (header[i] || '').trim() === h);
       if (!headerOK) {
         throw new Error(`CSV 表头不匹配, 期望前 5 列为:\n  ${expectedHeader.slice(0,5).join(' | ')}\n实际:\n  ${header.slice(0,5).join(' | ')}`);
       }
+      const hasNewCols = header.length >= 10 && (header[8] || '').trim() === '课程名称' && (header[9] || '').trim() === '考试ID';
 
       const dataRows = rows.slice(1).filter((r) => r.some((c) => c && c.trim()));
       if (dataRows.length === 0) throw new Error('CSV 没有数据行');
@@ -2425,7 +2469,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
 
       for (const row of dataRows) {
         try {
-          const [posStr, typeStr, stem, optionsStr, explainText, editedStr, verifyStr, timeStr] = row;
+          const [posStr, typeStr, stem, optionsStr, explainText, editedStr, verifyStr, timeStr, courseNameStr, examIdStr] = row;
           if (!stem || stem.trim().length < 2) {
             skipped++;
             continue;
@@ -2452,13 +2496,15 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
             if (!isNaN(parsed)) ts = parsed;
           }
 
-          // KEY_REQ
+          // KEY_REQ (v0.13.1: 含课程上下文)
           GM_setValue(`ilh:request:${qId}`, {
             id: qId,
             position,
             type,
             stem,
             options,
+            courseName: hasNewCols ? (courseNameStr || '').trim() : '',
+            examId: hasNewCols ? (examIdStr || '').trim() : '',
             timestamp: ts,
             status: 'imported',
           });
