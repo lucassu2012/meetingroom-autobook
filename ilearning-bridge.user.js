@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.13.3
+// @version      0.13.4
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.13.4 - 紧急修复 v0.13.0 引入的导入 bug: doImportFromCsvText 里 const qId = computeQId(stem, options) 写在 options 声明之前, 触发 temporal dead zone ReferenceError, 被 try-catch 捕获导致每行 skip. 现在调整顺序: 先解析 options 再算 qId. 同时加 Excel 大数字兼容: 导出 examId 用 \"=\"123...\"\" 包裹 (Excel 识别为文本公式不会科学计数法), 导入去壳.
 // v0.13.3 - 修复 4 个问题: (1) 启动迁移冲突时不再跳过, 改为合并 (选 status=done 优先 / 时间戳新优先), 清理 v0.13.2 留下的孤儿双份 entry; (2) 撤销自动 fillCourseContext 行为, 改为 cache 命中时按需补全 (新题自动带 courseName/examId, 旧题保持空白直到下次被命中); (3) CSV 导出题型规范化为中文 "单选题/多选题/判断题" (不再 multi/single); CSV 导入识别中文题型保留原值; (4) 移除 "🔧 修复" 按钮 + fixCacheInteractive / fillCourseContext / __fixCacheNow.
 // v0.13.2 - 修复 v0.13.0/v0.13.1 升级后两个问题: (1) 自动迁移旧 qId 公式 (脚本启动时静默扫描旧 cache, 用新公式重新算 qId 并改名, 保留所有 req+resp 数据, 解决"之前缓存的题被识别成新题"); (2) 新增"🔧 修复"按钮 (在导入按钮旁), 一键补全 KEY_REQ 缺失的 courseName/examId, 解决"导出 CSV 课程名空白". 旧 console 函数 __migrateLegacyCache 已弃用 (重命名为 __fixCacheNow 走同一逻辑).
 // v0.13.1 - CSV 增加"课程名称"和"考试ID"两列, 让每条题目能追溯到具体考试. 课程名称从页面标题 (.title 选择器) 自动提取, 考试ID 从 URL 的 examId 参数解析. 这两个字段同步存储到 KEY_REQ, NotebookLM 端导出也带这两列. 导入功能向下兼容: 旧 CSV (8 列) 仍可导入, 新 CSV (10 列) 自动识别后两列.
@@ -74,6 +75,22 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     }
     return null;
   })();
+
+  // v0.13.4: Excel 兼容 - 把大数字包裹成 ="..." (Excel 当文本不科学计数法)
+  function csvWrapBigNumber(s) {
+    const v = String(s || '').trim();
+    if (!v) return '';
+    // 纯数字且长度 > 15 (Excel 精度上限) 才包裹, 否则不动
+    if (/^\d{16,}$/.test(v)) return `="${v}"`;
+    return v;
+  }
+
+  // v0.13.4: 导入时剥掉 ="..." 外壳
+  function csvUnwrapBigNumber(s) {
+    const v = String(s || '').trim();
+    const m = v.match(/^=\"(.+)\"$/);
+    return m ? m[1] : v;
+  }
 
   // v0.13.3: 共享 helper - 题型规范化为中文 (iLearning + NotebookLM 两端都能用)
   function normalizeTypeToChinese(t) {
@@ -2473,7 +2490,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           verifyText,
           ts,
           q.courseName || '',
-          q.examId || '',
+          csvWrapBigNumber(q.examId || ''),
         ].map(csvEscape).join(','));
       }
       const csv = '\ufeff' + rows.join('\r\n');
@@ -2631,10 +2648,9 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           // v0.13.3: 保留中文题型, 不再 multi/single
           const typeText = (typeStr || '').trim();
           const type = ['单选题', '多选题', '判断题'].includes(typeText) ? typeText : '单选题';
-          // v0.13.0: 用统一 computeQId, 包含选项内容; "题干同选项异" 的题会被算成不同 qId
-          const qId = computeQId(stem, options);
 
           // 解析选项 "A. xxx\nB. xxx\nC. xxx" → [{letter, content}]
+          // v0.13.4: 必须先解析 options 才能算 qId (之前顺序写反了, 触发 temporal dead zone)
           const options = [];
           if (optionsStr) {
             const lines = optionsStr.split(/\r?\n/);
@@ -2643,6 +2659,9 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
               if (m) options.push({ letter: m[1], content: m[2].trim() });
             }
           }
+
+          // v0.13.0: 用统一 computeQId, 包含选项内容; "题干同选项异" 的题会被算成不同 qId
+          const qId = computeQId(stem, options);
 
           // 解析时间戳
           let ts = importTs;
@@ -2659,7 +2678,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
             stem,
             options,
             courseName: hasNewCols ? (courseNameStr || '').trim() : '',
-            examId: hasNewCols ? (examIdStr || '').trim() : '',
+            examId: hasNewCols ? csvUnwrapBigNumber(examIdStr || '') : '',
             timestamp: ts,
             status: 'imported',
           });
@@ -3502,7 +3521,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         if (q.edited) stat.edited++;
         if (q.stem) stat.withStem++;
         if (q.verified && q.verified !== 'unverified') stat.verified++;
-        rows.push([q.position || '', normalizeTypeToChinese(q.type), q.stem || '', optionsText, explanation, isEdited, verifyText, ts, q.courseName || '', q.examId || ''].map(csvEsc).join(','));
+        rows.push([q.position || '', normalizeTypeToChinese(q.type), q.stem || '', optionsText, explanation, isEdited, verifyText, ts, q.courseName || '', csvWrapBigNumber(q.examId || '')].map(csvEsc).join(','));
       }
       const csv = '\ufeff' + rows.join('\r\n');
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
