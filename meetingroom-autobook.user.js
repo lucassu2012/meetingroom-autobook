@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         华为会议室自动抢订
 // @namespace    huawei-meetingroom-autobook
-// @version      0.13.0
+// @version      0.14.0
 // @description  在系统开放预订时刻自动抢订会议室。带并发限制的工作队列 / 提前连续重试 / 精确对时 / Apple 风格界面 / GUI 配置。
 // @author       Lucas
 // @match        https://inner.welink.huawei.com/meetingroom/*
@@ -624,6 +624,7 @@
   let scheduledTimerId = null;
   let scheduledLocalTime = null;
   let preTriggerSyncTimerId = null;
+  let preTriggerSync5sTimerId = null;
 
   function scheduleAutoBook() {
     if (!CONFIG.bookings.length) {
@@ -654,12 +655,38 @@
       if (waitMs > 35000) {
         preTriggerSyncTimerId = setTimeout(() => {
           if (scheduledLocalTime) {
+            const prevOffset = serverOffsetMs;
             log('🕐 抢订前 30 秒重新对时...', 'info');
             syncServerTimePrecise().finally(() => {
+              const drift = serverOffsetMs - prevOffset;
+              if (Math.abs(drift) > 100) {
+                log(`⚠️ 时钟漂移 ${drift > 0 ? '+' : ''}${drift}ms · 系统时钟不稳, 可能影响抢订精度`, 'warn');
+                log(`   建议: 管理员 cmd 跑 'w32tm /resync /force' 修复系统时间同步`, 'debug');
+              }
               scheduledLocalTime = computeNextTriggerLocalTime();
             });
           }
         }, waitMs - 30000);
+      }
+
+      // v0.14 新增: 抢订前 5 秒补一次对时, catch 任何最后时刻的时钟跳跃
+      // 这是 8:29:55 左右触发, 5s 给 sync 完成 + busy-wait 预备时间
+      if (waitMs > 6000) {
+        preTriggerSync5sTimerId = setTimeout(() => {
+          if (scheduledLocalTime) {
+            const prevOffset = serverOffsetMs;
+            log('🕐 抢订前 5 秒最终对时...', 'info');
+            syncServerTimePrecise().finally(() => {
+              const drift = serverOffsetMs - prevOffset;
+              if (Math.abs(drift) > 50) {
+                log(`⚠️ 5 秒内时钟又漂了 ${drift > 0 ? '+' : ''}${drift}ms · 抢订精度受损`, 'warn');
+              }
+              scheduledLocalTime = computeNextTriggerLocalTime();
+              const newWait = scheduledLocalTime - Date.now();
+              log(`   触发时刻修正为本地 ${formatTimeWithMs(new Date(scheduledLocalTime))} (还剩 ${newWait}ms)`, 'debug');
+            });
+          }
+        }, waitMs - 5000);
       }
 
       scheduledTimerId = setTimeout(() => {
@@ -669,17 +696,31 @@
   }
 
   function busyWaitThenFire() {
-    const tick = () => {
-      if (!scheduledLocalTime) return;
-      if (Date.now() >= scheduledLocalTime) {
-        scheduledTimerId = null;
-        scheduledLocalTime = null;
-        executeAllBookings();
-      } else {
-        scheduledTimerId = setTimeout(tick, 1);
-      }
-    };
-    tick();
+    if (!scheduledLocalTime) return;
+    const target = scheduledLocalTime;
+    const remaining = target - Date.now();
+
+    if (remaining <= 0) {
+      // 已过期, 立即开火
+      scheduledLocalTime = null;
+      scheduledTimerId = null;
+      executeAllBookings();
+      return;
+    }
+
+    if (remaining > 250) {
+      // 距离 > 250ms, 继续用 setTimeout 等待 (省 CPU)
+      // 提前 100ms 进入下一次检查, 避免 setTimeout 不精确的影响
+      scheduledTimerId = setTimeout(busyWaitThenFire, Math.max(remaining - 200, 10));
+      return;
+    }
+
+    // 距离 ≤ 250ms: 进入真·busy-wait (堵 JS 主线程, 避免 setTimeout 节流)
+    // 注意: 这会卡 UI 200ms 左右, 但能保证毫秒级精度
+    scheduledLocalTime = null;
+    scheduledTimerId = null;
+    while (Date.now() < target) { /* spin */ }
+    executeAllBookings();
   }
 
   function cancelSchedule() {
@@ -690,6 +731,10 @@
     if (preTriggerSyncTimerId) {
       clearTimeout(preTriggerSyncTimerId);
       preTriggerSyncTimerId = null;
+    }
+    if (preTriggerSync5sTimerId) {
+      clearTimeout(preTriggerSync5sTimerId);
+      preTriggerSync5sTimerId = null;
     }
     if (scheduledLocalTime) {
       scheduledLocalTime = null;
@@ -840,7 +885,7 @@
     panel.id = 'mr-panel';
     panel.innerHTML = `
       <div class="h">
-        <span class="tt">📅 会议室自动抢订 v0.13</span>
+        <span class="tt">📅 会议室自动抢订 v0.14</span>
         <span class="tg" id="tg">−</span>
       </div>
       <div class="body" id="body">
@@ -1532,7 +1577,7 @@
       return;
     }
     buildUI();
-    log('✅ 会议室自动抢订 v0.13.0 已加载');
+    log('✅ 会议室自动抢订 v0.14.0 已加载');
     log(`📋 已配置 ${CONFIG.bookings.length} 个任务 / ${CONFIG.rooms.length} 个房间`);
 
     setTimeout(() => {
