@@ -7,9 +7,8 @@
 // @match        https://inner.welink.huawei.com/meetingroom/*
 // @grant        none
 // @run-at       document-start
-// 把下面两行的 URL 替换成实际托管地址(以 .user.js 结尾),粘贴时去掉前面的 //
-// // @updateURL    https://YOUR_INTERNAL_HOST/huawei-meetingroom-autobook.user.js
-// // @downloadURL  https://YOUR_INTERNAL_HOST/huawei-meetingroom-autobook.user.js
+// @updateURL    https://raw.githubusercontent.com/lucassu2012/meetingroom-autobook/main/meetingroom-autobook.user.js
+// @downloadURL  https://raw.githubusercontent.com/lucassu2012/meetingroom-autobook/main/meetingroom-autobook.user.js
 // ==/UserScript==
 
 (function () {
