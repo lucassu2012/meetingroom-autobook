@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         华为会议室自动抢订
 // @namespace    huawei-meetingroom-autobook
-// @version      0.14.0
+// @version      0.16.0
 // @description  在系统开放预订时刻自动抢订会议室。带并发限制的工作队列 / 提前连续重试 / 精确对时 / Apple 风格界面 / GUI 配置。
 // @author       Lucas
 // @match        https://inner.welink.huawei.com/meetingroom/*
 // @grant        none
 // @run-at       document-start
-// @updateURL    https://raw.githubusercontent.com/lucassu2012/meetingroom-autobook/main/meetingroom-autobook.user.js
-// @downloadURL  https://raw.githubusercontent.com/lucassu2012/meetingroom-autobook/main/meetingroom-autobook.user.js
+// 把下面两行的 URL 替换成实际托管地址(以 .user.js 结尾),粘贴时去掉前面的 //
+// // @updateURL    https://YOUR_INTERNAL_HOST/huawei-meetingroom-autobook.user.js
+// // @downloadURL  https://YOUR_INTERNAL_HOST/huawei-meetingroom-autobook.user.js
 // ==/UserScript==
 
 (function () {
@@ -216,35 +217,69 @@
     isSyncing = true;
     log('🕐 开始精确对时 (探测服务器秒边界)...', 'info');
     try {
-      let lastSec = null;
-      const maxAttempts = 25;
+      const maxAttempts = 32;
+      let lastServerSec = null;
+      let lastLocalMid = null;
+      // 收集多次"秒跳变"观测, 每次给出一个 offset 估计 + 不确定度
+      const estimates = []; // {offset, uncertainty}
+
       for (let i = 0; i < maxAttempts; i++) {
         const localBefore = Date.now();
-        const resp = await _origFetch.call(window, window.location.origin + '/meetingroom/', {
-          method: 'HEAD',
-          cache: 'no-store',
-        });
+        let resp;
+        try {
+          resp = await _origFetch.call(window, window.location.origin + '/meetingroom/', {
+            method: 'HEAD',
+            cache: 'no-store',
+          });
+        } catch (e) {
+          await sleep(40);
+          continue;
+        }
         const localAfter = Date.now();
         const dateHeader = resp.headers.get('Date');
-        if (!dateHeader) continue;
-        const serverSec = new Date(dateHeader).getTime();
+        if (!dateHeader) { await sleep(40); continue; }
+        const serverSec = new Date(dateHeader).getTime(); // 秒级精度
+        const localMid = (localBefore + localAfter) / 2;
 
-        if (lastSec !== null && serverSec > lastSec) {
-          const localMid = Math.round((localBefore + localAfter) / 2);
-          serverOffsetMs = serverSec - localMid;
-          lastSyncAt = Date.now();
-          syncQuality = 'PRECISE';
-          const sign = serverOffsetMs >= 0 ? '慢' : '快';
-          log(`🕐 精确对时完成: 本地${sign} ${Math.abs(serverOffsetMs)}ms,用 ${i + 1} 次探测`, 'success');
-          isSyncing = false;
-          return serverOffsetMs;
+        if (lastServerSec !== null && serverSec > lastServerSec && lastLocalMid !== null) {
+          // 捕获秒跳变: 服务器边界(serverSec)发生在 [lastLocalMid, localMid] 之间
+          // 最佳估计 = 窗口中点; 不确定度 = 窗口半宽
+          const offsetEst = serverSec - (lastLocalMid + localMid) / 2;
+          const uncertainty = (localMid - lastLocalMid) / 2;
+          estimates.push({ offset: offsetEst, uncertainty });
         }
-        lastSec = serverSec;
-        await sleep(80);
+
+        lastServerSec = serverSec;
+        lastLocalMid = localMid;
+
+        // 收集到 3 次跳变就够 (约 3 秒), 兼顾精度与速度
+        if (estimates.length >= 3) break;
+        await sleep(35); // 更短间隔 → 更紧的跳变窗口 → 更高精度
       }
-      log('⚠️ 未捕获服务器秒数跳变,使用粗对时', 'warn');
+
+      if (estimates.length === 0) {
+        log('⚠️ 未捕获服务器秒数跳变,使用粗对时', 'warn');
+        isSyncing = false;
+        return await syncServerTimeQuick();
+      }
+
+      // 取不确定度最小的几个估计, 用中位数 (天然剔除网络抖动离群值)
+      estimates.sort((a, b) => a.uncertainty - b.uncertainty);
+      const best = estimates.slice(0, Math.min(3, estimates.length));
+      const offsets = best.map(e => e.offset).sort((a, b) => a - b);
+      const medianOffset = offsets[Math.floor(offsets.length / 2)];
+      const bestUncertainty = Math.round(best[0].uncertainty);
+
+      serverOffsetMs = Math.round(medianOffset);
+      lastSyncAt = Date.now();
+      syncQuality = 'PRECISE';
+      const sign = serverOffsetMs >= 0 ? '慢' : '快';
+      log(`🕐 精确对时完成: 本地${sign} ${Math.abs(serverOffsetMs)}ms · ${estimates.length} 次跳变 · 精度 ±${bestUncertainty}ms`, 'success');
+      if (bestUncertainty > 80) {
+        log(`   ⚠️ 网络抖动较大 (±${bestUncertainty}ms), 本次对时精度有限`, 'warn');
+      }
       isSyncing = false;
-      return await syncServerTimeQuick();
+      return serverOffsetMs;
     } catch (e) {
       isSyncing = false;
       log('💥 对时失败: ' + e.message, 'error');
@@ -663,13 +698,13 @@
                 log(`   建议: 管理员 cmd 跑 'w32tm /resync /force' 修复系统时间同步`, 'debug');
               }
               scheduledLocalTime = computeNextTriggerLocalTime();
+              scheduleFireTimer();  // v0.16: 对时后立即重置 fire 定时器
             });
           }
         }, waitMs - 30000);
       }
 
       // v0.14 新增: 抢订前 5 秒补一次对时, catch 任何最后时刻的时钟跳跃
-      // 这是 8:29:55 左右触发, 5s 给 sync 完成 + busy-wait 预备时间
       if (waitMs > 6000) {
         preTriggerSync5sTimerId = setTimeout(() => {
           if (scheduledLocalTime) {
@@ -683,15 +718,38 @@
               scheduledLocalTime = computeNextTriggerLocalTime();
               const newWait = scheduledLocalTime - Date.now();
               log(`   触发时刻修正为本地 ${formatTimeWithMs(new Date(scheduledLocalTime))} (还剩 ${newWait}ms)`, 'debug');
+              scheduleFireTimer();  // v0.16: 对时后立即重置 fire 定时器
             });
           }
         }, waitMs - 5000);
       }
 
-      scheduledTimerId = setTimeout(() => {
-        busyWaitThenFire();
-      }, Math.max(0, waitMs - 500));
+      scheduleFireTimer();  // v0.16: 用统一的辅助函数, 不再用单次长 setTimeout
     });
+  }
+
+  // v0.16 新增: 统一管理 fire 定时器
+  // 每次对时后调用, 用最新的 scheduledLocalTime 重新设置
+  // 关键点: 单次超长 setTimeout(>30s) 浏览器精度极差, 用递归短 setTimeout 替代
+  function scheduleFireTimer() {
+    if (scheduledTimerId) {
+      clearTimeout(scheduledTimerId);
+      scheduledTimerId = null;
+    }
+    if (!scheduledLocalTime) return;
+    const waitMs = scheduledLocalTime - Date.now();
+    if (waitMs <= 0) {
+      // 已过期, 立即开火
+      busyWaitThenFire();
+      return;
+    }
+    if (waitMs > 30000) {
+      // 距离 >30s, 每 30s 自查一次 (避免超长 setTimeout 不精确)
+      scheduledTimerId = setTimeout(scheduleFireTimer, 30000);
+    } else {
+      // 距离 ≤30s, 设定 fire-prep 时刻 (提前 500ms 进入 busy-wait 准备)
+      scheduledTimerId = setTimeout(busyWaitThenFire, Math.max(0, waitMs - 500));
+    }
   }
 
   function busyWaitThenFire() {
@@ -707,15 +765,13 @@
       return;
     }
 
-    if (remaining > 250) {
-      // 距离 > 250ms, 继续用 setTimeout 等待 (省 CPU)
-      // 提前 100ms 进入下一次检查, 避免 setTimeout 不精确的影响
-      scheduledTimerId = setTimeout(busyWaitThenFire, Math.max(remaining - 200, 10));
+    if (remaining > 500) {
+      // v0.16: busy-wait 窗口从 250ms 提到 500ms, 给最后冲刺更多余量
+      scheduledTimerId = setTimeout(busyWaitThenFire, Math.max(remaining - 400, 10));
       return;
     }
 
-    // 距离 ≤ 250ms: 进入真·busy-wait (堵 JS 主线程, 避免 setTimeout 节流)
-    // 注意: 这会卡 UI 200ms 左右, 但能保证毫秒级精度
+    // 进入真·busy-wait (堵 JS 主线程, 避免 setTimeout 节流)
     scheduledLocalTime = null;
     scheduledTimerId = null;
     while (Date.now() < target) { /* spin */ }
@@ -884,7 +940,7 @@
     panel.id = 'mr-panel';
     panel.innerHTML = `
       <div class="h">
-        <span class="tt">📅 会议室自动抢订 v0.14</span>
+        <span class="tt">📅 会议室自动抢订 v0.16</span>
         <span class="tg" id="tg">−</span>
       </div>
       <div class="body" id="body">
@@ -1278,7 +1334,7 @@
       <div class="form-row">
         <label>并发</label>
         <input type="number" id="set-conc" value="${CONFIG.advanced.concurrency}" min="1" max="10" step="1">
-        <span style="font-size:11px;color:#666">建议 3-4</span>
+        <span style="font-size:11px;color:#666">建议 3(实测全局桶容量≈3)</span>
       </div>
       <div class="form-buttons" style="margin-top:8px">
         <button id="set-save" class="save">保存设置</button>
@@ -1289,9 +1345,10 @@
         <button id="set-reset" style="color:#c62828">恢复默认</button>
       </div>
       <div class="warn-text" id="set-warn" style="display:none"></div>
-      <div class="help">💡 服务器限流:令牌桶 ~4 令牌 / 4 令牌/秒。"提前ms"小则不浪费令牌,但要够大兜住时钟漂移。<br>
-      <b>实战推荐:提前 ms = 50~150</b>(实战 8:30 数据:300ms 浪费 3 个令牌、丢失关键 400ms 抢订窗口)。<br>
-      <b>📅 提前天数</b>:≤7 = 滚动模式(每天抢 N 天后);&gt;7 = 固定日期模式(锁定特定那天,自动选合适执行日)。
+      <div class="help">💡 服务器限流:全局共享令牌桶,容量≈3、补充≈4/秒(全公司抢手共用)。<br>
+      <b>实战推荐:并发 = 3</b>(并发 4 时第 4 个请求必被限流,纯浪费)。<br>
+      <b>提前 ms = 50~100</b>(NTP 修好后无需更大;对时精度才是关键)。<br>
+      <b>📅 提前天数</b>:≤7 = 滚动模式;&gt;7 = 固定日期模式(自动选合适执行日)。
       </div>`;
 
     // 实时刷新"实际预订"显示
@@ -1576,7 +1633,7 @@
       return;
     }
     buildUI();
-    log('✅ 会议室自动抢订 v0.14.0 已加载');
+    log('✅ 会议室自动抢订 v0.16.0 已加载');
     log(`📋 已配置 ${CONFIG.bookings.length} 个任务 / ${CONFIG.rooms.length} 个房间`);
 
     setTimeout(() => {
