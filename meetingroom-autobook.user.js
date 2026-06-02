@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         华为会议室自动抢订
+// @name         会议室自动化
 // @namespace    huawei-meetingroom-autobook
-// @version      0.16.0
+// @version      0.18.0
 // @description  在系统开放预订时刻自动抢订会议室。带并发限制的工作队列 / 提前连续重试 / 精确对时 / Apple 风格界面 / GUI 配置。
 // @author       Lucas
 // @match        https://inner.welink.huawei.com/meetingroom/*
@@ -37,6 +37,10 @@
     rooms: [
       { name: 'D02R', roomId: '547157686546268160' },
       { name: 'D05R', roomId: '547157686693068800' },
+      { name: 'D17R', roomId: '547157686714044414' },
+      { name: 'D22R', roomId: '547157686911176702' },
+      { name: 'D31R', roomId: '547157686978281472' },
+      { name: 'D32R', roomId: '547157687099916288' },
       { name: 'D34R', roomId: '547157687120887808' },
       { name: 'D45R', roomId: '547157687179612158' },
       { name: 'D47R', roomId: '547157687221551104' },
@@ -89,6 +93,22 @@
         // v0.12 → v0.13 迁移: 真实 8:30 实战发现 300ms 浪费 3 个 bucket 令牌, 改为 100ms
         if (cfg.timing && cfg.timing.preTriggerMs === 300) {
           cfg.timing.preTriggerMs = 100;
+        }
+        // v0.17 → v0.18 迁移: 新增 D17R/D22R/D31R/D32R 四个房间, 老用户自动追加
+        const newRooms = [
+          { name: 'D17R', roomId: '547157686714044414' },
+          { name: 'D22R', roomId: '547157686911176702' },
+          { name: 'D31R', roomId: '547157686978281472' },
+          { name: 'D32R', roomId: '547157687099916288' },
+        ];
+        if (cfg.rooms) {
+          newRooms.forEach(r => {
+            if (!cfg.rooms.find(x => x.roomId === r.roomId)) {
+              cfg.rooms.push(r);
+            }
+          });
+          // 按 name 自然排序, 让 D17R/D22R 等出现在 D02R~D34R 之间正确位置
+          cfg.rooms.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
         }
         return cfg;
       }
@@ -184,7 +204,6 @@
   let serverOffsetMs = 0;
   let lastSyncAt = null;
   let syncQuality = 'NONE';
-  let isSyncing = false;
 
   function getServerNow() {
     return Date.now() + serverOffsetMs;
@@ -208,21 +227,35 @@
     }
   }
 
-  async function syncServerTimePrecise() {
-    if (isSyncing) {
-      log('🕐 对时进行中,稍候...', 'info');
-      return null;
+  // v0.17: 用 Promise 共享并发的对时调用, 不再返回 null
+  // 所有同时调用 syncServerTimePrecise 的代码会等同一个结果, 不会出现"用 offset=0 调度"的 bug
+  let currentSyncPromise = null;
+  let lastSyncPrecisionMs = null;
+
+  function syncServerTimePrecise() {
+    if (currentSyncPromise) {
+      log('🕐 等待进行中的对时...', 'info');
+      return currentSyncPromise;
     }
-    isSyncing = true;
+    currentSyncPromise = _doSyncPrecise();
+    currentSyncPromise.finally(() => {
+      currentSyncPromise = null;
+    });
+    return currentSyncPromise;
+  }
+
+  async function _doSyncPrecise() {
     log('🕐 开始精确对时 (探测服务器秒边界)...', 'info');
     try {
       const maxAttempts = 32;
+      const startMs = Date.now();
+      const timeBudgetMs = 5000; // v0.17: 硬性 5 秒预算, 防止网络巨慢时探测半分钟
       let lastServerSec = null;
       let lastLocalMid = null;
-      // 收集多次"秒跳变"观测, 每次给出一个 offset 估计 + 不确定度
-      const estimates = []; // {offset, uncertainty}
+      const estimates = [];
 
       for (let i = 0; i < maxAttempts; i++) {
+        if (Date.now() - startMs > timeBudgetMs) break; // 超预算停止
         const localBefore = Date.now();
         let resp;
         try {
@@ -237,12 +270,10 @@
         const localAfter = Date.now();
         const dateHeader = resp.headers.get('Date');
         if (!dateHeader) { await sleep(40); continue; }
-        const serverSec = new Date(dateHeader).getTime(); // 秒级精度
+        const serverSec = new Date(dateHeader).getTime();
         const localMid = (localBefore + localAfter) / 2;
 
         if (lastServerSec !== null && serverSec > lastServerSec && lastLocalMid !== null) {
-          // 捕获秒跳变: 服务器边界(serverSec)发生在 [lastLocalMid, localMid] 之间
-          // 最佳估计 = 窗口中点; 不确定度 = 窗口半宽
           const offsetEst = serverSec - (lastLocalMid + localMid) / 2;
           const uncertainty = (localMid - lastLocalMid) / 2;
           estimates.push({ offset: offsetEst, uncertainty });
@@ -251,36 +282,39 @@
         lastServerSec = serverSec;
         lastLocalMid = localMid;
 
-        // 收集到 3 次跳变就够 (约 3 秒), 兼顾精度与速度
         if (estimates.length >= 3) break;
-        await sleep(35); // 更短间隔 → 更紧的跳变窗口 → 更高精度
+        await sleep(35);
       }
 
       if (estimates.length === 0) {
         log('⚠️ 未捕获服务器秒数跳变,使用粗对时', 'warn');
-        isSyncing = false;
         return await syncServerTimeQuick();
       }
 
-      // 取不确定度最小的几个估计, 用中位数 (天然剔除网络抖动离群值)
       estimates.sort((a, b) => a.uncertainty - b.uncertainty);
       const best = estimates.slice(0, Math.min(3, estimates.length));
       const offsets = best.map(e => e.offset).sort((a, b) => a - b);
       const medianOffset = offsets[Math.floor(offsets.length / 2)];
       const bestUncertainty = Math.round(best[0].uncertainty);
 
+      // v0.17: 若本次精度极差 (>500ms) 且之前有过比较好的测量, 保留旧值
+      // 避免用一个 ±10000ms 的垃圾数据覆盖 ±60ms 的好数据
+      if (bestUncertainty > 500 && lastSyncAt !== null && lastSyncPrecisionMs !== null && lastSyncPrecisionMs < 200) {
+        log(`⚠️ 本次精度过差 (±${bestUncertainty}ms),保留之前的 offset (本地${serverOffsetMs >= 0 ? '慢' : '快'} ${Math.abs(serverOffsetMs)}ms, 精度 ±${lastSyncPrecisionMs}ms)`, 'warn');
+        return serverOffsetMs;
+      }
+
       serverOffsetMs = Math.round(medianOffset);
       lastSyncAt = Date.now();
+      lastSyncPrecisionMs = bestUncertainty;
       syncQuality = 'PRECISE';
       const sign = serverOffsetMs >= 0 ? '慢' : '快';
       log(`🕐 精确对时完成: 本地${sign} ${Math.abs(serverOffsetMs)}ms · ${estimates.length} 次跳变 · 精度 ±${bestUncertainty}ms`, 'success');
       if (bestUncertainty > 80) {
         log(`   ⚠️ 网络抖动较大 (±${bestUncertainty}ms), 本次对时精度有限`, 'warn');
       }
-      isSyncing = false;
       return serverOffsetMs;
     } catch (e) {
-      isSyncing = false;
       log('💥 对时失败: ' + e.message, 'error');
       return null;
     }
@@ -658,15 +692,23 @@
   let scheduledLocalTime = null;
   let preTriggerSyncTimerId = null;
   let preTriggerSync5sTimerId = null;
+  let isScheduling = false;  // v0.17: 防止用户连续多次点击造成多套定时器叠加
 
   function scheduleAutoBook() {
+    if (isScheduling) {
+      log('⚠️ 正在调度中,请稍候(对时通常需 1-5 秒)', 'warn');
+      return;
+    }
     if (!CONFIG.bookings.length) {
       log('⚠️ 没有任务,先在[任务]标签页添加', 'warn');
       return;
     }
     cancelSchedule();
+    isScheduling = true;
 
     syncServerTimePrecise().finally(() => {
+      // 用户在对时过程中点了"取消", 这里不该继续设置定时器
+      if (!isScheduling) return;
       scheduledLocalTime = computeNextTriggerLocalTime();
       const waitMs = scheduledLocalTime - Date.now();
       const fireDateObj = new Date(scheduledLocalTime);
@@ -724,6 +766,7 @@
       }
 
       scheduleFireTimer();  // v0.16: 用统一的辅助函数, 不再用单次长 setTimeout
+      isScheduling = false;  // v0.17: 调度完成
     });
   }
 
@@ -778,6 +821,7 @@
   }
 
   function cancelSchedule() {
+    isScheduling = false;  // v0.17: 中断进行中的调度
     if (scheduledTimerId) {
       clearTimeout(scheduledTimerId);
       scheduledTimerId = null;
@@ -939,7 +983,7 @@
     panel.id = 'mr-panel';
     panel.innerHTML = `
       <div class="h">
-        <span class="tt">📅 会议室自动抢订 v0.16</span>
+        <span class="tt">📅 会议室自动化 v0.18</span>
         <span class="tg" id="tg">−</span>
       </div>
       <div class="body" id="body">
@@ -1632,7 +1676,7 @@
       return;
     }
     buildUI();
-    log('✅ 会议室自动抢订 v0.16.0 已加载');
+    log('✅ 会议室自动抢订 v0.18.0 已加载');
     log(`📋 已配置 ${CONFIG.bookings.length} 个任务 / ${CONFIG.rooms.length} 个房间`);
 
     setTimeout(() => {
