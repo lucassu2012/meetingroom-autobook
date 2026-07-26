@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.13.4
+// @version      0.13.5
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.13.5 - 修复考试回顾页 (examResultId) 浮窗"白屏": (1) z-index 提到 2147483647, 不再被页面满屏水印层压住; (2) 关键视觉属性 (background/color/position/z-index/border/font) 全部加 !important, 抵抗页面和其它浏览器扩展 (如 YouMind) 注入的全局 CSS; (3) 新增透明基线规则, 防止 div{background:#fff!important} 类规则把浮窗内部刷白; (4) 样式注入改为 injectStylesRobust: GM_addStyle 失败自动降级到手动 <style>, 并在 1s/3s/8s 重新注入 (让我们的样式表永远排在页面后加载的样式表之后); (5) 启动 1.5s/5s 做样式自检, 发现被覆盖自动启用内联 !important 兜底并在日志里告警; (6) 自动遍历改为轮询等待 sidebar 最多 15 秒 (原固定 2 秒, 回顾页渲染慢会漏)。
 // v0.13.4 - 紧急修复 v0.13.0 引入的导入 bug: doImportFromCsvText 里 const qId = computeQId(stem, options) 写在 options 声明之前, 触发 temporal dead zone ReferenceError, 被 try-catch 捕获导致每行 skip. 现在调整顺序: 先解析 options 再算 qId. 同时加 Excel 大数字兼容: 导出 examId 用 \"=\"123...\"\" 包裹 (Excel 识别为文本公式不会科学计数法), 导入去壳.
 // v0.13.3 - 修复 4 个问题: (1) 启动迁移冲突时不再跳过, 改为合并 (选 status=done 优先 / 时间戳新优先), 清理 v0.13.2 留下的孤儿双份 entry; (2) 撤销自动 fillCourseContext 行为, 改为 cache 命中时按需补全 (新题自动带 courseName/examId, 旧题保持空白直到下次被命中); (3) CSV 导出题型规范化为中文 "单选题/多选题/判断题" (不再 multi/single); CSV 导入识别中文题型保留原值; (4) 移除 "🔧 修复" 按钮 + fixCacheInteractive / fillCourseContext / __fixCacheNow.
 // v0.13.2 - 修复 v0.13.0/v0.13.1 升级后两个问题: (1) 自动迁移旧 qId 公式 (脚本启动时静默扫描旧 cache, 用新公式重新算 qId 并改名, 保留所有 req+resp 数据, 解决"之前缓存的题被识别成新题"); (2) 新增"🔧 修复"按钮 (在导入按钮旁), 一键补全 KEY_REQ 缺失的 courseName/examId, 解决"导出 CSV 课程名空白". 旧 console 函数 __migrateLegacyCache 已弃用 (重命名为 __fixCacheNow 走同一逻辑).
@@ -75,6 +76,91 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     }
     return null;
   })();
+
+  /* ═══════════ v0.13.5: 健壮样式注入 (对抗页面/其它扩展的全局 CSS) ═══════════
+   * 背景: 部分 iLearning 页面 (如带 examResultId 的考试回顾页) 有满屏水印层 (z-index 最大值),
+   *       且用户可能装了别的浏览器扩展 (如 YouMind) 注入全局 !important CSS,
+   *       会把浮窗背景刷白 -> 看起来就是"白屏"。
+   * 对策: ① 样式表重复注入, 保证排在页面样式表之后
+   *       ② GM_addStyle 失败自动降级手动 <style>
+   *       ③ 启动后自检, 真被覆盖就上内联 !important 兜底
+   */
+  const __ilhStyleRegistry = new Map();
+
+  function __ilhReinjectStyle(id) {
+    const cssText = __ilhStyleRegistry.get(id);
+    if (!cssText) return false;
+    // 先移除旧的, 重新 append -> 我们的 <style> 永远是 <head> 里最后一个
+    try {
+      document.querySelectorAll('style[data-ilh-style="' + id + '"]').forEach((el) => el.remove());
+    } catch (e) { /* ignore */ }
+
+    let el = null;
+    try {
+      if (typeof GM_addStyle === 'function') el = GM_addStyle(cssText);
+    } catch (e) {
+      console.warn('[ILH-BRIDGE] GM_addStyle 失败, 降级手动 <style>:', e);
+    }
+    if (!el || !el.tagName) {
+      try {
+        el = document.createElement('style');
+        el.type = 'text/css';
+        el.appendChild(document.createTextNode(cssText));
+        (document.head || document.documentElement).appendChild(el);
+      } catch (e) {
+        console.warn('[ILH-BRIDGE] <style> 注入也失败了:', e);
+        return false;
+      }
+    }
+    try { el.setAttribute('data-ilh-style', id); } catch (e) { /* ignore */ }
+    return true;
+  }
+
+  function injectStylesRobust(id, cssText, delays) {
+    __ilhStyleRegistry.set(id, cssText);
+    const ok = __ilhReinjectStyle(id);
+    // 页面自身的 CSS / 其它扩展的 CSS 常常晚于我们加载, 补注入几次抢"最后一个"
+    (delays || [1000, 3000, 8000]).forEach((ms) => setTimeout(() => __ilhReinjectStyle(id), ms));
+    return ok;
+  }
+
+  /** 自检: 浮窗真的被我们的样式画出来了吗? */
+  function verifyPanelPainted(panelId) {
+    const el = document.getElementById(panelId);
+    if (!el) return { ok: false, reason: 'panel-missing' };
+    let cs;
+    try { cs = getComputedStyle(el); } catch (e) { return { ok: false, reason: 'computed-failed' }; }
+    const bg = String(cs.backgroundImage || '') + ' ' + String(cs.backgroundColor || '');
+    // 我们的背景是深色渐变; 只要既没渐变、又是透明/白色, 就判定被覆盖了
+    const hasGradient = bg.indexOf('gradient') >= 0;
+    const isBlank = /rgba?\(0,\s*0,\s*0,\s*0\)|transparent|rgb\(255,\s*255,\s*255\)/.test(bg) && !hasGradient;
+    return {
+      ok: cs.position === 'fixed' && hasGradient && !isBlank,
+      position: cs.position,
+      background: bg.trim().slice(0, 80),
+      zIndex: cs.zIndex,
+    };
+  }
+
+  /** 兜底: 直接把关键样式内联写死 (带 !important), 页面 CSS 再狠也压不住 */
+  function applyFallbackInlineStyles(pairs) {
+    let n = 0;
+    for (const [sel, css] of pairs) {
+      let nodes = [];
+      try { nodes = Array.from(document.querySelectorAll(sel)); } catch (e) { continue; }
+      for (const el of nodes) {
+        for (const decl of css.split(';')) {
+          const i = decl.indexOf(':');
+          if (i < 0) continue;
+          try {
+            el.style.setProperty(decl.slice(0, i).trim(), decl.slice(i + 1).trim(), 'important');
+            n++;
+          } catch (e) { /* ignore */ }
+        }
+      }
+    }
+    return n;
+  }
 
   // v0.13.4: Excel 兼容 - 把大数字包裹成 ="..." (Excel 当文本不科学计数法)
   function csvWrapBigNumber(s) {
@@ -605,13 +691,22 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
 
       async start() {
         if (this.active) return;
-        // 等 sidebar 完全渲染
-        await sleep(2000);
-        const items = StatusDot.findSidebarItems();
+        // v0.13.5: 轮询等 sidebar 渲染 —— 原来固定 sleep 2s, 考试回顾页 (examResultId)
+        // 的 Vue 渲染更慢, 2s 时 sidebar 还是空的, 自动遍历就被永久跳过了。
+        let items = new Map();
+        const deadline = Date.now() + 15000;
+        let waited = 0;
+        while (Date.now() < deadline) {
+          await sleep(800);
+          waited += 800;
+          items = StatusDot.findSidebarItems();
+          if (items.size > 0) break;
+        }
         if (items.size === 0) {
-          log('⚠️ 未识别到 sidebar 题项, 跳过自动遍历 (你也许在非考试页面)', 'warn');
+          log('⚠️ 未识别到 sidebar 题项 (已重试 15 秒), 跳过自动遍历 (你也许在非考试页面)', 'warn');
           return;
         }
+        if (waited > 2400) log(`⏳ sidebar 渲染较慢, 等了 ${(waited / 1000).toFixed(1)}s 才就绪`, 'debug');
         const positions = Array.from(items.keys()).sort((a, b) => a - b);
         this.active = true;
         this.cancelled = false;
@@ -956,20 +1051,38 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       }
     }
 
-    // === STYLES ===
-    GM_addStyle(`
+injectStylesRobust('ilh', `
+      /* v0.13.5: 透明基线 —— 防止页面/其它扩展的 div{background:#fff!important} 把浮窗内部刷白。
+         写在最前面, 后面各模块自己的背景色会正常覆盖它。 */
+      #ilh-panel .ilh-meta,
+      #ilh-panel .ilh-options,
+      #ilh-panel .ilh-stem,
+      #ilh-panel .ilh-explain-header,
+      #ilh-panel .ilh-explain-actions,
+      #ilh-panel .ilh-verify-bar,
+      #ilh-panel .ilh-overview-header,
+      #ilh-panel .ilh-overview-legend,
+      #ilh-panel #ilh-overview-grid-content,
+      #ilh-panel #ilh-question,
+      #ilh-panel .ilh-log-entry,
+      #ilh-panel span,
+      #ilh-panel label,
+      #ilh-panel div:not([id]):not([class]) {
+        background-color: transparent !important;
+      }
+
       #ilh-panel {
-        position: fixed; bottom: 24px; right: 24px;
+        position: fixed !important; bottom: 24px; right: 24px;
         width: ${CONFIG.panelWidth}px;
         /* v0.12.8: 固定高度, 不随内容变化伸缩 */
         height: min(${CONFIG.panelMaxHeight}px, calc(100vh - 48px));
-        background: linear-gradient(135deg, #1a1d2e 0%, #232842 100%);
-        color: #e8eaf6;
-        font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+        background: linear-gradient(135deg, #1a1d2e 0%, #232842 100%) !important;
+        color: #e8eaf6 !important;
+        font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif !important;
         font-size: 13px;
-        border-radius: 12px;
-        box-shadow: 0 12px 40px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,255,255,0.06);
-        z-index: 2147483646;
+        border-radius: 12px !important;
+        box-shadow: 0 12px 40px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,255,255,0.06) !important;
+        z-index: 2147483647 !important;
         overflow: hidden;
         display: flex; flex-direction: column;
         transition: height 0.25s ease;
@@ -985,9 +1098,9 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
 
       /* v0.8.1: overview grid - 暗色系, 与浮窗一致 */
       #ilh-overview-grid {
-        background: rgba(255,255,255,0.03);
-        border: 1px solid rgba(255,255,255,0.06);
-        border-radius: 6px;
+        background: rgba(255,255,255,0.03) !important;
+        border: 1px solid rgba(255,255,255,0.06) !important;
+        border-radius: 6px !important;
         padding: 7px 10px 9px;
         margin: 8px 12px 0;
         font-size: 11px;
@@ -995,14 +1108,14 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       .ilh-overview-header {
         display: flex; justify-content: space-between; align-items: center;
         margin-bottom: 6px;
-        color: #b0bec5;
+        color: #b0bec5 !important;
         font-weight: 500;
         font-size: 11px;
       }
-      .ilh-overview-legend { font-size: 9.5px; color: #78909c; }
+      .ilh-overview-legend { font-size: 9.5px; color: #78909c !important; }
       .ilh-overview-legend span { margin-right: 7px; }
       .ilh-overview-legend i {
-        display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+        display: inline-block; width: 7px; height: 7px; border-radius: 50% !important;
         margin-right: 3px; vertical-align: middle;
       }
       #ilh-overview-grid-content {
@@ -1015,9 +1128,9 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         align-items: center;
         justify-content: center;
         height: 18px;
-        border-radius: 3px;
+        border-radius: 3px !important;
         background: #4a5568;
-        color: rgba(255,255,255,0.85);
+        color: rgba(255,255,255,0.85) !important;
         font-size: 9px;
         font-weight: 600;
         cursor: pointer;
@@ -1026,8 +1139,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       }
       .ilh-grid-dot:hover {
         transform: scale(1.18);
-        box-shadow: 0 2px 6px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.18);
-        z-index: 2;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.18) !important;
+        z-index: 2 !important;
       }
       .ilh-grid-dot.pending { animation: ilh-pulse 1.2s ease-in-out infinite; }
 
@@ -1036,62 +1149,62 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         margin-left: 8px;
         padding: 2px 8px;
         font-size: 10px;
-        color: #fbbf24;
-        background: rgba(251,191,36,0.12);
-        border-radius: 10px;
+        color: #fbbf24 !important;
+        background: rgba(251,191,36,0.12) !important;
+        border-radius: 10px !important;
         font-weight: 500;
         animation: ilh-pulse 1.6s ease-in-out infinite;
       }
       .ilh-traverse-cancel-btn {
         margin-left: 5px;
         padding: 1px 6px;
-        background: rgba(239,68,68,0.2);
-        color: #fca5a5;
-        border: 1px solid rgba(239,68,68,0.3);
-        border-radius: 3px;
+        background: rgba(239,68,68,0.2) !important;
+        color: #fca5a5 !important;
+        border: 1px solid rgba(239,68,68,0.3) !important;
+        border-radius: 3px !important;
         cursor: pointer;
         font-size: 10px;
         line-height: 1.2;
         transition: background 0.15s;
       }
       .ilh-traverse-cancel-btn:hover {
-        background: rgba(239,68,68,0.4);
-        color: #fff;
+        background: rgba(239,68,68,0.4) !important;
+        color: #fff !important;
       }
       #ilh-header {
         padding: 11px 14px;
-        background: rgba(0,0,0,0.28);
+        background: rgba(0,0,0,0.28) !important;
         display: flex; align-items: center; gap: 8px;
         cursor: move;
         user-select: none;
-        border-bottom: 1px solid rgba(255,255,255,0.06);
+        border-bottom: 1px solid rgba(255,255,255,0.06) !important;
       }
       .ilh-dot {
-        width: 8px; height: 8px; border-radius: 50%;
+        width: 8px; height: 8px; border-radius: 50% !important;
         background: #4caf50;
-        box-shadow: 0 0 8px #4caf50;
+        box-shadow: 0 0 8px #4caf50 !important;
       }
-      .ilh-dot.idle { background: #888; box-shadow: none; }
-      .ilh-dot.error { background: #f44336; box-shadow: 0 0 8px #f44336; }
-      .ilh-dot.warn  { background: #ff9800; box-shadow: 0 0 8px #ff9800; }
-      .ilh-dot.busy { background: #2196f3; box-shadow: 0 0 8px #2196f3; animation: ilh-pulse 1.2s infinite; }
+      .ilh-dot.idle { background: #888; box-shadow: none !important; }
+      .ilh-dot.error { background: #f44336; box-shadow: 0 0 8px #f44336 !important; }
+      .ilh-dot.warn  { background: #ff9800; box-shadow: 0 0 8px #ff9800 !important; }
+      .ilh-dot.busy { background: #2196f3; box-shadow: 0 0 8px #2196f3 !important; animation: ilh-pulse 1.2s infinite; }
       @keyframes ilh-pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
 
       .ilh-title { flex: 1; font-weight: 600; letter-spacing: 0.3px; }
       .ilh-stage {
         font-size: 10px; opacity: 0.65;
         padding: 2px 7px;
-        background: rgba(255,255,255,0.07);
-        border-radius: 4px;
+        background: rgba(255,255,255,0.07) !important;
+        border-radius: 4px !important;
       }
-      .ilh-toggle { cursor: pointer; padding: 2px 6px; opacity: 0.5; font-family: monospace; }
+      .ilh-toggle { cursor: pointer; padding: 2px 6px; opacity: 0.5; font-family: monospace !important; }
       .ilh-toggle:hover { opacity: 1; }
 
       /* v0.8.1: batch-panel 单行紧凑布局 */
       #ilh-batch-panel {
         padding: 8px 12px;
-        border-bottom: 1px solid rgba(255,255,255,0.06);
-        background: rgba(33,150,243,0.04);
+        border-bottom: 1px solid rgba(255,255,255,0.06) !important;
+        background: rgba(33,150,243,0.04) !important;
         font-size: 11px;
         display: flex;
         align-items: center;
@@ -1114,10 +1227,10 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       }
       .ilh-batch-config input {
         width: 44px; padding: 2px 4px;
-        background: rgba(0,0,0,0.28);
-        color: #e8eaf6;
-        border: 1px solid rgba(255,255,255,0.15);
-        border-radius: 3px;
+        background: rgba(0,0,0,0.28) !important;
+        color: #e8eaf6 !important;
+        border: 1px solid rgba(255,255,255,0.15) !important;
+        border-radius: 3px !important;
         font-size: 11px;
         text-align: center;
       }
@@ -1147,40 +1260,40 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       }
       .ilh-meta { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; align-items: center; }
       .ilh-pill.cache-count {
-        background: rgba(34,197,94,0.16);
-        color: #86efac;
+        background: rgba(34,197,94,0.16) !important;
+        color: #86efac !important;
         cursor: pointer;
         margin-left: auto;
       }
       .ilh-pill.cache-count:hover { background: rgba(34,197,94,0.28); }
       .ilh-pill {
         font-size: 10px; padding: 2px 7px;
-        border-radius: 10px;
-        background: rgba(33,150,243,0.18);
-        color: #90caf9;
+        border-radius: 10px !important;
+        background: rgba(33,150,243,0.18) !important;
+        color: #90caf9 !important;
       }
-      .ilh-pill.position { background: rgba(255,193,7,0.18); color: #ffd54f; }
+      .ilh-pill.position { background: rgba(255,193,7,0.18); color: #ffd54f !important; }
       .ilh-stem {
         font-size: 13px; line-height: 1.55;
         margin-bottom: 8px;
-        color: #f0f3ff;
+        color: #f0f3ff !important;
       }
       .ilh-options { display: flex; flex-direction: column; gap: 5px; }
       .ilh-option {
         font-size: 12px;
         padding: 6px 10px;
-        background: rgba(255,255,255,0.04);
-        border-radius: 5px;
+        background: rgba(255,255,255,0.04) !important;
+        border-radius: 5px !important;
         line-height: 1.45;
       }
-      .ilh-option-letter { font-weight: 600; color: #64b5f6; margin-right: 6px; }
+      .ilh-option-letter { font-weight: 600; color: #64b5f6 !important; margin-right: 6px; }
 
       #ilh-explain {
         /* v0.12.9: 不强制 flex column, 用 normal flow + flex-shrink: 0 (整体高度由内部子元素累加, 但 explain-content 是固定高度的) */
         flex-shrink: 0;
         padding: 12px 14px;
-        border-top: 1px solid rgba(255,255,255,0.06);
-        background: rgba(0,0,0,0.18);
+        border-top: 1px solid rgba(255,255,255,0.06) !important;
+        background: rgba(0,0,0,0.18) !important;
       }
       .ilh-explain-header {
         display: flex; justify-content: space-between; align-items: center;
@@ -1190,13 +1303,13 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       .ilh-explain-content {
         /* v0.12.9: 固定高度 210px (解析模块尺寸稳定, 不论内容多少都不撑大) */
         height: 210px;
-        background: rgba(34,197,94,0.07);
-        border-left: 2px solid #22c55e;
+        background: rgba(34,197,94,0.07) !important;
+        border-left: 2px solid #22c55e !important;
         padding: 10px 12px;
-        border-radius: 5px;
+        border-radius: 5px !important;
         font-size: 12px;
         line-height: 1.6;
-        color: #e8f5e9;
+        color: #e8f5e9 !important;
         white-space: pre-wrap;
         word-break: break-word;
         overflow-y: auto;
@@ -1204,14 +1317,14 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       }
       .ilh-explain-content.waiting {
         border-left-color: #2196f3;
-        background: rgba(33,150,243,0.07);
-        color: #90caf9;
+        background: rgba(33,150,243,0.07) !important;
+        color: #90caf9 !important;
         font-style: italic;
       }
       .ilh-explain-content.error {
         border-left-color: #ef4444;
-        background: rgba(239,68,68,0.07);
-        color: #fca5a5;
+        background: rgba(239,68,68,0.07) !important;
+        color: #fca5a5 !important;
       }
       /* v0.12.5: 答案核对栏 */
       .ilh-verify-bar {
@@ -1220,45 +1333,45 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         margin-top: 4px;
         font-size: 11px;
       }
-      .ilh-verify-label { opacity: 0.7; color: #94a3b8; }
+      .ilh-verify-label { opacity: 0.7; color: #94a3b8 !important; }
       .ilh-verify-btn {
         padding: 3px 9px;
-        border-radius: 11px;
+        border-radius: 11px !important;
         font-size: 11px;
-        background: rgba(255,255,255,0.05);
-        border: 1px solid rgba(255,255,255,0.10);
-        color: #cbd5e1;
+        background: rgba(255,255,255,0.05) !important;
+        border: 1px solid rgba(255,255,255,0.10) !important;
+        color: #cbd5e1 !important;
         cursor: pointer;
         transition: all 0.15s;
       }
       .ilh-verify-btn:hover { background: rgba(255,255,255,0.10); }
       .ilh-verify-btn.active[data-state="correct"] {
-        background: #22c55e; border-color: #22c55e; color: #fff;
+        background: #22c55e !important; border-color: #22c55e !important; color: #fff !important;
       }
       .ilh-verify-btn.active[data-state="incorrect"] {
-        background: #ef4444; border-color: #ef4444; color: #fff;
+        background: #ef4444 !important; border-color: #ef4444 !important; color: #fff !important;
       }
       .ilh-verify-btn.active[data-state="unverified"] {
-        background: rgba(148,163,184,0.3); border-color: #94a3b8; color: #fff;
+        background: rgba(148,163,184,0.3) !important; border-color: #94a3b8 !important; color: #fff !important;
       }
 
       /* v0.12.2: 选项重排警告 */
       .ilh-remap-warning {
-        background: rgba(251,191,36,0.08);
-        border-left: 2px solid #fbbf24;
+        background: rgba(251,191,36,0.08) !important;
+        border-left: 2px solid #fbbf24 !important;
         padding: 8px 11px;
         margin-bottom: 9px;
-        border-radius: 4px;
+        border-radius: 4px !important;
         font-size: 11.5px;
       }
       .ilh-remap-title {
-        color: #fde68a;
+        color: #fde68a !important;
         font-weight: 600;
         margin-bottom: 4px;
       }
       .ilh-remap-details summary {
         cursor: pointer;
-        color: #94a3b8;
+        color: #94a3b8 !important;
         font-size: 10.5px;
         padding: 1px 0;
         opacity: 0.85;
@@ -1270,24 +1383,24 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         padding: 1px 0 1px 12px;
         line-height: 1.6;
       }
-      .ilh-remap-orig { color: #94a3b8; font-family: "SF Mono", monospace; }
+      .ilh-remap-orig { color: #94a3b8; font-family: "SF Mono", monospace !important; }
       .ilh-remap-arrow { color: #fbbf24; margin-left: 6px; }
       .ilh-remap-arrow b { color: #fde68a; font-size: 12px; }
       .ilh-remap-same { color: #6b7280; font-size: 10px; margin-left: 6px; }
 
       .ilh-explain-content[contenteditable="true"] {
         outline: none;
-        background: rgba(33,150,243,0.05);
+        background: rgba(33,150,243,0.05) !important;
         border-left-color: #2196f3;
         cursor: text;
       }
       .ilh-mini-btn.ilh-btn-primary {
-        background: #2196f3;
-        border-color: #2196f3;
-        color: #fff;
+        background: #2196f3 !important;
+        border-color: #2196f3 !important;
+        color: #fff !important;
       }
       .ilh-mini-btn.ilh-btn-primary:hover {
-        background: #1e88e5;
+        background: #1e88e5 !important;
       }
       .ilh-explain-actions {
         display: flex; gap: 6px; margin-top: 8px;
@@ -1296,12 +1409,12 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       .ilh-mini-btn {
         padding: 4px 9px;
         font-size: 11px;
-        background: rgba(255,255,255,0.06);
-        border: 1px solid rgba(255,255,255,0.10);
-        color: #e8eaf6;
-        border-radius: 4px;
+        background: rgba(255,255,255,0.06) !important;
+        border: 1px solid rgba(255,255,255,0.10) !important;
+        color: #e8eaf6 !important;
+        border-radius: 4px !important;
         cursor: pointer;
-        font-family: inherit;
+        font-family: inherit !important;
         transition: background 0.15s;
       }
       .ilh-mini-btn:hover { background: rgba(255,255,255,0.13); }
@@ -1311,8 +1424,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         flex: 1;
         min-height: 80px;
         display: flex; flex-direction: column;
-        border-top: 1px solid rgba(255,255,255,0.06);
-        background: rgba(0,0,0,0.20);
+        border-top: 1px solid rgba(255,255,255,0.06) !important;
+        background: rgba(0,0,0,0.20) !important;
       }
       #ilh-log-section > #ilh-log-header { flex-shrink: 0; }
       #ilh-log-section > #ilh-log {
@@ -1331,7 +1444,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       #ilh-log {
         padding: 0 14px 10px;
         overflow-y: auto;
-        font-family: "SF Mono", Monaco, Consolas, monospace;
+        font-family: "SF Mono", Monaco, Consolas, monospace !important;
         font-size: 10.5px;
         line-height: 1.55;
       }
@@ -1363,14 +1476,14 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       }
       .ilh-explain-content strong {
         font-weight: 600;
-        color: #fff;
+        color: #fff !important;
       }
       .ilh-explain-content em { font-style: italic; }
 
       #ilh-empty {
         padding: 20px 14px;
         text-align: center;
-        color: #90a4ae;
+        color: #90a4ae !important;
         font-size: 12px;
       }
       .ilh-hint {
@@ -3005,6 +3118,48 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     buildPanel();
     log(`✅ iLearning 端 v${VERSION} 已加载`, 'success');
 
+    /* v0.13.5: 样式自检 —— 有些页面 (如带 examResultId 的考试回顾页) 有满屏水印层,
+       用户也可能装了别的浏览器扩展注入全局 !important CSS, 会把浮窗刷成"白屏"。
+       这里在 1.5s / 5s 各查一次, 真被覆盖就上内联兜底并告警。 */
+    const ILH_FALLBACK_STYLES = [
+      ['#ilh-panel', 'position:fixed;background:linear-gradient(135deg,#1a1d2e 0%,#232842 100%);background-color:#1a1d2e;color:#e8eaf6;border-radius:12px;overflow:hidden;z-index:2147483647;box-shadow:0 12px 40px rgba(0,0,0,0.45)'],
+      ['#ilh-header', 'background-color:#12141f;color:#e8eaf6;border-bottom:1px solid rgba(255,255,255,0.08)'],
+      ['#ilh-batch-panel', 'background-color:#1b2136;color:#e8eaf6;border-bottom:1px solid rgba(255,255,255,0.08)'],
+      ['#ilh-overview-grid', 'background-color:#20253c;color:#b0bec5;border:1px solid rgba(255,255,255,0.08)'],
+      ['#ilh-question', 'background-color:transparent;color:#e8eaf6'],
+      ['#ilh-explain', 'background-color:#161927;color:#e8eaf6;border-top:1px solid rgba(255,255,255,0.08)'],
+      ['#ilh-log-section', 'background-color:#12141f;color:#b0bec5;border-top:1px solid rgba(255,255,255,0.08)'],
+      ['#ilh-log', 'color:#b0bec5'],
+      ['.ilh-stem', 'color:#f0f3ff;background-color:transparent'],
+      ['.ilh-option', 'background-color:#262c44;color:#e8eaf6'],
+      ['.ilh-title', 'color:#e8eaf6;background-color:transparent'],
+      ['.ilh-explain-content', 'color:#e8f5e9'],
+      ['.ilh-mini-btn', 'background-color:#2b3250;color:#e8eaf6;border:1px solid rgba(255,255,255,0.12)'],
+    ];
+
+    let __ilhStyleFixed = false;
+    function ilhStyleSelfCheck(tag) {
+      if (__ilhStyleFixed) return;
+      const v = verifyPanelPainted('ilh-panel');
+      if (v.ok) {
+        log(`✓ 样式自检通过 [${tag}] (z-index=${v.zIndex})`, 'debug');
+        return;
+      }
+      if (v.reason === 'panel-missing') return;
+      log(`⚠️ 浮窗样式被页面覆盖 [${tag}]: position=${v.position}, background=${v.background}`, 'warn');
+      __ilhReinjectStyle('ilh');
+      const again = verifyPanelPainted('ilh-panel');
+      if (again.ok) {
+        log('🛡 重新注入样式表后已恢复正常', 'success');
+        return;
+      }
+      const n = applyFallbackInlineStyles(ILH_FALLBACK_STYLES);
+      __ilhStyleFixed = true;
+      log(`🛡 已强制内联 ${n} 条兜底样式 (可能是页面水印层或其它浏览器扩展的全局 CSS 导致)`, 'success');
+    }
+    setTimeout(() => ilhStyleSelfCheck('1.5s'), 1500);
+    setTimeout(() => ilhStyleSelfCheck('5s'), 5000);
+
     // v0.13.3: 启动时静默执行 qId 迁移 + 去重 (修复 v0.13.2 留下的孤儿)
     try {
       const mig = migrateLegacyQIds();
@@ -3136,74 +3291,84 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       currentRequest: null,
     };
 
-    GM_addStyle(`
+injectStylesRobust('nlh', `
+      /* v0.13.5: 透明基线 (同 iLearning 端) */
+      #nlh-panel .nlh-current-title,
+      #nlh-panel .nlh-stat-label,
+      #nlh-panel .nlh-log-entry,
+      #nlh-panel #nlh-current,
+      #nlh-panel span,
+      #nlh-panel label {
+        background-color: transparent !important;
+      }
+
       #nlh-panel {
-        position: fixed; bottom: 24px; right: 24px;
+        position: fixed !important; bottom: 24px; right: 24px;
         width: ${CONFIG.panelWidth}px;
         max-height: ${CONFIG.panelMaxHeight}px;
-        background: linear-gradient(135deg, #1a2e2a 0%, #1f3a3f 100%);
-        color: #e0f2f1;
-        font-family: -apple-system, "Segoe UI", "PingFang SC", sans-serif;
+        background: linear-gradient(135deg, #1a2e2a 0%, #1f3a3f 100%) !important;
+        color: #e0f2f1 !important;
+        font-family: -apple-system, "Segoe UI", "PingFang SC", sans-serif !important;
         font-size: 13px;
-        border-radius: 12px;
-        box-shadow: 0 12px 40px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,255,255,0.06);
-        z-index: 2147483646;
+        border-radius: 12px !important;
+        box-shadow: 0 12px 40px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,255,255,0.06) !important;
+        z-index: 2147483647 !important;
         overflow: hidden;
         display: flex; flex-direction: column;
       }
       #nlh-panel.collapsed { max-height: 44px; }
       #nlh-header {
         padding: 11px 14px;
-        background: rgba(0,0,0,0.28);
+        background: rgba(0,0,0,0.28) !important;
         display: flex; align-items: center; gap: 8px;
         cursor: move;
         user-select: none;
-        border-bottom: 1px solid rgba(255,255,255,0.06);
+        border-bottom: 1px solid rgba(255,255,255,0.06) !important;
       }
       .nlh-dot {
-        width: 8px; height: 8px; border-radius: 50%;
+        width: 8px; height: 8px; border-radius: 50% !important;
         background: #26a69a;
-        box-shadow: 0 0 8px #26a69a;
+        box-shadow: 0 0 8px #26a69a !important;
       }
-      .nlh-dot.idle { background: #888; box-shadow: none; }
-      .nlh-dot.busy { background: #ffb300; box-shadow: 0 0 8px #ffb300; animation: nlh-pulse 1.2s infinite; }
-      .nlh-dot.error { background: #f44336; box-shadow: 0 0 8px #f44336; }
+      .nlh-dot.idle { background: #888; box-shadow: none !important; }
+      .nlh-dot.busy { background: #ffb300; box-shadow: 0 0 8px #ffb300 !important; animation: nlh-pulse 1.2s infinite; }
+      .nlh-dot.error { background: #f44336; box-shadow: 0 0 8px #f44336 !important; }
       @keyframes nlh-pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
       .nlh-title { flex: 1; font-weight: 600; }
       .nlh-stage {
         font-size: 10px; opacity: 0.65;
         padding: 2px 7px;
-        background: rgba(255,255,255,0.07);
-        border-radius: 4px;
+        background: rgba(255,255,255,0.07) !important;
+        border-radius: 4px !important;
       }
-      .nlh-toggle { cursor: pointer; padding: 2px 6px; opacity: 0.5; font-family: monospace; }
+      .nlh-toggle { cursor: pointer; padding: 2px 6px; opacity: 0.5; font-family: monospace !important; }
       .nlh-toggle:hover { opacity: 1; }
 
       #nlh-status {
         padding: 11px 14px;
         font-weight: 500;
-        border-left: 3px solid #26a69a;
-        background: rgba(38,166,154,0.10);
+        border-left: 3px solid #26a69a !important;
+        background: rgba(38,166,154,0.10) !important;
       }
-      #nlh-status.idle  { border-left-color: #666; background: rgba(255,255,255,0.03); opacity: 0.75; }
-      #nlh-status.busy  { border-left-color: #ffb300; background: rgba(255,179,0,0.10); }
-      #nlh-status.error { border-left-color: #f44336; background: rgba(244,67,54,0.10); }
+      #nlh-status.idle  { border-left-color: #666; background: rgba(255,255,255,0.03) !important; opacity: 0.75; }
+      #nlh-status.busy  { border-left-color: #ffb300; background: rgba(255,179,0,0.10) !important; }
+      #nlh-status.error { border-left-color: #f44336; background: rgba(244,67,54,0.10) !important; }
 
       #nlh-stats {
         padding: 10px 14px;
         display: grid;
         grid-template-columns: repeat(3, 1fr);
         gap: 8px;
-        border-bottom: 1px solid rgba(255,255,255,0.06);
+        border-bottom: 1px solid rgba(255,255,255,0.06) !important;
       }
       .nlh-stat {
         text-align: center;
         padding: 6px;
-        background: rgba(255,255,255,0.03);
-        border-radius: 4px;
+        background: rgba(255,255,255,0.03) !important;
+        border-radius: 4px !important;
       }
       .nlh-stat-num {
-        font-size: 18px; font-weight: 600; color: #80cbc4;
+        font-size: 18px; font-weight: 600; color: #80cbc4 !important;
       }
       .nlh-stat-label {
         font-size: 10px; opacity: 0.7;
@@ -3222,8 +3387,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       .nlh-current-content {
         font-size: 12px; line-height: 1.5;
         padding: 8px 10px;
-        background: rgba(255,255,255,0.04);
-        border-radius: 4px;
+        background: rgba(255,255,255,0.04) !important;
+        border-radius: 4px !important;
         white-space: pre-wrap;
         word-break: break-word;
         max-height: 130px;
@@ -3237,10 +3402,10 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       .nlh-btn {
         flex: 1;
         padding: 6px 10px;
-        background: rgba(255,255,255,0.06);
-        color: #e0f2f1;
-        border: 1px solid rgba(255,255,255,0.1);
-        border-radius: 5px;
+        background: rgba(255,255,255,0.06) !important;
+        color: #e0f2f1 !important;
+        border: 1px solid rgba(255,255,255,0.1) !important;
+        border-radius: 5px !important;
         font-size: 11px;
         cursor: pointer;
       }
@@ -3248,7 +3413,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       .nlh-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
       #nlh-log-section {
-        border-top: 1px solid rgba(255,255,255,0.06);
+        border-top: 1px solid rgba(255,255,255,0.06) !important;
         display: flex; flex-direction: column;
       }
       #nlh-log-header {
@@ -3263,7 +3428,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         padding: 0 14px 10px;
         overflow-y: auto;
         font-size: 11px;
-        font-family: "SF Mono", Monaco, Consolas, monospace;
+        font-family: "SF Mono", Monaco, Consolas, monospace !important;
         line-height: 1.55;
         max-height: 140px;
       }
