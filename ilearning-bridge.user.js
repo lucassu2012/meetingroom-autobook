@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.14.3
+// @version      0.15.0
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.15.0 - 【白屏根治】把浮窗整体迁入 <iframe>。决定性实测: 用浮窗的真实 HTML + 真实 CSS 在 iframe 里原样重建 → 完整深色渲染, 而同一时刻宿主页面里的真实浮窗仍是白的。机制报告排除了合成层超限(动画元素 1 / will-change 0 / fixed 10)、水印层干扰(pointer-events:none, 无混合/滤镜/变换)、浮窗过复杂(139 节点) —— 根因是 Chromium 在该页面上的合成缺陷, 页面内无法规避。iframe 是浏览器里唯一真正独立的渲染单元, 宿主的合成状态影响不到它内部。改造: 面板 DOM 与样式全部写入 iframe 文档; 新增 PD() 统一取面板文档, 全部面板 DOM 调用改走 PD(); 拖动与键盘拦截同时监听宿主与 iframe 两个文档; sidebar 状态灯仍注入 iLearning 自身 DOM。
 // v0.14.3 - 【白屏缓解】实测证明浮窗在问题页面上【能】正常渲染: 运行七变体诊断脚本(一次创建 7 个 fixed 容器 + 克隆大量 DOM)之后, 真实浮窗自己恢复了深色显示。同时变体的黑白状态几秒内会互相变化, 说明这不是某个 CSS 属性的固定缺陷, 而是该页面上合成器状态不稳定(谁先画、谁卡住取决于时序), 此前想找'那一个属性'的方向是错的。对策: 把实测有效的动作(大规模重排)做成自动机制 forceRepaintStorm() —— 反复创建/移除屏幕外的临时 fixed 元素并强制同步布局, 在浮窗建好后的 2s/5s/10s/20s 各跑一次; 另提供 __ilhKick() 手动触发。对正常页面无副作用(临时元素在屏幕外, 毫秒级)。
 // v0.14.2 - 【白屏真正修复】四探针对照实测: 新建独立 fixed 容器 (只有内容那么大) 里的块全部正常渲染 (P2 绿 187080px / P3 蓝 890766px / P4 橙 34320px), 而放进 v0.14.0 引入的 #ilh-root 里的块只剩 277px 边缘轮廓 = 没渲染。元凶是 #ilh-root 用了 width:100vw; height:100vh 【铺满整个视口】—— Chromium 对这种全屏透明遮罩层的合成优化会导致其子元素不绘制 (此前 100vw×210px 的实验条里的块全部正常, 印证了'铺满全屏'才是触发条件)。改法: 根容器改为只包住浮窗 (right/bottom 定位, 尺寸由内容决定), 去掉 100vw/100vh、pointer-events:none 和 flex 对齐; 拖动改为移动根容器的 transform, 浮窗自身不带任何变换, 完全等同于实测通过的 P2/P4 形态。同时纠正 v0.14.0 的一个错误结论: '偏移定位的 fixed 元素画不出背景' 是错的 (当时实验 B 用了过期 rect 导致定位错乱), P2/P4 已证伪。
 // v0.14.1 - 逃出水印层: 页面有一个防截屏水印 div (随机数字 id, 铺满全屏, z-index 最大, 挂在 body 里, 带防篡改自动重挂)。它与浮窗同 z-index 且在 DOM 里更靠后 → 画在浮窗上方; 若其带 backdrop-filter, Chromium 会对其下方的独立合成层做快照过滤, 已知会导致下方 fixed 元素渲染成空白 (对照实验中排在它后面的元素全部正常, 排在它前面的全部空白, 完全吻合)。水印是公司安全功能不可移除, 改为逃逸: 根容器 #ilh-root/#nlh-root 从挂 body 改为挂 <html> 上 (排在 <body> 之后) —— 同 z-index 下 DOM 靠后者画在上面, 且不在水印防篡改脚本监视的 body 里, 不会发生互相抢位。看门狗同步改为保证根容器始终是 <html> 的最后一个子节点。诊断日志补充打印遮挡元素的 backgroundImage / backdropFilter。
@@ -812,11 +813,11 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
 
       // 浮窗 overview grid - 4 行 x 10 列 = 40 个小点
       buildOverviewGrid(total = 40) {
-        const container = document.getElementById('ilh-overview-grid-content');
+        const container = PD().getElementById('ilh-overview-grid-content');
         if (!container) return;
         container.innerHTML = '';
         for (let i = 1; i <= total; i++) {
-          const dot = document.createElement('span');
+          const dot = PD().createElement('span');   // v0.15.0: 面板内元素必须由 iframe 文档创建
           dot.className = 'ilh-grid-dot';
           dot.dataset.pos = String(i);
           dot.title = `第 ${i} 题: ⚫ 未开始`;
@@ -849,7 +850,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         }
 
         // overview grid dot
-        const gridDot = document.querySelector(`.ilh-grid-dot[data-pos="${position}"]`);
+        const gridDot = PD().querySelector(`.ilh-grid-dot[data-pos="${position}"]`);
         if (gridDot) {
           gridDot.style.background = color;
           gridDot.title = label;
@@ -1084,8 +1085,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       },
 
       updateUI() {
-        const ind = document.getElementById('ilh-traverse-indicator');
-        const btn = document.getElementById('ilh-traverse-cancel');
+        const ind = PD().getElementById('ilh-traverse-indicator');
+        const btn = PD().getElementById('ilh-traverse-cancel');
         if (!ind) return;
         if (this.active) {
           ind.textContent = `🤖 ${this.visited}/${this.total}` + (this.currentPos ? ` (第 ${this.currentPos} 题)` : '');
@@ -1276,8 +1277,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
 
     function updateBatchPanel() {
       // v0.8.1: 大幅简化 - 状态只通过 button disabled + grid 颜色表达, 不再渲染文字
-      const startBtn = document.getElementById('ilh-batch-start');
-      const panelEl = document.getElementById('ilh-batch-panel');
+      const startBtn = PD().getElementById('ilh-batch-start');
+      const panelEl = PD().getElementById('ilh-batch-panel');
       if (!startBtn || !panelEl) return;
 
       panelEl.classList.toggle('disabled', !batchState.enabled);
@@ -1316,7 +1317,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       }
     }
 
-injectStylesRobust('ilh', `
+// v0.15.0: 这一大段是【浮窗内部】样式, 写进 iframe 文档; 宿主只注入下面那一小段
+    const ILH_PANEL_CSS = `
       /* v0.13.5: 透明基线 —— 防止页面/其它扩展的 div{background:#fff!important} 把浮窗内部刷白。
          写在最前面, 后面各模块自己的背景色会正常覆盖它。 */
       #ilh-panel .ilh-meta,
@@ -1780,6 +1782,28 @@ injectStylesRobust('ilh', `
       .ilh-sidebar-dot {
         flex-shrink: 0;
       }
+    `;
+
+    /* v0.15.0: 宿主页面只需要这三条 —— 根容器、iframe 本身、注入到 iLearning 侧边栏的状态灯 */
+    injectStylesRobust('ilh', `
+      #ilh-root {
+        position: fixed !important;
+        right: 24px !important;
+        bottom: 24px !important;
+        z-index: 2147483647 !important;
+        background: transparent !important;
+        line-height: 0 !important;
+      }
+      #ilh-frame {
+        border: none !important;
+        background: transparent !important;
+        display: block !important;
+        width: ${CONFIG.panelWidth}px !important;
+        height: min(${CONFIG.panelMaxHeight}px, calc(100vh - 48px)) !important;
+        color-scheme: normal !important;
+      }
+      #ilh-frame.collapsed { height: 44px !important; }
+      .ilh-sidebar-dot { flex-shrink: 0; }
     `);
 
     // === Markdown 渲染 (v0.5.6) ===
@@ -1841,9 +1865,9 @@ injectStylesRobust('ilh', `
     // === LOG ===
     function log(msg, type = 'info') {
       const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-      const logEl = document.getElementById('ilh-log');
+      const logEl = PD().getElementById('ilh-log');
       if (logEl) {
-        const entry = document.createElement('div');
+        const entry = PD().createElement('div');    // v0.15.0: 同上
         entry.className = `ilh-log-entry ilh-log-${type}`;
         setSafeHTML(entry, `<span class="ilh-log-time">${time}</span>${escapeHtml(msg)}`);
         logEl.appendChild(entry);
@@ -2213,8 +2237,34 @@ injectStylesRobust('ilh', `
     }
 
     // === UI ===
+    /* v0.15.0: 浮窗活在 iframe 文档里, 所有面板 DOM 操作都要走 PD() */
+    let ILH_DOC = null;
+    const PD = () => ILH_DOC || document;
+
     function buildPanel() {
-      const panel = document.createElement('div');
+      // ① 宿主页面里只留根容器 + iframe 两个节点
+      const root = ensureRootContainer('ilh-root');
+      document.getElementById('ilh-frame')?.remove();
+      const frame = document.createElement('iframe');
+      frame.id = 'ilh-frame';
+      root.appendChild(frame);
+
+      // ② 在 iframe 里建干净文档, 写入面板样式
+      const fdoc = frame.contentDocument;
+      fdoc.open();
+      fdoc.write('<!DOCTYPE html><html><head><meta charset="utf-8"></head><body></body></html>');
+      fdoc.close();
+      ILH_DOC = fdoc;
+      const fstyle = fdoc.createElement('style');
+      fstyle.textContent =
+        'html,body{margin:0;padding:0;background:transparent;overflow:hidden;height:100%}'
+        + '#ilh-panel{position:relative!important;right:auto!important;bottom:auto!important;'
+        + 'top:auto!important;left:auto!important;width:100%!important;height:100%!important}'
+        + ILH_PANEL_CSS;
+      fdoc.head.appendChild(fstyle);
+
+      // ③ 浮窗本体建在 iframe 文档里
+      const panel = fdoc.createElement('div');
       panel.id = 'ilh-panel';
       setSafeHTML(panel, `
         <div id="ilh-header">
@@ -2287,21 +2337,24 @@ injectStylesRobust('ilh', `
           <div id="ilh-log"></div>
         </div>
       `);
-      // v0.14.0: 挂到铺满视口的根容器里 (不再自己做 fixed 定位)
-      ensureRootContainer('ilh-root').appendChild(panel);
+      // v0.15.0: 浮窗挂进 iframe 文档
+      fdoc.body.appendChild(panel);
 
-      document.getElementById('ilh-toggle-panel').addEventListener('click', () => {
+      PD().getElementById('ilh-toggle-panel').addEventListener('click', () => {
         state.panelCollapsed = !state.panelCollapsed;
         panel.classList.toggle('collapsed', state.panelCollapsed);
+        // v0.15.0: iframe 高度要跟着折叠状态一起变, 否则折叠后会留下一大块透明空白挡住页面
+        const fr = document.getElementById('ilh-frame');
+        if (fr) fr.classList.toggle('collapsed', state.panelCollapsed);
       });
-      document.getElementById('ilh-log-header').addEventListener('click', () => {
+      PD().getElementById('ilh-log-header').addEventListener('click', () => {
         state.logCollapsed = !state.logCollapsed;
-        document.getElementById('ilh-log').classList.toggle('collapsed', state.logCollapsed);
-        document.getElementById('ilh-log-toggle').textContent = state.logCollapsed ? '▶' : '▼';
+        PD().getElementById('ilh-log').classList.toggle('collapsed', state.logCollapsed);
+        PD().getElementById('ilh-log-toggle').textContent = state.logCollapsed ? '▶' : '▼';
       });
       // v0.12.8: 移除"复制解析"按钮 (用户可双击解析框选中再复制, 或用浏览器自带功能)
       // v0.12.5: 答案核对按钮组事件 (点击切换状态, 立即保存到 KEY_RESP)
-      document.querySelectorAll('#ilh-verify-bar .ilh-verify-btn').forEach((btn) => {
+      PD().querySelectorAll('#ilh-verify-bar .ilh-verify-btn').forEach((btn) => {
         btn.addEventListener('click', () => {
           if (!state.currentQuestion) return;
           const qId = state.currentQuestion.id;
@@ -2314,7 +2367,7 @@ injectStylesRobust('ilh', `
           cached.verified = newState;
           GM_setValue(`ilh:response:${qId}`, cached);
           // 更新 UI
-          document.querySelectorAll('#ilh-verify-bar .ilh-verify-btn').forEach((b) => {
+          PD().querySelectorAll('#ilh-verify-bar .ilh-verify-btn').forEach((b) => {
             b.classList.toggle('active', b.dataset.state === newState);
           });
           const stateLabel = { correct: '✓ 正确', incorrect: '✗ 错误', unverified: '? 未验证' }[newState];
@@ -2322,7 +2375,7 @@ injectStylesRobust('ilh', `
         });
       });
 
-      document.getElementById('ilh-btn-redo').addEventListener('click', () => {
+      PD().getElementById('ilh-btn-redo').addEventListener('click', () => {
         if (!state.currentQuestion) return;
         const qId = state.currentQuestion.id;
         // v0.12.3: 同时删 KEY_RESP 和 KEY_REQ, 否则下面 requestExplanation 看到 KEY_REQ 残留会判定 "已在处理中"
@@ -2333,22 +2386,22 @@ injectStylesRobust('ilh', `
       });
 
       // v0.11.0: 编辑解析
-      document.getElementById('ilh-btn-edit').addEventListener('click', () => {
+      PD().getElementById('ilh-btn-edit').addEventListener('click', () => {
         if (!state.currentQuestion) return log('⚠️ 当前没有题目可编辑', 'warn');
         const cached = GM_getValue(`ilh:response:${state.currentQuestion.id}`, null);
         if (!cached || !cached.text) return log('⚠️ 当前题暂无解析可编辑', 'warn');
         EditMode.enter(state.currentQuestion.id, cached.text);
       });
-      document.getElementById('ilh-btn-save').addEventListener('click', () => EditMode.save());
-      document.getElementById('ilh-btn-cancel-edit').addEventListener('click', () => EditMode.cancel());
+      PD().getElementById('ilh-btn-save').addEventListener('click', () => EditMode.save());
+      PD().getElementById('ilh-btn-cancel-edit').addEventListener('click', () => EditMode.cancel());
 
       // v0.11.0: CSV 导出
-      document.getElementById('ilh-btn-csv').addEventListener('click', () => exportCSV());
-      document.getElementById('ilh-btn-import').addEventListener('click', () => importCsvAsBank());
+      PD().getElementById('ilh-btn-csv').addEventListener('click', () => exportCSV());
+      PD().getElementById('ilh-btn-import').addEventListener('click', () => importCsvAsBank());
 
 
       // v0.6.0: 批量面板事件
-      document.getElementById('ilh-batch-enabled').addEventListener('change', (e) => {
+      PD().getElementById('ilh-batch-enabled').addEventListener('change', (e) => {
         batchState.enabled = e.target.checked;
         log(`🚀 批量预取已${batchState.enabled ? '开启' : '关闭'}`, 'info');
         updateBatchPanel();
@@ -2360,7 +2413,7 @@ injectStylesRobust('ilh', `
           }
         }
       });
-      const batchSizeInput = document.getElementById('ilh-batch-size');
+      const batchSizeInput = PD().getElementById('ilh-batch-size');
       batchSizeInput.addEventListener('change', (e) => {
         const v = parseInt(e.target.value, 10);
         if (Number.isInteger(v) && v >= 1 && v <= 50) {
@@ -2379,16 +2432,16 @@ injectStylesRobust('ilh', `
           e.preventDefault();
         }
       });
-      document.getElementById('ilh-batch-start').addEventListener('click', () => {
+      PD().getElementById('ilh-batch-start').addEventListener('click', () => {
         startBatchProcessing();
       });
 
-      makeDraggable(panel, document.getElementById('ilh-header'));
+      makeDraggable(panel, PD().getElementById('ilh-header'));
 
       // v0.8.0: 初始化 overview grid (默认 40 题, 第一题识别后会按 q.total 重建)
       StatusDot.buildOverviewGrid(40);
       // 点击 grid 上的题号 → 模拟点击 sidebar 跳过去 (v0.10.1: 用 robustClick)
-      document.getElementById('ilh-overview-grid-content').addEventListener('click', (e) => {
+      PD().getElementById('ilh-overview-grid-content').addEventListener('click', (e) => {
         const dot = e.target.closest('.ilh-grid-dot');
         if (!dot) return;
         const pos = parseInt(dot.dataset.pos, 10);
@@ -2403,7 +2456,7 @@ injectStylesRobust('ilh', `
       });
 
       // v0.9.0: 取消自动遍历按钮
-      document.getElementById('ilh-traverse-cancel').addEventListener('click', () => {
+      PD().getElementById('ilh-traverse-cancel').addEventListener('click', () => {
         AutoTraverse.cancel();
       });
     }
@@ -2413,6 +2466,9 @@ injectStylesRobust('ilh', `
      * 正是画不出背景的那种结构。改用 transform 不影响布局和绘制结构。 */
     /* v0.14.2: 拖动【移动根容器】, 浮窗自身不带任何 transform ——
      * 保持浮窗与实测通过的对照探针 P2/P4 完全同构, 不引入额外合成层。 */
+    /* v0.15.0: 拖动手柄在 iframe 内, 鼠标一旦移出 iframe 范围, mousemove 就只有宿主文档收得到,
+     * 所以两个文档都要监听。位移施加在宿主的 #ilh-root 上。
+     * 注意 iframe 内的 clientX/clientY 是相对 iframe 的, 但我们只用【差值】, 不受偏移影响。 */
     function makeDraggable(el, handle) {
       const mover = () => document.getElementById('ilh-root') || el;
       let dragging = false, startX = 0, startY = 0, baseX = 0, baseY = 0;
@@ -2426,23 +2482,31 @@ injectStylesRobust('ilh', `
         [baseX, baseY] = readOffset(mover());
         e.preventDefault();
       });
-      document.addEventListener('mousemove', (e) => {
+      const onMove = (e) => {
         if (!dragging) return;
         mover().style.transform = `translate(${baseX + e.clientX - startX}px, ${baseY + e.clientY - startY}px)`;
-      });
-      document.addEventListener('mouseup', () => { dragging = false; });
+      };
+      const onUp = () => { dragging = false; };
+      // 宿主文档 + iframe 文档都要监听
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+      const fd = PD();
+      if (fd !== document) {
+        fd.addEventListener('mousemove', onMove);
+        fd.addEventListener('mouseup', onUp);
+      }
     }
 
     function setStatus(level, text) {
       // v0.8.1: ilh-status div 已删除, 只更新 header dot 的颜色 (题目识别状态信息会在 ilh-meta pill 里显示)
-      const dot = document.querySelector('#ilh-header .ilh-dot');
+      const dot = PD().querySelector('#ilh-header .ilh-dot');
       if (dot) dot.className = 'ilh-dot' + (level ? ' ' + level : '');
       // 同时把 text 设为 dot 的 title (hover 提示)
       if (dot && text) dot.title = text;
     }
 
     function renderQuestion(q) {
-      const c = document.getElementById('ilh-question');
+      const c = PD().getElementById('ilh-question');
       if (!c) return;
       const optionsHtml = q.options.length > 0
         ? `<div class="ilh-options">${q.options.map((o) => `
@@ -2465,7 +2529,7 @@ injectStylesRobust('ilh', `
 
     // v0.12.0: 更新 iLearning 浮窗的缓存数显示 (与 NotebookLM 端 nlh-stat-cache 一致)
     function updateCacheCount() {
-      const el = document.getElementById('ilh-cache-count');
+      const el = PD().getElementById('ilh-cache-count');
       if (!el) return;
       try {
         const allKeys = Bridge.listAllKeys();
@@ -2481,7 +2545,7 @@ injectStylesRobust('ilh', `
     // v0.12.1: 点击缓存 pill 触发去重
     function setupCacheDedupClick() {
       // 用事件委托 (因为 ilh-cache-count 是 renderQuestion 时动态生成的)
-      const panel = document.getElementById('ilh-panel');
+      const panel = PD().getElementById('ilh-panel');
       if (!panel || panel.__dedupBound) return;
       panel.__dedupBound = true;
       panel.addEventListener('click', (e) => {
@@ -2507,10 +2571,10 @@ injectStylesRobust('ilh', `
         this.active = true;
         this.qId = qId;
         this.originalText = currentText;
-        const contentEl = document.getElementById('ilh-explain-content');
-        const statusEl = document.getElementById('ilh-explain-status');
-        const viewActions = document.getElementById('ilh-actions-view');
-        const editActions = document.getElementById('ilh-actions-edit');
+        const contentEl = PD().getElementById('ilh-explain-content');
+        const statusEl = PD().getElementById('ilh-explain-status');
+        const viewActions = PD().getElementById('ilh-actions-view');
+        const editActions = PD().getElementById('ilh-actions-edit');
         if (!contentEl) return;
         // 切到纯文本可编辑模式 (markdown 源码)
         contentEl.classList.remove('md-rendered');
@@ -2525,7 +2589,7 @@ injectStylesRobust('ilh', `
 
       save() {
         if (!this.active) return;
-        const contentEl = document.getElementById('ilh-explain-content');
+        const contentEl = PD().getElementById('ilh-explain-content');
         const newText = contentEl.textContent.trim();
         if (newText.length < 5) {
           log('⚠️ 解析内容过短, 拒绝保存', 'warn');
@@ -2556,10 +2620,10 @@ injectStylesRobust('ilh', `
       },
 
       exit(displayText, wasEdited) {
-        const contentEl = document.getElementById('ilh-explain-content');
-        const statusEl = document.getElementById('ilh-explain-status');
-        const viewActions = document.getElementById('ilh-actions-view');
-        const editActions = document.getElementById('ilh-actions-edit');
+        const contentEl = PD().getElementById('ilh-explain-content');
+        const statusEl = PD().getElementById('ilh-explain-status');
+        const viewActions = PD().getElementById('ilh-actions-view');
+        const editActions = PD().getElementById('ilh-actions-edit');
         if (contentEl) {
           contentEl.removeAttribute('contenteditable');
           contentEl.classList.add('md-rendered');
@@ -3193,9 +3257,9 @@ injectStylesRobust('ilh', `
 
 
     function showExplain(kind, content = '', statusText = '') {
-      const wrap = document.getElementById('ilh-explain');
-      const contentEl = document.getElementById('ilh-explain-content');
-      const statusEl = document.getElementById('ilh-explain-status');
+      const wrap = PD().getElementById('ilh-explain');
+      const contentEl = PD().getElementById('ilh-explain-content');
+      const statusEl = PD().getElementById('ilh-explain-status');
       if (!wrap) return;
       wrap.style.display = 'block';
       contentEl.className = 'ilh-explain-content ' + (kind || '');
@@ -3245,7 +3309,7 @@ injectStylesRobust('ilh', `
       statusEl.textContent = finalStatus;
 
       // v0.12.5: 渲染答案核对栏 (仅成功状态显示)
-      const verifyBar = document.getElementById('ilh-verify-bar');
+      const verifyBar = PD().getElementById('ilh-verify-bar');
       if (verifyBar) {
         if ((!kind || kind === '') && content && state.currentQuestion) {
           verifyBar.style.display = 'flex';
@@ -3261,7 +3325,7 @@ injectStylesRobust('ilh', `
     }
 
     function hideExplain() {
-      const wrap = document.getElementById('ilh-explain');
+      const wrap = PD().getElementById('ilh-explain');
       if (wrap) wrap.style.display = 'none';
     }
 
@@ -3469,8 +3533,17 @@ injectStylesRobust('ilh', `
       __ilhStyleFixed = true;
       log(`🛡 已强制内联 ${n} 条兜底样式 (可能是页面水印层或其它浏览器扩展的全局 CSS 导致)`, 'success');
     }
-    setTimeout(() => ilhStyleSelfCheck('1.5s'), 1500);
-    setTimeout(() => ilhStyleSelfCheck('5s'), 5000);
+    // v0.15.0: 面板已迁入 iframe, 宿主侧的样式自检/遮挡诊断不再适用 (它们查的是宿主 document)。
+    // 改为检查 iframe 本身是否正常存在且有内容。
+    setTimeout(() => {
+      try {
+        const fr = document.getElementById('ilh-frame');
+        const ok = !!(fr && fr.contentDocument && fr.contentDocument.getElementById('ilh-panel'));
+        const b = fr ? fr.getBoundingClientRect() : null;
+        log(ok ? `✓ 浮窗已在独立 iframe 中渲染 (${b ? Math.round(b.width) + '×' + Math.round(b.height) : '?'})`
+               : '⚠️ 浮窗 iframe 内容异常, 请刷新页面', ok ? 'success' : 'warn');
+      } catch (e) { /* ignore */ }
+    }, 1500);
 
     /* v0.14.3: 重排风暴 —— 按节奏跑几次, 把可能卡住的绘制推过去 */
     [2000, 5000, 10000, 20000].forEach((ms) => setTimeout(() => {
@@ -3485,10 +3558,12 @@ injectStylesRobust('ilh', `
           (逃出 body 里水印层的绘制影响, 同 z-index 下我们永远画在它上面) */
     setInterval(() => {
       try {
-        const p = document.getElementById('ilh-panel');
-        if (!p) return;
         const root = ensureRootContainer('ilh-root');
-        if (p.parentElement !== root) root.appendChild(p);
+        const fr = document.getElementById('ilh-frame');
+        if (!fr) { log('⚠️ 浮窗 iframe 丢失, 请刷新页面', 'warn'); return; }
+        // 注意: 重新 appendChild 一个 iframe 会让它重新加载、文档被清空,
+        // 所以这里只检测不搬动; 真掉出去了就提示刷新。
+        if (fr.parentElement !== root) log('⚠️ 浮窗 iframe 脱离了根容器, 请刷新页面', 'warn');
       } catch (e) { /* ignore */ }
     }, 3000);
 
@@ -3521,7 +3596,7 @@ injectStylesRobust('ilh', `
       }
       return d;
     }
-    setTimeout(() => ilhRunDiagnose(true), 6000);
+    // v0.15.0: 面板已不在宿主文档, 宿主侧遮挡诊断不再自动跑 (仍可手动 __ilhDiagnose())
 
     if (typeof unsafeWindow !== 'undefined') {
       unsafeWindow.__ilhDiagnose = () => ilhRunDiagnose(true);
@@ -3574,7 +3649,9 @@ injectStylesRobust('ilh', `
     window.addEventListener('keyup', blockArrows, true);
     document.addEventListener('keydown', blockArrows, true);
     document.addEventListener('keyup', blockArrows, true);
-    log('⌨️  已启用浮窗方向键拦截 (浮窗内按 ↑↓←→ 不会切 iLearning 题)', 'debug');
+    // v0.15.0: 浮窗迁入 iframe 后, 里面的键盘事件根本不会冒泡到宿主文档,
+    // iLearning 收不到, 所以方向键误切题的问题自然消失了 (上面的拦截作为双保险保留)。
+    log('⌨️  浮窗已在 iframe 内, 键盘事件天然隔离 (不会误切 iLearning 题)', 'debug');
 
     // v0.9.0: 自动遍历 - 延迟 3 秒后启动 (留时间给 iLearning 渲染 sidebar 和首题)
     setTimeout(() => {
@@ -3623,7 +3700,7 @@ injectStylesRobust('ilh', `
     setInterval(() => {
       if (state.currentQuestion) return;
       const alive = Bridge.isNotebookLMAlive();
-      const dot = document.querySelector('#ilh-header .ilh-dot');
+      const dot = PD().querySelector('#ilh-header .ilh-dot');
       if (dot && !state.currentQuestion) {
         dot.className = 'ilh-dot' + (alive ? ' idle' : ' warn');
       }
