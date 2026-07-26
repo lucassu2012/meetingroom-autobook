@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.14.1
+// @version      0.14.2
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.14.2 - 【白屏真正修复】四探针对照实测: 新建独立 fixed 容器 (只有内容那么大) 里的块全部正常渲染 (P2 绿 187080px / P3 蓝 890766px / P4 橙 34320px), 而放进 v0.14.0 引入的 #ilh-root 里的块只剩 277px 边缘轮廓 = 没渲染。元凶是 #ilh-root 用了 width:100vw; height:100vh 【铺满整个视口】—— Chromium 对这种全屏透明遮罩层的合成优化会导致其子元素不绘制 (此前 100vw×210px 的实验条里的块全部正常, 印证了'铺满全屏'才是触发条件)。改法: 根容器改为只包住浮窗 (right/bottom 定位, 尺寸由内容决定), 去掉 100vw/100vh、pointer-events:none 和 flex 对齐; 拖动改为移动根容器的 transform, 浮窗自身不带任何变换, 完全等同于实测通过的 P2/P4 形态。同时纠正 v0.14.0 的一个错误结论: '偏移定位的 fixed 元素画不出背景' 是错的 (当时实验 B 用了过期 rect 导致定位错乱), P2/P4 已证伪。
 // v0.14.1 - 逃出水印层: 页面有一个防截屏水印 div (随机数字 id, 铺满全屏, z-index 最大, 挂在 body 里, 带防篡改自动重挂)。它与浮窗同 z-index 且在 DOM 里更靠后 → 画在浮窗上方; 若其带 backdrop-filter, Chromium 会对其下方的独立合成层做快照过滤, 已知会导致下方 fixed 元素渲染成空白 (对照实验中排在它后面的元素全部正常, 排在它前面的全部空白, 完全吻合)。水印是公司安全功能不可移除, 改为逃逸: 根容器 #ilh-root/#nlh-root 从挂 body 改为挂 <html> 上 (排在 <body> 之后) —— 同 z-index 下 DOM 靠后者画在上面, 且不在水印防篡改脚本监视的 body 里, 不会发生互相抢位。看门狗同步改为保证根容器始终是 <html> 的最后一个子节点。诊断日志补充打印遮挡元素的 backgroundImage / backdropFilter。
 // v0.14.0 - 【修复白屏】根因: 在带 examResultId 的考试回顾页上, 偏移定位的 position:fixed 元素不绘制背景 (实测对照: 普通 div ✅ / flex+半透明子元素 ✅ / 再加 overflow+圆角+阴影 ✅ / 但 position:fixed 独立小方块 ❌ 画不出背景)。改法: 浮窗不再自己做 fixed 定位, 改成挂在一个【铺满视口的透明 fixed 容器 #ilh-root】里, 用 flex 靠右下角对齐, 浮窗本身回归普通流 —— 这正是实测中能正常渲染的结构。容器 pointer-events:none 不吃鼠标事件, 浮窗自身 pointer-events:auto。同时撤销 v0.13.6 的 popover 顶层方案 (对照实测同样画不出背景, 且从未解决问题); 拖动从改 left/top 改为改 transform (不破坏新的绘制结构)。
 // v0.13.7 - 找到"白屏"真凶: 浮窗是【透明】的, 看到的白色是背景页面 div#app (rgb(246,246,246)) 透过来的。原因是 background 简写会把 background-color 重置为 transparent, 深色全靠那层 linear-gradient, 渐变一旦没画出来浮窗就全透明。修复: (1) 拆成 background-color (实心深色) + background-image (渐变) 两条声明, 渐变失效也还有实心底色兜底; (2) 撤掉 v0.13.5 误加的 '#ilh-panel span/label/div:not() { background-color: transparent !important }' —— 状态灯是 <span>, JS 设的内联背景打不过 !important, 导致 28 个状态灯全部变透明(这也是为什么白屏时连数字方块都看不见); (3) 诊断补盲区: 之前只扫浮窗外部元素, 现在也扫子元素; 过滤掉画在我们下面的静态元素(div#app 那种误报); 补充报告 background-color/background-image/forced-colors 等; (4) 新增 __ilhPaintTest(): 把浮窗刷成纯红 3 秒, 一眼区分"背景没画出来"还是"被别的东西盖住"。
@@ -1295,22 +1296,16 @@ injectStylesRobust('ilh', `
          已删除 —— 状态灯 .ilh-grid-dot 是 <span>, 它的颜色由 JS 内联设置,
          内联样式优先级打不过带强制标记的规则, 结果 28 个状态灯全变透明了。 */
 
-      /* v0.14.0: 铺满视口的透明容器。浮窗自己不再做 fixed 定位 ——
-         实测在考试回顾页上, 偏移定位的 fixed 小方块画不出背景, 而
-         "铺满视口的 fixed 容器 + 里面的普通流子元素" 完全正常。 */
+      /* v0.14.2: 根容器【只包住浮窗】, 尺寸由内容决定。
+         千万不要写成 width:100vw; height:100vh 铺满视口 —— 实测那样会让
+         容器里的所有子元素都不绘制 (Chromium 对全屏透明遮罩层的合成优化所致)。
+         这里的形态和实测通过的对照探针 P2/P4 完全一致。 */
       #ilh-root {
         position: fixed !important;
-        left: 0 !important; top: 0 !important;
-        width: 100vw !important; height: 100vh !important;
+        right: 24px !important;
+        bottom: 24px !important;
         z-index: 2147483647 !important;
-        pointer-events: none !important;   /* 不挡页面操作 */
         background: transparent !important;
-        display: flex !important;
-        align-items: flex-end !important;      /* 靠下 */
-        justify-content: flex-end !important;  /* 靠右 */
-        padding: 24px !important;
-        box-sizing: border-box !important;
-        overflow: hidden !important;
       }
 
       #ilh-panel {
@@ -1319,7 +1314,7 @@ injectStylesRobust('ilh', `
         flex: none;
         width: ${CONFIG.panelWidth}px;
         /* v0.12.8: 固定高度, 不随内容变化伸缩 */
-        height: min(${CONFIG.panelMaxHeight}px, 100%);
+        height: min(${CONFIG.panelMaxHeight}px, calc(100vh - 48px));
         /* v0.13.7: 必须拆成两条 —— background 简写会把 background-color 重置成 transparent,
            渐变一旦没画出来浮窗就全透明, 背景页面直接透上来 (这就是"白屏"的真因)。
            实心底色放在下面兜底, 渐变只是锦上添花。 */
@@ -2376,21 +2371,24 @@ injectStylesRobust('ilh', `
     /* v0.14.0: 拖动改用 transform 位移。
      * 原来是改 left/top + right/bottom:auto, 那会把浮窗变回"偏移定位"的状态,
      * 正是画不出背景的那种结构。改用 transform 不影响布局和绘制结构。 */
+    /* v0.14.2: 拖动【移动根容器】, 浮窗自身不带任何 transform ——
+     * 保持浮窗与实测通过的对照探针 P2/P4 完全同构, 不引入额外合成层。 */
     function makeDraggable(el, handle) {
+      const mover = () => document.getElementById('ilh-root') || el;
       let dragging = false, startX = 0, startY = 0, baseX = 0, baseY = 0;
-      const readOffset = () => {
-        const m = /translate\(\s*(-?[\d.]+)px\s*,\s*(-?[\d.]+)px\s*\)/.exec(el.style.transform || '');
+      const readOffset = (t) => {
+        const m = /translate\(\s*(-?[\d.]+)px\s*,\s*(-?[\d.]+)px\s*\)/.exec(t.style.transform || '');
         return m ? [parseFloat(m[1]), parseFloat(m[2])] : [0, 0];
       };
       handle.addEventListener('mousedown', (e) => {
         dragging = true;
         startX = e.clientX; startY = e.clientY;
-        [baseX, baseY] = readOffset();
+        [baseX, baseY] = readOffset(mover());
         e.preventDefault();
       });
       document.addEventListener('mousemove', (e) => {
         if (!dragging) return;
-        el.style.transform = `translate(${baseX + e.clientX - startX}px, ${baseY + e.clientY - startY}px)`;
+        mover().style.transform = `translate(${baseX + e.clientX - startX}px, ${baseY + e.clientY - startY}px)`;
       });
       document.addEventListener('mouseup', () => { dragging = false; });
     }
@@ -3379,6 +3377,15 @@ injectStylesRobust('ilh', `
           && document.documentElement.lastElementChild === root;
         log(isLast ? '🛡 根容器已挂到 <html> 末位 (画在 body 内所有内容之上, 含水印层)'
                    : '⚠️ 根容器不在 <html> 末位, 看门狗会持续纠正', isLast ? 'success' : 'warn');
+        // v0.14.2: 根容器绝不能铺满视口, 否则里面的一切都不绘制
+        if (root) {
+          const rr = root.getBoundingClientRect();
+          if (rr.width >= innerWidth - 2 && rr.height >= innerHeight - 2) {
+            log(`❌ 根容器铺满了视口 (${Math.round(rr.width)}×${Math.round(rr.height)}) —— 会导致浮窗不绘制!`, 'error');
+          } else {
+            log(`✓ 根容器尺寸正常 (${Math.round(rr.width)}×${Math.round(rr.height)}, 未铺满视口)`, 'debug');
+          }
+        }
       } catch (e) { /* ignore */ }
     }, 1000);
 
@@ -3613,20 +3620,13 @@ injectStylesRobust('nlh', `
         background-color: transparent !important;
       }
 
-      /* v0.14.0: 同 iLearning 端 —— 铺满视口的透明容器 + 普通流浮窗 */
+      /* v0.14.2: 同 iLearning 端 —— 只包住浮窗, 绝不铺满视口 */
       #nlh-root {
         position: fixed !important;
-        left: 0 !important; top: 0 !important;
-        width: 100vw !important; height: 100vh !important;
+        right: 24px !important;
+        bottom: 24px !important;
         z-index: 2147483647 !important;
-        pointer-events: none !important;
         background: transparent !important;
-        display: flex !important;
-        align-items: flex-end !important;
-        justify-content: flex-end !important;
-        padding: 24px !important;
-        box-sizing: border-box !important;
-        overflow: hidden !important;
       }
 
       #nlh-panel {
@@ -3634,7 +3634,7 @@ injectStylesRobust('nlh', `
         pointer-events: auto !important;
         flex: none;
         width: ${CONFIG.panelWidth}px;
-        max-height: min(${CONFIG.panelMaxHeight}px, 100%);
+        max-height: min(${CONFIG.panelMaxHeight}px, calc(100vh - 48px));
         /* v0.13.7: 同 iLearning 端, 实心底色兜底 */
         background-color: #1a2e2a !important;
         background-image: linear-gradient(135deg, #1a2e2a 0%, #1f3a3f 100%) !important;
@@ -4694,21 +4694,22 @@ injectStylesRobust('nlh', `
 
       // 拖拽
       const handle = document.getElementById('nlh-header');
-      // v0.14.0: 改用 transform 位移 (改 left/top 会退回"偏移定位"结构, 那正是画不出背景的形态)
+      // v0.14.2: 移动根容器, 浮窗自身不带 transform
+      const mover = () => document.getElementById('nlh-root') || panel;
       let dragging = false, startX = 0, startY = 0, baseX = 0, baseY = 0;
-      const readOffset = () => {
-        const m = /translate\(\s*(-?[\d.]+)px\s*,\s*(-?[\d.]+)px\s*\)/.exec(panel.style.transform || '');
+      const readOffset = (t) => {
+        const m = /translate\(\s*(-?[\d.]+)px\s*,\s*(-?[\d.]+)px\s*\)/.exec(t.style.transform || '');
         return m ? [parseFloat(m[1]), parseFloat(m[2])] : [0, 0];
       };
       handle.addEventListener('mousedown', (e) => {
         dragging = true;
         startX = e.clientX; startY = e.clientY;
-        [baseX, baseY] = readOffset();
+        [baseX, baseY] = readOffset(mover());
         e.preventDefault();
       });
       document.addEventListener('mousemove', (e) => {
         if (!dragging) return;
-        panel.style.transform = `translate(${baseX + e.clientX - startX}px, ${baseY + e.clientY - startY}px)`;
+        mover().style.transform = `translate(${baseX + e.clientX - startX}px, ${baseY + e.clientY - startY}px)`;
       });
       document.addEventListener('mouseup', () => { dragging = false; });
     }
