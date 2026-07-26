@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.13.5
+// @version      0.13.6
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.13.6 - 彻底解决"白屏"(浮窗被别的悬浮层盖住): v0.13.5 的样式自检已证明我们自己的样式是好的, 问题是有东西画在我们上面。z-index 已是最大值 2147483647, 再拼数字没用, 所以改用浏览器原生的 Top Layer (Popover API): 浮窗用 popover=manual + showPopover() 提升到顶层, 顶层元素永远画在所有普通页面内容之上, 且不受祖先 filter/transform/opacity 造成的层叠上下文限制。同时配套: (1) 覆盖 popover 的 UA 默认样式 (background-color:Canvas / border:solid / padding / margin:auto / inset:0) 否则浮窗会变白框; (2) ::backdrop 设为全透明, 不遮挡页面; (3) 看门狗每 3 秒检查一次, 掉出顶层自动重新提升 (SPA 路由切换会重建 DOM); (4) 浏览器不支持 Popover 时自动降级到原方案并在日志说明。新增遮挡诊断 __ilhDiagnose(): 扫描全文档找出覆盖浮窗超过 40% 且带不透明背景的元素, 报告 tag/id/class/z-index/背景色, 并检查祖先链上的 filter/opacity/transform/mix-blend-mode; 启动 6 秒后自动跑一次, 发现可疑遮挡会在日志告警。
 // v0.13.5 - 修复考试回顾页 (examResultId) 浮窗"白屏": (1) z-index 提到 2147483647, 不再被页面满屏水印层压住; (2) 关键视觉属性 (background/color/position/z-index/border/font) 全部加 !important, 抵抗页面和其它浏览器扩展 (如 YouMind) 注入的全局 CSS; (3) 新增透明基线规则, 防止 div{background:#fff!important} 类规则把浮窗内部刷白; (4) 样式注入改为 injectStylesRobust: GM_addStyle 失败自动降级到手动 <style>, 并在 1s/3s/8s 重新注入 (让我们的样式表永远排在页面后加载的样式表之后); (5) 启动 1.5s/5s 做样式自检, 发现被覆盖自动启用内联 !important 兜底并在日志里告警; (6) 自动遍历改为轮询等待 sidebar 最多 15 秒 (原固定 2 秒, 回顾页渲染慢会漏)。
 // v0.13.4 - 紧急修复 v0.13.0 引入的导入 bug: doImportFromCsvText 里 const qId = computeQId(stem, options) 写在 options 声明之前, 触发 temporal dead zone ReferenceError, 被 try-catch 捕获导致每行 skip. 现在调整顺序: 先解析 options 再算 qId. 同时加 Excel 大数字兼容: 导出 examId 用 \"=\"123...\"\" 包裹 (Excel 识别为文本公式不会科学计数法), 导入去壳.
 // v0.13.3 - 修复 4 个问题: (1) 启动迁移冲突时不再跳过, 改为合并 (选 status=done 优先 / 时间戳新优先), 清理 v0.13.2 留下的孤儿双份 entry; (2) 撤销自动 fillCourseContext 行为, 改为 cache 命中时按需补全 (新题自动带 courseName/examId, 旧题保持空白直到下次被命中); (3) CSV 导出题型规范化为中文 "单选题/多选题/判断题" (不再 multi/single); CSV 导入识别中文题型保留原值; (4) 移除 "🔧 修复" 按钮 + fixCacheInteractive / fillCourseContext / __fixCacheNow.
@@ -76,6 +77,137 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     }
     return null;
   })();
+
+  /* ═══════════ v0.13.6: 把浮窗提升到浏览器"顶层" (Top Layer) ═══════════
+   * 为什么需要: z-index 最大只能到 2147483647, 一旦别的扩展/页面也用这个值,
+   *   谁在 DOM 里靠后谁就赢, 我们没法保证赢。而且祖先元素上的 filter / transform /
+   *   opacity 会新建层叠上下文, 把我们的 z-index 直接"关"在里面。
+   * 怎么解决: 浏览器有个独立于页面的 Top Layer (全屏、<dialog>、popover 用的就是它)。
+   *   顶层元素永远画在所有普通内容之上, 也不受祖先层叠上下文影响。
+   *   用 popover="manual" 是因为它不会被 Esc 或点击外部关掉。
+   */
+  function supportsTopLayer() {
+    return typeof HTMLElement !== 'undefined'
+      && typeof HTMLElement.prototype.showPopover === 'function';
+  }
+
+  function promoteToTopLayer(el) {
+    if (!el || !supportsTopLayer()) return false;
+    try {
+      if (el.getAttribute('popover') !== 'manual') el.setAttribute('popover', 'manual');
+      if (!el.matches(':popover-open')) el.showPopover();
+      return true;
+    } catch (e) {
+      console.warn('[ILH-BRIDGE] showPopover 失败:', e);
+      return false;
+    }
+  }
+
+  /** 看门狗: SPA 路由切换/页面重绘可能把浮窗踢出顶层, 定期检查并重新提升 */
+  function keepInTopLayer(panelId, intervalMs) {
+    if (!supportsTopLayer()) return null;
+    return setInterval(() => {
+      const el = document.getElementById(panelId);
+      if (!el || !el.isConnected) return;
+      try {
+        if (!el.matches(':popover-open')) promoteToTopLayer(el);
+      } catch (e) { /* ignore */ }
+    }, intervalMs || 3000);
+  }
+
+  /* ═══════════ v0.13.6: 遮挡诊断 ═══════════
+   * 找出"到底是谁盖在浮窗上面"。扫描全文档, 报告与浮窗重叠超过 40%
+   * 且自身带不透明背景的元素, 以及祖先链上会破坏层叠的属性。
+   */
+  function diagnoseOverlay(panelId) {
+    const panel = document.getElementById(panelId);
+    if (!panel) return { error: 'panel-missing' };
+    const r = panel.getBoundingClientRect();
+    const area = Math.max(1, r.width * r.height);
+    const desc = (el) => {
+      const id = el.id ? '#' + el.id : '';
+      const cls = (typeof el.className === 'string' && el.className)
+        ? '.' + el.className.trim().split(/\s+/).slice(0, 3).join('.')
+        : '';
+      return el.tagName.toLowerCase() + id + cls;
+    };
+
+    // 1) 祖先链上会新建层叠上下文 / 影响绘制的属性
+    const ancestorIssues = [];
+    for (let p = panel.parentElement; p && p !== document.documentElement; p = p.parentElement) {
+      let cs;
+      try { cs = getComputedStyle(p); } catch (e) { break; }
+      const bad = [];
+      if (cs.filter && cs.filter !== 'none') bad.push('filter=' + cs.filter);
+      if (cs.transform && cs.transform !== 'none') bad.push('transform=' + cs.transform);
+      if (cs.opacity && parseFloat(cs.opacity) < 1) bad.push('opacity=' + cs.opacity);
+      if (cs.mixBlendMode && cs.mixBlendMode !== 'normal') bad.push('mix-blend-mode=' + cs.mixBlendMode);
+      if (cs.perspective && cs.perspective !== 'none') bad.push('perspective=' + cs.perspective);
+      if (cs.contain && cs.contain !== 'none') bad.push('contain=' + cs.contain);
+      if (bad.length) ancestorIssues.push(desc(p) + ' → ' + bad.join(', '));
+    }
+
+    // 2) 覆盖浮窗的可疑元素
+    const suspects = [];
+    let all = [];
+    try { all = document.querySelectorAll('*'); } catch (e) { all = []; }
+    for (const el of all) {
+      if (el === panel || panel.contains(el) || el.contains(panel)) continue;
+      let cs;
+      try { cs = getComputedStyle(el); } catch (e) { continue; }
+      if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+      const op = parseFloat(cs.opacity);
+      if (!isNaN(op) && op === 0) continue;
+      const b = el.getBoundingClientRect();
+      if (b.width < 40 || b.height < 40) continue;
+      const ix = Math.max(0, Math.min(r.right, b.right) - Math.max(r.left, b.left));
+      const iy = Math.max(0, Math.min(r.bottom, b.bottom) - Math.max(r.top, b.top));
+      const cover = (ix * iy) / area;
+      if (cover < 0.4) continue;
+      const bg = cs.backgroundColor || '';
+      const transparentBg = !bg || bg === 'transparent' || /rgba\([^)]*,\s*0\s*\)/.test(bg);
+      const hasImg = cs.backgroundImage && cs.backgroundImage !== 'none';
+      const hasBackdrop = cs.backdropFilter && cs.backdropFilter !== 'none';
+      if (transparentBg && !hasImg && !hasBackdrop) continue;
+      suspects.push({
+        el: desc(el),
+        cover: Math.round(cover * 100) + '%',
+        zIndex: cs.zIndex,
+        position: cs.position,
+        background: bg,
+        backgroundImage: hasImg ? String(cs.backgroundImage).slice(0, 40) + '…' : 'none',
+        backdropFilter: cs.backdropFilter,
+        opacity: cs.opacity,
+        pointerEvents: cs.pointerEvents,
+      });
+    }
+    suspects.sort((a, b) => parseInt(b.cover) - parseInt(a.cover));
+
+    // 3) 中心点上到底命中了谁
+    let stack = [];
+    try {
+      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      stack = (document.elementsFromPoint(cx, cy) || []).slice(0, 6).map(desc);
+    } catch (e) { /* ignore */ }
+
+    let panelCs = {};
+    try {
+      const cs = getComputedStyle(panel);
+      panelCs = {
+        position: cs.position, zIndex: cs.zIndex, opacity: cs.opacity,
+        background: String(cs.backgroundImage).slice(0, 50), filter: cs.filter,
+        inTopLayer: (() => { try { return panel.matches(':popover-open'); } catch (e) { return 'n/a'; } })(),
+      };
+    } catch (e) { /* ignore */ }
+
+    return {
+      panelRect: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
+      panelStyle: panelCs,
+      ancestorIssues,
+      suspects: suspects.slice(0, 6),
+      elementsAtCenter: stack,
+    };
+  }
 
   /* ═══════════ v0.13.5: 健壮样式注入 (对抗页面/其它扩展的全局 CSS) ═══════════
    * 背景: 部分 iLearning 页面 (如带 examResultId 的考试回顾页) 有满屏水印层 (z-index 最大值),
@@ -1089,6 +1221,27 @@ injectStylesRobust('ilh', `
       }
       #ilh-panel.collapsed { height: 44px; }
 
+      /* v0.13.6: 覆盖 popover 的浏览器默认样式。
+         UA 默认给 [popover] 加了 background-color:Canvas(白) / border:solid /
+         padding:0.25em / margin:auto / inset:0, 不盖掉的话浮窗会变成一个白框。
+         注意 top/left 只用普通优先级 (拖动时的内联 inset 还要能覆盖它)。 */
+      #ilh-panel:popover-open {
+        margin: 0 !important;
+        padding: 0 !important;
+        border: none !important;
+        max-width: none !important;
+        max-height: none !important;
+      }
+      #ilh-panel {
+        top: auto;
+        left: auto;
+      }
+      #ilh-panel::backdrop {
+        background: transparent !important;
+        -webkit-backdrop-filter: none !important;
+        backdrop-filter: none !important;
+      }
+
       /* v0.12.8: 各模块固定高度, 不随内容塌缩或撑大 */
       #ilh-panel > #ilh-header,
       #ilh-panel > #ilh-batch-panel,
@@ -2004,6 +2157,8 @@ injectStylesRobust('ilh', `
         </div>
       `);
       document.body.appendChild(panel);
+      // v0.13.6: 提升到浏览器顶层, 保证不被任何页面元素/其它扩展的悬浮层盖住
+      promoteToTopLayer(panel);
 
       document.getElementById('ilh-toggle-panel').addEventListener('click', () => {
         state.panelCollapsed = !state.panelCollapsed;
@@ -3160,6 +3315,51 @@ injectStylesRobust('ilh', `
     setTimeout(() => ilhStyleSelfCheck('1.5s'), 1500);
     setTimeout(() => ilhStyleSelfCheck('5s'), 5000);
 
+    /* v0.13.6: 顶层 (Top Layer) 状态汇报 + 看门狗 */
+    if (supportsTopLayer()) {
+      keepInTopLayer('ilh-panel', 3000);
+      setTimeout(() => {
+        const el = document.getElementById('ilh-panel');
+        let ok = false;
+        try { ok = !!(el && el.matches(':popover-open')); } catch (e) { /* ignore */ }
+        log(ok ? '🔝 浮窗已提升到浏览器顶层 (不会再被其它悬浮层盖住)'
+               : '⚠️ 浮窗未能进入顶层, 仍使用 z-index 方案', ok ? 'success' : 'warn');
+      }, 1200);
+    } else {
+      log('ℹ️ 当前浏览器不支持 Popover 顶层 (需 Chrome 114+), 沿用 z-index 方案', 'debug');
+    }
+
+    /* v0.13.6: 遮挡自动诊断 —— 启动 6 秒后跑一次, 发现有东西盖在浮窗上就告警 */
+    function ilhRunDiagnose(verbose) {
+      const d = diagnoseOverlay('ilh-panel');
+      if (d.error) return d;
+      console.groupCollapsed('%c[ILH-BRIDGE] 浮窗遮挡诊断', 'color:#90caf9;font-weight:bold');
+      console.log('浮窗位置:', d.panelRect);
+      console.log('浮窗样式:', d.panelStyle);
+      console.log('祖先链问题:', d.ancestorIssues.length ? d.ancestorIssues : '(无)');
+      console.log('可疑遮挡元素:', d.suspects.length ? d.suspects : '(无)');
+      console.table && d.suspects.length && console.table(d.suspects);
+      console.log('中心点元素栈:', d.elementsAtCenter);
+      console.groupEnd();
+
+      if (d.suspects.length) {
+        const top = d.suspects[0];
+        log(`⚠️ 检测到遮挡: ${top.el} 覆盖了浮窗 ${top.cover} (z-index=${top.zIndex}, 背景=${top.background})`, 'warn');
+        log('   详情见 F12 Console 的"浮窗遮挡诊断"分组; 也可随时手动运行 __ilhDiagnose()', 'debug');
+      } else if (d.ancestorIssues.length) {
+        log(`⚠️ 祖先元素影响层叠: ${d.ancestorIssues[0]}`, 'warn');
+      } else if (verbose) {
+        log('✓ 遮挡诊断: 没有发现盖在浮窗上的元素', 'debug');
+      }
+      return d;
+    }
+    setTimeout(() => ilhRunDiagnose(true), 6000);
+
+    if (typeof unsafeWindow !== 'undefined') {
+      unsafeWindow.__ilhDiagnose = () => ilhRunDiagnose(true);
+      unsafeWindow.__ilhTopLayer = () => promoteToTopLayer(document.getElementById('ilh-panel'));
+    }
+
     // v0.13.3: 启动时静默执行 qId 迁移 + 去重 (修复 v0.13.2 留下的孤儿)
     try {
       const mig = migrateLegacyQIds();
@@ -3317,6 +3517,24 @@ injectStylesRobust('nlh', `
         display: flex; flex-direction: column;
       }
       #nlh-panel.collapsed { max-height: 44px; }
+
+      /* v0.13.6: 同 iLearning 端, 覆盖 popover 的 UA 默认样式 */
+      #nlh-panel:popover-open {
+        margin: 0 !important;
+        padding: 0 !important;
+        border: none !important;
+        max-width: none !important;
+        max-height: none !important;
+      }
+      #nlh-panel {
+        top: auto;
+        left: auto;
+      }
+      #nlh-panel::backdrop {
+        background: transparent !important;
+        -webkit-backdrop-filter: none !important;
+        backdrop-filter: none !important;
+      }
       #nlh-header {
         padding: 11px 14px;
         background: rgba(0,0,0,0.28) !important;
@@ -4317,6 +4535,8 @@ injectStylesRobust('nlh', `
         </div>
       `);
       document.body.appendChild(panel);
+      // v0.13.6: 同上
+      promoteToTopLayer(panel);
 
       document.getElementById('nlh-toggle-panel').addEventListener('click', () => {
         state.panelCollapsed = !state.panelCollapsed;
