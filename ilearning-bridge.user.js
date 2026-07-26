@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.15.3
+// @version      0.15.5
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,15 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.15.5 - 两端各新增"📋 导出日志"。起因: 排查批量解析问题时, 浮窗日志区只保留最近 N 行且早期内容会被滚掉, 靠截图只能看到片段, 导致基于不完整日志下结论。现在把所有日志同时存进一个内存环形缓冲(默认 2000 条, 含毫秒时间戳与级别), 一键导出为 .txt; 导出内容附带环境信息(版本/URL/缓存数/批次设置)便于对照。日志区显示行数不变, 不影响性能。
+// v0.15.4 - 一次性修掉批量解析的四个连锁 bug (实测日志: 8 题批次只抓到 804 字符/2 题, 随后 attempt 2→8 每 2 秒一轮全部"未找到输入框"):
+//   ① 抓取太早 —— thumb_up 只是【第一题】答完的标记, Gemini 还在写后面的题。原来固定收尾 1.5s 就抓。
+//      改为: 按题数动态收尾(每题 +1.2s, 上限 20s), 且必须【文本连续 2 次不再增长】才算真完成;
+//      若已找到的 ===Q数字=== 标记数 < 批次题数且文本仍在增长, 继续等到静默为止。
+//   ② 环境失败被当成内容失败 —— 生成期间输入框被"停止"按钮取代, findInputElement 返回 null 就整批判失败。
+//      改为: 轮询等待输入框出现(最多 120s), 真超时才失败; 等待中不写 error、不回报 failed。
+//   ③ 固定 2 秒重发 —— 失败后 2 秒就重发, 撞上仍在生成 → 每 2 秒死循环。改为指数退避 8s/20s/45s。
+//   ④ 重试预算被环境失败烧光 —— attempt 一路飙到 8。改为环境性失败(输入框未就绪/正忙)【不计入 attempt】, 只有内容失败才计数。
 // v0.15.3 - 修复"NotebookLM 已答复但学习助手仍重复提问": 根因是 GM 存储跨标签页同步是异步的 —— NotebookLM 侧 writeResponse 写完答案后【立刻】发批次通知, iLearning 侧收到通知时那条答案可能还没同步到本标签页, 于是判定该题失败并重发; 等答案同步到位, 重发请求已经在路上, 一轮轮叠加就出现了日志里的"尝试 5"。修复: ① iLearning 侧 sendOne 发送前逐题查缓存, status=done 的直接剔除, 全部已答复则整批不发; ② 重试前先等 3 秒让存储同步, 再查一次缓存, 确认真失败才重发; ③ NotebookLM 侧收到批次后同样过滤掉已有答案的题, 从源头省额度, 整批都已答复则直接回报成功不提问。
 // v0.15.2 - 修复批量预取烧额度: ① batchSize 曾因连续失败被降级到 1 (20→10→5→1) 且【永不恢复】, 导致之后每题单独发一个批次 = 每题一次 NotebookLM 对话额度; 现在 flushAll 每次都从界面输入框重新读取用户设定值, 并在批次成功后逐级恢复。② 重试没有上限, 同一题被反复重发(日志出现"尝试 5"), 即使 NotebookLM 已经答过; 现在 attempt 超过 3 次直接判定失败写入缓存并停止, 不再无限重发。③ 新增发送去重: 同一道题 90 秒内不重复发送, 从根上杜绝重复提问。④ 批次发送之间加 1.2 秒间隔, 避免同时塞爆 NotebookLM 队列。
 // v0.15.1 - 新增"🔁 重试失败"按钮。背景: 浮窗白屏那段时间里整套题请求失败, 失败结果被写进缓存; 批量预取看到"已有缓存"就跳过(日志: 缓存的错误响应, 不重试), 导致怎么点批处理都没反应, 只能一道道手动点"重新请求"。新按钮一次性扫出当前试卷所有 status=error 的题, 清掉它们的 request+response 缓存并重新入队, 带二次确认和数量提示; 没有失败题时给出提示不做任何操作。
@@ -86,6 +95,46 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     }
     return null;
   })();
+
+  /* v0.15.5: 全量日志环形缓冲 —— 浮窗日志区只显示最近若干行, 早期内容会被滚掉,
+   * 排查问题时看不到全貌。这里额外留一份完整记录, 供"导出日志"用。 */
+  const __ilhLogBuffer = [];
+  const ILH_LOG_BUFFER_MAX = 2000;
+  function recordLog(side, msg, type) {
+    try {
+      const d = new Date();
+      const ts = d.toLocaleTimeString('zh-CN', { hour12: false }) + '.' + String(d.getMilliseconds()).padStart(3, '0');
+      __ilhLogBuffer.push(`[${ts}] [${side}] [${type || 'info'}] ${msg}`);
+      if (__ilhLogBuffer.length > ILH_LOG_BUFFER_MAX) __ilhLogBuffer.shift();
+    } catch (e) { /* ignore */ }
+  }
+
+  function downloadTextFile(filename, text) {
+    try {
+      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      return true;
+    } catch (e) { console.warn('[ILH] 导出失败', e); return false; }
+  }
+
+  function buildLogExport(side, extra) {
+    const head = [
+      '=============================================',
+      ` iLearning 学习助手 · 完整日志 (${side} 端)`,
+      '=============================================',
+      `导出时间: ${new Date().toLocaleString()}`,
+      `脚本版本: ${(typeof GM_info !== 'undefined' && GM_info.script) ? GM_info.script.version : '未知'}`,
+      `页面地址: ${location.href}`,
+      `日志条数: ${__ilhLogBuffer.length}${__ilhLogBuffer.length >= ILH_LOG_BUFFER_MAX ? ' (已达上限, 更早的已滚出)' : ''}`,
+    ];
+    if (extra) for (const [k, v] of Object.entries(extra)) head.push(`${k}: ${v}`);
+    head.push('=============================================', '');
+    return head.join('\n') + __ilhLogBuffer.join('\n') + '\n';
+  }
 
   /* ═══════════ v0.14.3: 重排风暴 ═══════════
    * 背景: 在带 examResultId 的考试回顾页上, 浮窗有时会卡住不绘制(白屏且无法拖动),
@@ -1252,7 +1301,10 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       },
 
       // 批次部分成功 (NotebookLM 端通知)
-      onBatchPartial(batchId, splitResults, failedPositions) {
+      // v0.15.4-④: envFailure = 环境性失败 (输入框没就绪、NotebookLM 正忙),
+      // 不是内容失败。这类失败【不计入 attempt、不触发 batchSize 降级】,
+      // 否则重试预算全被烧在"输入框没找到"上, 真正该重试的机会反而没了。
+      onBatchPartial(batchId, splitResults, failedPositions, envFailure) {
         const history = this.batchHistory.get(batchId);
         if (!history) {
           log(`⚠️ 收到未知批次结果 ${batchId.slice(-8)}, 忽略`, 'warn');
@@ -1298,7 +1350,11 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           // 整批失败
           this.consecutiveFailures++;
           log(`❌ 批次 ${batchId.slice(-8)} 失败: 仅 ${(successRate*100).toFixed(0)}% (连续 ${this.consecutiveFailures} 次失败)`, 'error');
-          if (this.consecutiveFailures >= 2) {
+          if (envFailure) {
+          this.consecutiveFailures--;   // 抵消上面的 ++, 环境失败不算数
+          log('  ℹ️ 这是环境性失败 (NotebookLM 未就绪), 不计入重试次数、不降级批次', 'debug');
+        }
+        if (!envFailure && this.consecutiveFailures >= 2) {
             const oldSize = this.currentBatchSize;
             // 降级路径: 20 → 10 → 5 → 1
             if (this.currentBatchSize > 10) this.currentBatchSize = 10;
@@ -1309,12 +1365,17 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
             this.consecutiveFailures = 0;
           }
           // 重打包失败的题, 按新 batchSize 发
+          // v0.15.4-③: 原来固定 2 秒就重发, 而 NotebookLM 那边往往还在生成上一轮,
+          // 于是每 2 秒撞一次墙。改成指数退避: 第 2 次等 8s, 第 3 次 20s, 之后 45s。
           const failedQs = failedPositions.map((p) => history.questions.find((q) => q.position === p)).filter(Boolean);
           if (failedQs.length > 0) {
+            const nextAttempt = envFailure ? history.attempt : history.attempt + 1;
+            const backoff = [0, 8000, 20000, 45000][Math.min(Math.max(nextAttempt - 1, 0), 3)] || 45000;
             const sortedFailed = failedQs.sort((a, b) => a.position - b.position);
+            log(`  ⏱ ${Math.round(backoff / 1000)} 秒后重试 ${sortedFailed.length} 题 (尝试 ${nextAttempt})`, 'info');
             for (let i = 0; i < sortedFailed.length; i += this.currentBatchSize) {
               const newBatch = sortedFailed.slice(i, i + this.currentBatchSize);
-              setTimeout(() => this.sendOne(newBatch, history.attempt + 1), 2000 * (i / this.currentBatchSize + 1));
+              setTimeout(() => this.sendOne(newBatch, nextAttempt), backoff + i * 1500);
             }
           }
         }
@@ -1972,6 +2033,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     // === LOG ===
     function log(msg, type = 'info') {
       const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+      recordLog('iLearning', msg, type);   // v0.15.5: 同时进全量缓冲
       const logEl = PD().getElementById('ilh-log');
       if (logEl) {
         const entry = PD().createElement('div');    // v0.15.0: 同上
@@ -2428,6 +2490,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
             <button class="ilh-mini-btn" id="ilh-btn-csv" title="导出全部题目和解析为 CSV (Excel 可打开)">📤 导出题库</button>
             <button class="ilh-mini-btn" id="ilh-btn-import" title="从 CSV 文件导入题库 (会完全清空当前缓存!)">📂 导入题库</button>
             <button class="ilh-mini-btn" id="ilh-btn-retry-failed" title="清除所有失败题的错误缓存并重新发送 (批量预取会跳过已有缓存的题, 包括失败的)">🔁 重试失败</button>
+            <button class="ilh-mini-btn" id="ilh-btn-export-log" title="把完整日志导出成 txt (浮窗里只显示最近若干行, 这里是全量)">📋 导出日志</button>
 
           </div>
           <div class="ilh-explain-actions" id="ilh-actions-edit" style="display:none">
@@ -2507,6 +2570,18 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       PD().getElementById('ilh-btn-csv').addEventListener('click', () => exportCSV());
       PD().getElementById('ilh-btn-import').addEventListener('click', () => importCsvAsBank());
       PD().getElementById('ilh-btn-retry-failed').addEventListener('click', () => retryFailedQuestions());
+      PD().getElementById('ilh-btn-export-log').addEventListener('click', () => {
+        const cacheCount = GM_listValues().filter((k) => k.startsWith('ilh:response:')).length;
+        const txt = buildLogExport('iLearning', {
+          '缓存题数': cacheCount,
+          '批次大小(界面)': (PD().getElementById('ilh-batch-size') || {}).value,
+          '批次大小(实际)': BatchManager.currentBatchSize,
+          '批量预取': (PD().getElementById('ilh-batch-enabled') || {}).checked ? '开' : '关',
+          '已识别题数': batchState.identifiedQuestions.size,
+        });
+        const name = `ilearning-log-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.txt`;
+        if (downloadTextFile(name, txt)) log(`📋 已导出完整日志: ${name} (${__ilhLogBuffer.length} 条)`, 'success');
+      });
 
 
       // v0.6.0: 批量面板事件
@@ -3775,7 +3850,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     GM_addValueChangeListener(Bridge.KEY_BATCH_NOTIFY, (key, oldVal, newVal) => {
       if (!newVal || !newVal.batchId) return;
       if (newVal.status === 'partial' || newVal.status === 'failed') {
-        BatchManager.onBatchPartial(newVal.batchId, newVal.splitResults || {}, newVal.failedPositions || []);
+        BatchManager.onBatchPartial(newVal.batchId, newVal.splitResults || {}, newVal.failedPositions || [], !!newVal.envFailure);
       } else if (newVal.status === 'success') {
         BatchManager.onBatchPartial(newVal.batchId, newVal.splitResults || {}, []);
       }
@@ -4010,6 +4085,7 @@ injectStylesRobust('nlh', `
 
     function log(msg, type = 'info') {
       const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+      recordLog('NotebookLM', msg, type);   // v0.15.5: 同时进全量缓冲
       const logEl = document.getElementById('nlh-log');
       if (logEl) {
         const entry = document.createElement('div');
@@ -4467,6 +4543,8 @@ injectStylesRobust('nlh', `
       let lastLen = 0;
       let lastChangeTs = startTs;
       let completedAt = null;
+      let settleLastLen = 0;   // v0.15.4: 收尾期间的文本长度基准
+      let stableCount = 0;     // v0.15.4: 连续多少次探测文本没再增长
       let lastStatus = null;
       let okStartedAt = null;
 
@@ -4499,17 +4577,41 @@ injectStylesRobust('nlh', `
         }
 
         // 主判定: 完成标记 (mat-card-actions thumb_up 出现)
+        // v0.15.4-①: thumb_up 只代表【第一段】答完, 多题批次里 Gemini 还在继续写。
+        // 原来固定收尾 1.5s 就抓, 8 题批次只抓到 804 字符(2 题)。现在:
+        //   - 收尾时长按题数动态计算 (每题 +1.2s, 上限 20s)
+        //   - 必须文本【连续 2 次探测都不再增长】才算真的写完
+        //   - 若已出现的 ===Q数字=== 标记数 < 批次题数, 且文本还在长, 就继续等
         if (result.complete && lastLen >= CONFIG.minResponseChars) {
+          const expectN = (req && req.positions && req.positions.length) || 1;
+          const settleMs = Math.min(1500 + (expectN - 1) * 1200, 20000);
           if (completedAt === null) {
             completedAt = Date.now();
-            log(`  ✅ 检测到完成标记 (thumb_up), 收尾 1.5s`, 'success');
+            stableCount = 0;
+            log(`  ✅ 检测到完成标记 (thumb_up), 按 ${expectN} 题收尾 ${(settleMs / 1000).toFixed(1)}s`, 'success');
           }
-          if (Date.now() - completedAt > 1500) {
-            // 收尾再抓一次, 拿最完整内容
+          // 文本还在增长 → 重新计时, 说明 Gemini 仍在写后面的题
+          if (currentLen > settleLastLen) {
+            settleLastLen = currentLen;
+            completedAt = Date.now();
+            stableCount = 0;
+          } else {
+            stableCount++;
+          }
+          const waited = Date.now() - completedAt;
+          if (waited > settleMs && stableCount >= 2) {
             const finalResult = findCurrentAIResponse(req);
             const finalEl = (finalResult.status === 'ok' && finalResult.el) ? finalResult.el : lastEl;
             const text = extractFormattedText(finalEl);
-            log(`  ✅ 抓取最终响应 (${text ? text.length : 0} 字符, 含格式)`, 'success');
+            // 标记数校验: 不够且还没等满上限 → 再等等
+            const found = (String(text || '').match(/===\s*Q\s*\d+\s*===/g) || []).length;
+            if (found < expectN && (Date.now() - okStartedAt) < CONFIG.maxWaitMs * 0.8) {
+              log(`  ⏳ 只找到 ${found}/${expectN} 个题号标记, 内容可能还没写完, 继续等…`, 'warn');
+              completedAt = Date.now();
+              stableCount = 0;
+              continue;
+            }
+            log(`  ✅ 抓取最终响应 (${text ? text.length : 0} 字符, ${found}/${expectN} 个题号标记)`, found >= expectN ? 'success' : 'warn');
             return text;
           }
           continue;
@@ -4602,16 +4704,29 @@ injectStylesRobust('nlh', `
 
       try {
         // 1. 找输入框
-        const inputEl = findInputElement();
+        // v0.15.4-②: Gemini 生成期间输入框会被"停止"按钮取代, findInputElement 返回 null。
+        // 这是【环境暂时不可用】, 不是内容失败 —— 原来直接判整批失败, 导致 iLearning 每 2 秒重发一次,
+        // 撞上仍在生成又立刻失败, attempt 一路烧到 8。现在改为轮询等待输入框出现。
+        let inputEl = findInputElement();
         if (!inputEl) {
-          log('❌ 未找到 NotebookLM 输入框', 'error');
-          batchReq.positions.forEach((p) => {
-            const qId = batchReq.positionMap[p];
-            Bridge.writeResponse(qId, '', 'error', '找不到 NotebookLM 输入框');
-          });
-          Bridge.completeBatch(batchReq.id);
-          Bridge.notifyBatchResult(batchReq.id, 'failed', { failedPositions: batchReq.positions });
-          return;
+          const deadline = Date.now() + 120000;   // 最多等 2 分钟
+          let waited = 0;
+          log('⏳ 输入框暂不可用 (上一轮可能还在生成), 等待中…', 'warn');
+          while (!inputEl && Date.now() < deadline) {
+            await sleep(2000);
+            waited += 2000;
+            inputEl = findInputElement();
+            if (waited % 20000 === 0) log(`  ⏳ 已等待 ${waited / 1000}s…`, 'debug');
+          }
+          if (inputEl) {
+            log(`  ✅ 输入框已就绪 (等了 ${waited / 1000}s), 继续提问`, 'success');
+          } else {
+            log('❌ 等待 120s 后输入框仍不可用, 判定失败', 'error');
+            Bridge.completeBatch(batchReq.id);
+            // envFailure: 告诉 iLearning 这是环境问题, 不要计入重试次数
+            Bridge.notifyBatchResult(batchReq.id, 'failed', { failedPositions: batchReq.positions, envFailure: true });
+            return;
+          }
         }
 
         // 2. 输入 prompt
@@ -4913,6 +5028,7 @@ injectStylesRobust('nlh', `
           <button class="nlh-btn" id="nlh-btn-detect">🔍 仅探测</button>
           <button class="nlh-btn" id="nlh-btn-export">📥 CSV</button>
           <button class="nlh-btn" id="nlh-btn-clear">🗑️ 清空</button>
+          <button class="nlh-btn" id="nlh-btn-export-log" title="导出完整日志 (面板里只显示最近若干行)">📋 日志</button>
         </div>
         <div id="nlh-log-section">
           <div id="nlh-log-header">
@@ -4956,6 +5072,17 @@ injectStylesRobust('nlh', `
           log('❌ 未找到输入框', 'error');
         }
       });
+      document.getElementById('nlh-btn-export-log').addEventListener('click', () => {
+        const txt = buildLogExport('NotebookLM', {
+          '当前状态': state.busy ? '忙碌' : '空闲',
+          '已处理': state.processed,
+          '排队中': (GM_getValue(Bridge.KEY_BATCH_QUEUE, []) || []).length,
+          '输入框': findInputElement() ? '可用' : '不可用(可能正在生成)',
+        });
+        const name = `notebooklm-log-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.txt`;
+        if (downloadTextFile(name, txt)) log(`📋 已导出完整日志: ${name} (${__ilhLogBuffer.length} 条)`, 'success');
+      });
+
       document.getElementById('nlh-btn-clear').addEventListener('click', () => {
         if (!confirm('清空所有缓存的解析? 之后切回老题会重新请求。')) return;
         Bridge.clearAll();
