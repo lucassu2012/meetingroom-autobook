@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.15.5
+// @version      0.15.6
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,14 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.15.6 - 依据完整日志(导出功能拿到的)修三处:
+//   A. v0.15.4 的 expectN 取错对象 —— waitForResponse 收到的是 fakeReq(指纹用), 不是批次对象, 导致 12 题批次被"按 1 题收尾",
+//      日志出现 "12/1 个题号标记"。改为在 fakeReq 上带 expectCount, 收尾时长与标记数校验都用它。
+//   B. 【真根因】自动遍历切题失败的题被静默跳过, 从未进入待发送名单: 日志显示 19/20/21 题切换失败 3 次后跳过,
+//      batchState 只有 25 题(应 28), 批次名单里根本没有这三题, 但界面却显示"批处理已启动, 答案马上到"。
+//      改为: 记录跳过的题 → 遍历结束后自动补扫一轮(间隔更长) → 仍失败的明确列出并提示手动翻到该题。
+//   C. 清理"(阶段 A: 仅 UI 模拟, 阶段 B 真正发送)"这句陈旧文案; 未被纳入批次的题不再谎报"答案马上到",
+//      改为如实提示"这道题没能自动识别, 请手动停留几秒"。
 // v0.15.5 - 两端各新增"📋 导出日志"。起因: 排查批量解析问题时, 浮窗日志区只保留最近 N 行且早期内容会被滚掉, 靠截图只能看到片段, 导致基于不完整日志下结论。现在把所有日志同时存进一个内存环形缓冲(默认 2000 条, 含毫秒时间戳与级别), 一键导出为 .txt; 导出内容附带环境信息(版本/URL/缓存数/批次设置)便于对照。日志区显示行数不变, 不影响性能。
 // v0.15.4 - 一次性修掉批量解析的四个连锁 bug (实测日志: 8 题批次只抓到 804 字符/2 题, 随后 attempt 2→8 每 2 秒一轮全部"未找到输入框"):
 //   ① 抓取太早 —— thumb_up 只是【第一题】答完的标记, Gemini 还在写后面的题。原来固定收尾 1.5s 就抓。
@@ -1010,6 +1018,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
 
       async start() {
         if (this.active) return;
+        this.skipped = [];   // v0.15.6-B: 本轮切题失败的题号
         // v0.13.5: 轮询等 sidebar 渲染 —— 原来固定 sleep 2s, 考试回顾页 (examResultId)
         // 的 Vue 渲染更慢, 2s 时 sidebar 还是空的, 自动遍历就被永久跳过了。
         let items = new Map();
@@ -1080,7 +1089,38 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           if (switched) {
             this.ensureQueued(state.currentQuestion);
           } else {
-            log(`  ⚠️ 切到第 ${pos} 题失败 (当前: ${state.currentQuestion?.position || '无'}, 重试 3 次仍失败), 跳过`, 'warn');
+            // v0.15.6-B: 不再静默跳过 —— 记下来, 遍历结束后补扫一轮。
+            // 实测日志里 19/20/21 就是这样丢的: 切题失败 → 没识别 → 没进批次名单 → 永远等不到答案。
+            this.skipped.push(pos);
+            log(`  ⚠️ 切到第 ${pos} 题失败 (当前: ${state.currentQuestion?.position || '无'}), 稍后补扫`, 'warn');
+          }
+        }
+
+        // v0.15.6-B: 补扫一轮 —— 前面切失败的题, 用更长的间隔再试一次。
+        // 切题失败多半是页面还没渲染完/sidebar 被虚拟滚动回收, 等一等往往就好了。
+        if (!this.cancelled && this.skipped.length > 0) {
+          const pending = this.skipped.slice();
+          this.skipped = [];
+          log(`🔁 补扫 ${pending.length} 道切换失败的题: ${pending.join(', ')}`, 'info');
+          await sleep(1500);
+          for (const pos of pending) {
+            if (this.cancelled) break;
+            const items = StatusDot.findSidebarItems();
+            const el = items.get(pos);
+            if (!el) { this.skipped.push(pos); continue; }
+            let ok = false;
+            for (let a = 1; a <= 3 && !ok; a++) {
+              this.robustClick(el, pos);
+              await sleep(1800);          // 比主循环更宽裕
+              ok = state.currentQuestion && state.currentQuestion.position === pos;
+            }
+            if (ok) {
+              this.ensureQueued(state.currentQuestion);
+              log(`  ✅ 补扫成功: 第 ${pos} 题`, 'success');
+            } else {
+              this.skipped.push(pos);
+              log(`  ❌ 补扫仍失败: 第 ${pos} 题`, 'warn');
+            }
           }
         }
 
@@ -1092,6 +1132,11 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           return;
         }
         log(`✅ 自动遍历完成: ${this.visited}/${this.total} 题已识别 (batchState 含 ${batchState.identifiedQuestions.size} 题)`, 'success');
+        // v0.15.6-B: 补扫后仍然失败的, 必须明确告诉用户, 不能装作没事
+        if (this.skipped.length > 0) {
+          log(`⚠️ 第 ${this.skipped.join(', ')} 题始终切不过去, 未纳入批量发送`, 'warn');
+          log(`   请手动翻到这些题并停留 2 秒, 识别后再点"立即批处理"`, 'warn');
+        }
 
         // v0.10.0: 批量模式下, 识别完毕后触发批量预取
         if (batchState.enabled) {
@@ -3555,8 +3600,13 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
             log(`💾 缓存命中: ${q.id}`, 'success');
           } else if (cached && cached.status === 'error') {
             showExplain('error', cached.error || '上次失败', '上次失败 · 关闭批量模式可单题重试');
+          } else if (batchState.batchStarted && batchState.identifiedQuestions.has(q.id)) {
+            // v0.15.6-C: 只有【确实在批次名单里】的题才说"马上到"
+            showExplain('waiting', '⏳ 批处理已启动, 这道题已在队列中, 答案到达后会自动显示。', '批处理中');
           } else if (batchState.batchStarted) {
-            showExplain('waiting', '⏳ 批处理已启动, 这道题答案马上到...\n\n(阶段 A: 仅 UI 模拟, 阶段 B 真正发送)', '批处理中');
+            // 不在名单里 = 自动遍历时没能识别它 (多半是切题失败)。如实说, 别谎报。
+            showExplain('waiting', '⚠️ 这道题没能被自动识别, 所以【没有】发给 NotebookLM。\n\n'
+              + '现在你已经翻到它了, 稍等 2 秒让它被识别, 然后点浮窗里的「立即批处理」或「🔄 重新请求」即可。', '未纳入批次');
           } else {
             const missing = getMissingPositions();
             if (missing.length > 0) {
@@ -4583,7 +4633,7 @@ injectStylesRobust('nlh', `
         //   - 必须文本【连续 2 次探测都不再增长】才算真的写完
         //   - 若已出现的 ===Q数字=== 标记数 < 批次题数, 且文本还在长, 就继续等
         if (result.complete && lastLen >= CONFIG.minResponseChars) {
-          const expectN = (req && req.positions && req.positions.length) || 1;
+          const expectN = (req && (req.expectCount || (req.positions && req.positions.length))) || 1;
           const settleMs = Math.min(1500 + (expectN - 1) * 1200, 20000);
           if (completedAt === null) {
             completedAt = Date.now();
@@ -4750,6 +4800,10 @@ injectStylesRobust('nlh', `
           position: '0',
           total: '0',
           isBatch: true,
+          // v0.15.6-A: 把真实题数带给 waitForResponse。
+          // 之前用 req.positions.length, 但这里传的是 fakeReq(只做响应指纹), 没有 positions,
+          // 于是 expectN 恒为 1 —— 12 题批次被"按 1 题收尾", 日志出现 "12/1 个题号标记"。
+          expectCount: batchReq.positions.length,
         };
         const responseText = await waitForResponse(fakeReq);
         if (!responseText || responseText.length < 100) {
