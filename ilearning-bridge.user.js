@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.13.7
+// @version      0.14.0
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.14.0 - 【修复白屏】根因: 在带 examResultId 的考试回顾页上, 偏移定位的 position:fixed 元素不绘制背景 (实测对照: 普通 div ✅ / flex+半透明子元素 ✅ / 再加 overflow+圆角+阴影 ✅ / 但 position:fixed 独立小方块 ❌ 画不出背景)。改法: 浮窗不再自己做 fixed 定位, 改成挂在一个【铺满视口的透明 fixed 容器 #ilh-root】里, 用 flex 靠右下角对齐, 浮窗本身回归普通流 —— 这正是实测中能正常渲染的结构。容器 pointer-events:none 不吃鼠标事件, 浮窗自身 pointer-events:auto。同时撤销 v0.13.6 的 popover 顶层方案 (对照实测同样画不出背景, 且从未解决问题); 拖动从改 left/top 改为改 transform (不破坏新的绘制结构)。
 // v0.13.7 - 找到"白屏"真凶: 浮窗是【透明】的, 看到的白色是背景页面 div#app (rgb(246,246,246)) 透过来的。原因是 background 简写会把 background-color 重置为 transparent, 深色全靠那层 linear-gradient, 渐变一旦没画出来浮窗就全透明。修复: (1) 拆成 background-color (实心深色) + background-image (渐变) 两条声明, 渐变失效也还有实心底色兜底; (2) 撤掉 v0.13.5 误加的 '#ilh-panel span/label/div:not() { background-color: transparent !important }' —— 状态灯是 <span>, JS 设的内联背景打不过 !important, 导致 28 个状态灯全部变透明(这也是为什么白屏时连数字方块都看不见); (3) 诊断补盲区: 之前只扫浮窗外部元素, 现在也扫子元素; 过滤掉画在我们下面的静态元素(div#app 那种误报); 补充报告 background-color/background-image/forced-colors 等; (4) 新增 __ilhPaintTest(): 把浮窗刷成纯红 3 秒, 一眼区分"背景没画出来"还是"被别的东西盖住"。
 // v0.13.6 - 彻底解决"白屏"(浮窗被别的悬浮层盖住): v0.13.5 的样式自检已证明我们自己的样式是好的, 问题是有东西画在我们上面。z-index 已是最大值 2147483647, 再拼数字没用, 所以改用浏览器原生的 Top Layer (Popover API): 浮窗用 popover=manual + showPopover() 提升到顶层, 顶层元素永远画在所有普通页面内容之上, 且不受祖先 filter/transform/opacity 造成的层叠上下文限制。同时配套: (1) 覆盖 popover 的 UA 默认样式 (background-color:Canvas / border:solid / padding / margin:auto / inset:0) 否则浮窗会变白框; (2) ::backdrop 设为全透明, 不遮挡页面; (3) 看门狗每 3 秒检查一次, 掉出顶层自动重新提升 (SPA 路由切换会重建 DOM); (4) 浏览器不支持 Popover 时自动降级到原方案并在日志说明。新增遮挡诊断 __ilhDiagnose(): 扫描全文档找出覆盖浮窗超过 40% 且带不透明背景的元素, 报告 tag/id/class/z-index/背景色, 并检查祖先链上的 filter/opacity/transform/mix-blend-mode; 启动 6 秒后自动跑一次, 发现可疑遮挡会在日志告警。
 // v0.13.5 - 修复考试回顾页 (examResultId) 浮窗"白屏": (1) z-index 提到 2147483647, 不再被页面满屏水印层压住; (2) 关键视觉属性 (background/color/position/z-index/border/font) 全部加 !important, 抵抗页面和其它浏览器扩展 (如 YouMind) 注入的全局 CSS; (3) 新增透明基线规则, 防止 div{background:#fff!important} 类规则把浮窗内部刷白; (4) 样式注入改为 injectStylesRobust: GM_addStyle 失败自动降级到手动 <style>, 并在 1s/3s/8s 重新注入 (让我们的样式表永远排在页面后加载的样式表之后); (5) 启动 1.5s/5s 做样式自检, 发现被覆盖自动启用内联 !important 兜底并在日志里告警; (6) 自动遍历改为轮询等待 sidebar 最多 15 秒 (原固定 2 秒, 回顾页渲染慢会漏)。
@@ -79,41 +80,19 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     return null;
   })();
 
-  /* ═══════════ v0.13.6: 把浮窗提升到浏览器"顶层" (Top Layer) ═══════════
-   * 为什么需要: z-index 最大只能到 2147483647, 一旦别的扩展/页面也用这个值,
-   *   谁在 DOM 里靠后谁就赢, 我们没法保证赢。而且祖先元素上的 filter / transform /
-   *   opacity 会新建层叠上下文, 把我们的 z-index 直接"关"在里面。
-   * 怎么解决: 浏览器有个独立于页面的 Top Layer (全屏、<dialog>、popover 用的就是它)。
-   *   顶层元素永远画在所有普通内容之上, 也不受祖先层叠上下文影响。
-   *   用 popover="manual" 是因为它不会被 Esc 或点击外部关掉。
+  /* ═══════════ v0.14.0: 铺满视口的透明根容器 ═══════════
+   * 为什么要这一层: 实测在带 examResultId 的考试回顾页上, 偏移定位的
+   * position:fixed 小元素【不绘制背景】; 而"铺满视口的 fixed 容器 +
+   * 里面的普通流子元素"这个结构渲染完全正常 (对照实验 A/C/D 通过, B 失败)。
+   * 所以浮窗不再自己做 fixed 定位, 改为挂在这个容器里用 flex 靠右下对齐。
    */
-  function supportsTopLayer() {
-    return typeof HTMLElement !== 'undefined'
-      && typeof HTMLElement.prototype.showPopover === 'function';
-  }
-
-  function promoteToTopLayer(el) {
-    if (!el || !supportsTopLayer()) return false;
-    try {
-      if (el.getAttribute('popover') !== 'manual') el.setAttribute('popover', 'manual');
-      if (!el.matches(':popover-open')) el.showPopover();
-      return true;
-    } catch (e) {
-      console.warn('[ILH-BRIDGE] showPopover 失败:', e);
-      return false;
-    }
-  }
-
-  /** 看门狗: SPA 路由切换/页面重绘可能把浮窗踢出顶层, 定期检查并重新提升 */
-  function keepInTopLayer(panelId, intervalMs) {
-    if (!supportsTopLayer()) return null;
-    return setInterval(() => {
-      const el = document.getElementById(panelId);
-      if (!el || !el.isConnected) return;
-      try {
-        if (!el.matches(':popover-open')) promoteToTopLayer(el);
-      } catch (e) { /* ignore */ }
-    }, intervalMs || 3000);
+  function ensureRootContainer(rootId) {
+    let root = document.getElementById(rootId);
+    if (root && root.isConnected) return root;
+    root = document.createElement('div');
+    root.id = rootId;
+    document.body.appendChild(root);
+    return root;
   }
 
   /* ═══════════ v0.13.6: 遮挡诊断 ═══════════
@@ -142,10 +121,10 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     };
 
     // 浮窗自己在不在顶层? 在顶层的话, 只有同样在顶层的元素才可能盖住我们
-    let panelInTopLayer = false;
-    try { panelInTopLayer = panel.matches(':popover-open'); } catch (e) { /* ignore */ }
+    // v0.14.0: 已不用 popover 顶层, 判据回归 z-index
+    const panelInTopLayer = false;
     const inTopLayer = (el) => {
-      try { return el.matches(':popover-open, :modal, :fullscreen'); } catch (e) { return false; }
+      try { return el.matches(':modal, :fullscreen'); } catch (e) { return false; }
     };
 
     // 1) 祖先链上会新建层叠上下文 / 影响绘制的属性
@@ -372,7 +351,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     const hasGradient = bg.indexOf('gradient') >= 0;
     const isBlank = /rgba?\(0,\s*0,\s*0,\s*0\)|transparent|rgb\(255,\s*255,\s*255\)/.test(bg) && !hasGradient;
     return {
-      ok: cs.position === 'fixed' && hasGradient && !isBlank,
+      // v0.14.0: 浮窗已改为普通流(定位交给 #ilh-root), 不再检查 position:fixed
+      ok: hasGradient && !isBlank,
       position: cs.position,
       background: bg.trim().slice(0, 80),
       zIndex: cs.zIndex,
@@ -1308,11 +1288,31 @@ injectStylesRobust('ilh', `
          已删除 —— 状态灯 .ilh-grid-dot 是 <span>, 它的颜色由 JS 内联设置,
          内联样式优先级打不过带强制标记的规则, 结果 28 个状态灯全变透明了。 */
 
+      /* v0.14.0: 铺满视口的透明容器。浮窗自己不再做 fixed 定位 ——
+         实测在考试回顾页上, 偏移定位的 fixed 小方块画不出背景, 而
+         "铺满视口的 fixed 容器 + 里面的普通流子元素" 完全正常。 */
+      #ilh-root {
+        position: fixed !important;
+        left: 0 !important; top: 0 !important;
+        width: 100vw !important; height: 100vh !important;
+        z-index: 2147483647 !important;
+        pointer-events: none !important;   /* 不挡页面操作 */
+        background: transparent !important;
+        display: flex !important;
+        align-items: flex-end !important;      /* 靠下 */
+        justify-content: flex-end !important;  /* 靠右 */
+        padding: 24px !important;
+        box-sizing: border-box !important;
+        overflow: hidden !important;
+      }
+
       #ilh-panel {
-        position: fixed !important; bottom: 24px; right: 24px;
+        position: relative;
+        pointer-events: auto !important;   /* 浮窗本身要能点 */
+        flex: none;
         width: ${CONFIG.panelWidth}px;
         /* v0.12.8: 固定高度, 不随内容变化伸缩 */
-        height: min(${CONFIG.panelMaxHeight}px, calc(100vh - 48px));
+        height: min(${CONFIG.panelMaxHeight}px, 100%);
         /* v0.13.7: 必须拆成两条 —— background 简写会把 background-color 重置成 transparent,
            渐变一旦没画出来浮窗就全透明, 背景页面直接透上来 (这就是"白屏"的真因)。
            实心底色放在下面兜底, 渐变只是锦上添花。 */
@@ -1330,26 +1330,6 @@ injectStylesRobust('ilh', `
       }
       #ilh-panel.collapsed { height: 44px; }
 
-      /* v0.13.6: 覆盖 popover 的浏览器默认样式。
-         UA 默认给 [popover] 加了 background-color:Canvas(白) / border:solid /
-         padding:0.25em / margin:auto / inset:0, 不盖掉的话浮窗会变成一个白框。
-         注意 top/left 只用普通优先级 (拖动时的内联 inset 还要能覆盖它)。 */
-      #ilh-panel:popover-open {
-        margin: 0 !important;
-        padding: 0 !important;
-        border: none !important;
-        max-width: none !important;
-        max-height: none !important;
-      }
-      #ilh-panel {
-        top: auto;
-        left: auto;
-      }
-      #ilh-panel::backdrop {
-        background: transparent !important;
-        -webkit-backdrop-filter: none !important;
-        backdrop-filter: none !important;
-      }
 
       /* v0.12.8: 各模块固定高度, 不随内容塌缩或撑大 */
       #ilh-panel > #ilh-header,
@@ -2265,9 +2245,8 @@ injectStylesRobust('ilh', `
           <div id="ilh-log"></div>
         </div>
       `);
-      document.body.appendChild(panel);
-      // v0.13.6: 提升到浏览器顶层, 保证不被任何页面元素/其它扩展的悬浮层盖住
-      promoteToTopLayer(panel);
+      // v0.14.0: 挂到铺满视口的根容器里 (不再自己做 fixed 定位)
+      ensureRootContainer('ilh-root').appendChild(panel);
 
       document.getElementById('ilh-toggle-panel').addEventListener('click', () => {
         state.panelCollapsed = !state.panelCollapsed;
@@ -2387,19 +2366,24 @@ injectStylesRobust('ilh', `
       });
     }
 
+    /* v0.14.0: 拖动改用 transform 位移。
+     * 原来是改 left/top + right/bottom:auto, 那会把浮窗变回"偏移定位"的状态,
+     * 正是画不出背景的那种结构。改用 transform 不影响布局和绘制结构。 */
     function makeDraggable(el, handle) {
-      let dragging = false, dx = 0, dy = 0;
+      let dragging = false, startX = 0, startY = 0, baseX = 0, baseY = 0;
+      const readOffset = () => {
+        const m = /translate\(\s*(-?[\d.]+)px\s*,\s*(-?[\d.]+)px\s*\)/.exec(el.style.transform || '');
+        return m ? [parseFloat(m[1]), parseFloat(m[2])] : [0, 0];
+      };
       handle.addEventListener('mousedown', (e) => {
         dragging = true;
-        dx = e.clientX - el.offsetLeft;
-        dy = e.clientY - el.offsetTop;
+        startX = e.clientX; startY = e.clientY;
+        [baseX, baseY] = readOffset();
         e.preventDefault();
       });
       document.addEventListener('mousemove', (e) => {
         if (!dragging) return;
-        el.style.left = (e.clientX - dx) + 'px';
-        el.style.top = (e.clientY - dy) + 'px';
-        el.style.right = 'auto'; el.style.bottom = 'auto';
+        el.style.transform = `translate(${baseX + e.clientX - startX}px, ${baseY + e.clientY - startY}px)`;
       });
       document.addEventListener('mouseup', () => { dragging = false; });
     }
@@ -3425,19 +3409,15 @@ injectStylesRobust('ilh', `
     setTimeout(() => ilhStyleSelfCheck('1.5s'), 1500);
     setTimeout(() => ilhStyleSelfCheck('5s'), 5000);
 
-    /* v0.13.6: 顶层 (Top Layer) 状态汇报 + 看门狗 */
-    if (supportsTopLayer()) {
-      keepInTopLayer('ilh-panel', 3000);
-      setTimeout(() => {
-        const el = document.getElementById('ilh-panel');
-        let ok = false;
-        try { ok = !!(el && el.matches(':popover-open')); } catch (e) { /* ignore */ }
-        log(ok ? '🔝 浮窗已提升到浏览器顶层 (不会再被其它悬浮层盖住)'
-               : '⚠️ 浮窗未能进入顶层, 仍使用 z-index 方案', ok ? 'success' : 'warn');
-      }, 1200);
-    } else {
-      log('ℹ️ 当前浏览器不支持 Popover 顶层 (需 Chrome 114+), 沿用 z-index 方案', 'debug');
-    }
+    /* v0.14.0: 根容器看门狗 —— SPA 路由切换可能把容器或浮窗摘掉, 定期检查并挂回 */
+    setInterval(() => {
+      try {
+        const p = document.getElementById('ilh-panel');
+        if (!p) return;
+        const root = ensureRootContainer('ilh-root');
+        if (p.parentElement !== root) root.appendChild(p);
+      } catch (e) { /* ignore */ }
+    }, 3000);
 
     /* v0.13.6: 遮挡自动诊断 —— 启动 6 秒后跑一次, 发现有东西盖在浮窗上就告警 */
     function ilhRunDiagnose(verbose) {
@@ -3472,7 +3452,6 @@ injectStylesRobust('ilh', `
 
     if (typeof unsafeWindow !== 'undefined') {
       unsafeWindow.__ilhDiagnose = () => ilhRunDiagnose(true);
-      unsafeWindow.__ilhTopLayer = () => promoteToTopLayer(document.getElementById('ilh-panel'));
       unsafeWindow.__ilhPaintTest = (ms) => paintTestPanel('ilh-panel', ms);
     }
 
@@ -3616,10 +3595,28 @@ injectStylesRobust('nlh', `
         background-color: transparent !important;
       }
 
+      /* v0.14.0: 同 iLearning 端 —— 铺满视口的透明容器 + 普通流浮窗 */
+      #nlh-root {
+        position: fixed !important;
+        left: 0 !important; top: 0 !important;
+        width: 100vw !important; height: 100vh !important;
+        z-index: 2147483647 !important;
+        pointer-events: none !important;
+        background: transparent !important;
+        display: flex !important;
+        align-items: flex-end !important;
+        justify-content: flex-end !important;
+        padding: 24px !important;
+        box-sizing: border-box !important;
+        overflow: hidden !important;
+      }
+
       #nlh-panel {
-        position: fixed !important; bottom: 24px; right: 24px;
+        position: relative;
+        pointer-events: auto !important;
+        flex: none;
         width: ${CONFIG.panelWidth}px;
-        max-height: ${CONFIG.panelMaxHeight}px;
+        max-height: min(${CONFIG.panelMaxHeight}px, 100%);
         /* v0.13.7: 同 iLearning 端, 实心底色兜底 */
         background-color: #1a2e2a !important;
         background-image: linear-gradient(135deg, #1a2e2a 0%, #1f3a3f 100%) !important;
@@ -3634,23 +3631,6 @@ injectStylesRobust('nlh', `
       }
       #nlh-panel.collapsed { max-height: 44px; }
 
-      /* v0.13.6: 同 iLearning 端, 覆盖 popover 的 UA 默认样式 */
-      #nlh-panel:popover-open {
-        margin: 0 !important;
-        padding: 0 !important;
-        border: none !important;
-        max-width: none !important;
-        max-height: none !important;
-      }
-      #nlh-panel {
-        top: auto;
-        left: auto;
-      }
-      #nlh-panel::backdrop {
-        background: transparent !important;
-        -webkit-backdrop-filter: none !important;
-        backdrop-filter: none !important;
-      }
       #nlh-header {
         padding: 11px 14px;
         background: rgba(0,0,0,0.28) !important;
@@ -4650,9 +4630,8 @@ injectStylesRobust('nlh', `
           <div id="nlh-log"></div>
         </div>
       `);
-      document.body.appendChild(panel);
-      // v0.13.6: 同上
-      promoteToTopLayer(panel);
+      // v0.14.0: 同上
+      ensureRootContainer('nlh-root').appendChild(panel);
 
       document.getElementById('nlh-toggle-panel').addEventListener('click', () => {
         state.panelCollapsed = !state.panelCollapsed;
@@ -4691,18 +4670,21 @@ injectStylesRobust('nlh', `
 
       // 拖拽
       const handle = document.getElementById('nlh-header');
-      let dragging = false, dx = 0, dy = 0;
+      // v0.14.0: 改用 transform 位移 (改 left/top 会退回"偏移定位"结构, 那正是画不出背景的形态)
+      let dragging = false, startX = 0, startY = 0, baseX = 0, baseY = 0;
+      const readOffset = () => {
+        const m = /translate\(\s*(-?[\d.]+)px\s*,\s*(-?[\d.]+)px\s*\)/.exec(panel.style.transform || '');
+        return m ? [parseFloat(m[1]), parseFloat(m[2])] : [0, 0];
+      };
       handle.addEventListener('mousedown', (e) => {
         dragging = true;
-        dx = e.clientX - panel.offsetLeft;
-        dy = e.clientY - panel.offsetTop;
+        startX = e.clientX; startY = e.clientY;
+        [baseX, baseY] = readOffset();
         e.preventDefault();
       });
       document.addEventListener('mousemove', (e) => {
         if (!dragging) return;
-        panel.style.left = (e.clientX - dx) + 'px';
-        panel.style.top = (e.clientY - dy) + 'px';
-        panel.style.right = 'auto'; panel.style.bottom = 'auto';
+        panel.style.transform = `translate(${baseX + e.clientX - startX}px, ${baseY + e.clientY - startY}px)`;
       });
       document.addEventListener('mouseup', () => { dragging = false; });
     }
