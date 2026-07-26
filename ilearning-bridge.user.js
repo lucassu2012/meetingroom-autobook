@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.15.1
+// @version      0.15.3
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,8 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.15.3 - 修复"NotebookLM 已答复但学习助手仍重复提问": 根因是 GM 存储跨标签页同步是异步的 —— NotebookLM 侧 writeResponse 写完答案后【立刻】发批次通知, iLearning 侧收到通知时那条答案可能还没同步到本标签页, 于是判定该题失败并重发; 等答案同步到位, 重发请求已经在路上, 一轮轮叠加就出现了日志里的"尝试 5"。修复: ① iLearning 侧 sendOne 发送前逐题查缓存, status=done 的直接剔除, 全部已答复则整批不发; ② 重试前先等 3 秒让存储同步, 再查一次缓存, 确认真失败才重发; ③ NotebookLM 侧收到批次后同样过滤掉已有答案的题, 从源头省额度, 整批都已答复则直接回报成功不提问。
+// v0.15.2 - 修复批量预取烧额度: ① batchSize 曾因连续失败被降级到 1 (20→10→5→1) 且【永不恢复】, 导致之后每题单独发一个批次 = 每题一次 NotebookLM 对话额度; 现在 flushAll 每次都从界面输入框重新读取用户设定值, 并在批次成功后逐级恢复。② 重试没有上限, 同一题被反复重发(日志出现"尝试 5"), 即使 NotebookLM 已经答过; 现在 attempt 超过 3 次直接判定失败写入缓存并停止, 不再无限重发。③ 新增发送去重: 同一道题 90 秒内不重复发送, 从根上杜绝重复提问。④ 批次发送之间加 1.2 秒间隔, 避免同时塞爆 NotebookLM 队列。
 // v0.15.1 - 新增"🔁 重试失败"按钮。背景: 浮窗白屏那段时间里整套题请求失败, 失败结果被写进缓存; 批量预取看到"已有缓存"就跳过(日志: 缓存的错误响应, 不重试), 导致怎么点批处理都没反应, 只能一道道手动点"重新请求"。新按钮一次性扫出当前试卷所有 status=error 的题, 清掉它们的 request+response 缓存并重新入队, 带二次确认和数量提示; 没有失败题时给出提示不做任何操作。
 // v0.15.0 - 【白屏根治】把浮窗整体迁入 <iframe>。决定性实测: 用浮窗的真实 HTML + 真实 CSS 在 iframe 里原样重建 → 完整深色渲染, 而同一时刻宿主页面里的真实浮窗仍是白的。机制报告排除了合成层超限(动画元素 1 / will-change 0 / fixed 10)、水印层干扰(pointer-events:none, 无混合/滤镜/变换)、浮窗过复杂(139 节点) —— 根因是 Chromium 在该页面上的合成缺陷, 页面内无法规避。iframe 是浏览器里唯一真正独立的渲染单元, 宿主的合成状态影响不到它内部。改造: 面板 DOM 与样式全部写入 iframe 文档; 新增 PD() 统一取面板文档, 全部面板 DOM 调用改走 PD(); 拖动与键盘拦截同时监听宿主与 iframe 两个文档; sidebar 状态灯仍注入 iLearning 自身 DOM。
 // v0.14.3 - 【白屏缓解】实测证明浮窗在问题页面上【能】正常渲染: 运行七变体诊断脚本(一次创建 7 个 fixed 容器 + 克隆大量 DOM)之后, 真实浮窗自己恢复了深色显示。同时变体的黑白状态几秒内会互相变化, 说明这不是某个 CSS 属性的固定缺陷, 而是该页面上合成器状态不稳定(谁先画、谁卡住取决于时序), 此前想找'那一个属性'的方向是错的。对策: 把实测有效的动作(大规模重排)做成自动机制 forceRepaintStorm() —— 反复创建/移除屏幕外的临时 fixed 元素并强制同步布局, 在浮窗建好后的 2s/5s/10s/20s 各跑一次; 另提供 __ilhKick() 手动触发。对正常页面无副作用(临时元素在屏幕外, 毫秒级)。
@@ -908,6 +910,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     const batchState = {
       enabled: true,                       // 默认开
       batchSize: 20,                       // 默认每批 20 题
+      maxBatchAttempts: 3,                 // v0.15.2: 同一批最多重试 3 次, 超过就判失败, 避免无限重发烧额度
       totalQuestions: 0,                   // 第一题识别后从 q.total 填入
       identifiedPositions: new Set(),      // 已识别的题号(数字)
       identifiedQuestions: new Map(),      // qId -> q 对象
@@ -1105,9 +1108,18 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       currentBatchSize: 20,        // 当前批次大小 (会因失败降级)
       consecutiveFailures: 0,      // 连续失败次数 (达 2 触发降级)
       batchHistory: new Map(),     // batchId -> { questions, attempt }
+      lastSentAt: new Map(),       // v0.15.2: qId -> 最后一次发送时间 (去重用)
 
       // 把所有未完成的题按当前 batchSize 切分发送
       flushAll() {
+        // v0.15.2: 每次都以【界面上用户设定的值】为准。
+        // 原来 currentBatchSize 一旦因连续失败被降级到 1 就再也回不去,
+        // 之后每题单独成批 = 每题烧一次 NotebookLM 对话额度。
+        const uiSize = parseInt((PD().getElementById('ilh-batch-size') || {}).value, 10);
+        if (uiSize >= 1 && uiSize <= 50 && uiSize !== this.currentBatchSize) {
+          log(`🔧 批次大小按界面设定恢复为 ${uiSize} 题/批 (原 ${this.currentBatchSize})`, 'info');
+          this.currentBatchSize = uiSize;
+        }
         const allQs = Array.from(batchState.identifiedQuestions.values())
           .sort((a, b) => a.position - b.position);
         const todoQs = allQs.filter((q) => {
@@ -1133,9 +1145,10 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         }
 
         log(`🚀 准备发 ${batches.length} 个批次, 每批最多 ${this.currentBatchSize} 题 (共 ${todoQs.length} 题)`, 'info');
-        for (const batchQs of batches) {
-          this.sendOne(batchQs);
-        }
+        // v0.15.2: 批次之间留 1.2 秒间隔, 避免瞬间塞爆 NotebookLM 队列
+        batches.forEach((batchQs, i) => {
+          setTimeout(() => this.sendOne(batchQs), i * 1200);
+        });
         batchState.batchStarted = true;
         updateBatchPanel();
       },
@@ -1143,6 +1156,45 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       // 发送单个批次
       sendOne(questions, attempt = 1) {
         if (questions.length === 0) return;
+
+        // v0.15.2-①: 重试上限。原来没有上限, 同一题会被反复重发(日志里出现过"尝试 5"),
+        // 即使 NotebookLM 其实已经答过了, 白白烧对话额度。
+        if (attempt > CONFIG.maxBatchAttempts) {
+          for (const q of questions) {
+            Bridge.writeResponse(q.id, '', 'error', `已重试 ${CONFIG.maxBatchAttempts} 次仍未成功, 已停止自动重发 (可手动点"重新请求")`);
+            StatusDot.updateOne(q.position, q.id);
+          }
+          log(`⛔ 第 ${questions.map((q) => q.position).join(',')} 题重试超过 ${CONFIG.maxBatchAttempts} 次, 停止重发 (避免消耗额度)`, 'warn');
+          return;
+        }
+
+        // v0.15.3: 发送前先查缓存 —— NotebookLM 可能已经答复了, 只是通知/存储同步有延迟。
+        // 这是防止"重复提问烧额度"最关键的一道闸。
+        const already = [];
+        questions = questions.filter((q) => {
+          const cached = GM_getValue(`ilh:response:${q.id}`, null);
+          if (cached && cached.status === 'done' && cached.text) {
+            already.push(q.position);
+            StatusDot.updateOne(q.position, q.id);
+            return false;
+          }
+          return true;
+        });
+        if (already.length) log(`✓ 第 ${already.join(',')} 题已有答复, 跳过重发 (省额度)`, 'success');
+        if (questions.length === 0) { log('✓ 该批全部已有答复, 无需提问', 'success'); return; }
+
+        // v0.15.2-②: 发送去重。同一道题 90 秒内不重复发送 —— 从根上杜绝重复提问。
+        const now = Date.now();
+        const skipped = [];
+        questions = questions.filter((q) => {
+          const last = this.lastSentAt.get(q.id) || 0;
+          if (now - last < 90000) { skipped.push(q.position); return false; }
+          this.lastSentAt.set(q.id, now);
+          return true;
+        });
+        if (skipped.length) log(`⏭ 第 ${skipped.join(',')} 题 90 秒内刚发过, 跳过重复发送`, 'debug');
+        if (questions.length === 0) return;
+
         const batchId = `batch_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
         const positions = questions.map((q) => q.position);
         const positionMap = {};
@@ -1214,14 +1266,32 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           // 整批视为成功 (>= 70%)
           this.consecutiveFailures = 0;
           log(`✅ 批次 ${batchId.slice(-8)} 完成: ${successCount}/${total} 题 (${(successRate*100).toFixed(0)}%)`, 'success');
+          // v0.15.2: 成功了就把之前降级掉的批次大小逐级升回去, 别一直卡在 1 题/批
+          const uiMax = parseInt((PD().getElementById('ilh-batch-size') || {}).value, 10) || 20;
+          if (this.currentBatchSize < uiMax) {
+            const up = this.currentBatchSize <= 1 ? 5 : (this.currentBatchSize <= 5 ? 10 : uiMax);
+            this.currentBatchSize = Math.min(up, uiMax);
+            log(`📈 批次大小恢复: → ${this.currentBatchSize} 题/批`, 'info');
+          }
           // 失败的少数题, 后续单独重试
           if (failedPositions.length > 0) {
             const failedQs = failedPositions.map((p) => history.questions.find((q) => q.position === p)).filter(Boolean);
             if (failedQs.length > 0) {
-              log(`  ↪️ ${failedQs.length} 题没拆出, 单独重试`, 'info');
+              log(`  ↪️ ${failedQs.length} 题没拆出, 3 秒后确认是否真失败`, 'info');
+              // v0.15.3: 等 3 秒让 GM 存储跨标签页同步完成, 再查一次缓存。
+              // 很多"失败"其实只是答案还没同步过来, 直接重发就是白烧额度。
               setTimeout(() => {
-                for (const q of failedQs) this.sendOne([q], 2);
-              }, 2000);
+                const stillFailed = failedQs.filter((q) => {
+                  const c = GM_getValue(`ilh:response:${q.id}`, null);
+                  if (c && c.status === 'done' && c.text) { StatusDot.updateOne(q.position, q.id); return false; }
+                  return true;
+                });
+                const recovered = failedQs.length - stillFailed.length;
+                if (recovered > 0) log(`  ✓ 其中 ${recovered} 题答案已同步到位, 无需重发`, 'success');
+                if (stillFailed.length === 0) return;
+                log(`  ↪️ ${stillFailed.length} 题确认失败, 单独重试`, 'info');
+                for (const q of stillFailed) this.sendOne([q], 2);
+              }, 3000);
             }
           }
         } else {
@@ -4489,6 +4559,46 @@ injectStylesRobust('nlh', `
       const N = batchReq.batchSize;
       setStatus('busy', `⏳ 处理批次 ${batchReq.id.slice(-8)} (${N} 题)...`);
       log(`📦 接到批次 ${batchReq.id.slice(-8)}: ${N} 题 [${batchReq.positions.slice(0, 5).join(',')}${batchReq.positions.length > 5 ? '...' : ''}] (尝试 ${batchReq.attempt})`, 'info');
+
+      // v0.15.3: 提问前先剔除【已经有答案】的题 —— iLearning 侧可能因同步延迟重发了已答复的题,
+
+      // 在这里拦掉就不会浪费 NotebookLM 对话额度。
+
+      try {
+
+        const _keep = [], _skip = [];
+
+        for (const _p of batchReq.positions) {
+
+          const _qid = batchReq.positionMap[_p];
+
+          const _c = GM_getValue(`ilh:response:${_qid}`, null);
+
+          if (_c && _c.status === 'done' && _c.text) _skip.push(_p); else _keep.push(_p);
+
+        }
+
+        if (_skip.length) log(`✓ 第 ${_skip.join(',')} 题已有答案, 不再提问 (省额度)`, 'success');
+
+        if (_keep.length === 0) {
+
+          log('✓ 该批全部已有答案, 直接回报成功', 'success');
+
+          Bridge.completeBatch(batchReq.id);
+
+          Bridge.notifyBatchResult(batchReq.id, 'success', { failedPositions: [], successCount: batchReq.positions.length, totalCount: batchReq.positions.length });
+
+          state.busy = false; state.currentRequest = null;
+
+          return;
+
+        }
+
+        batchReq.positions = _keep;
+
+        batchReq.questions = (batchReq.questions || []).filter((q) => _keep.includes(q.position));
+
+      } catch (e) { /* 过滤失败就照常提问, 不影响主流程 */ }
 
       try {
         // 1. 找输入框
