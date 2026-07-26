@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.15.0
+// @version      0.15.1
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.15.1 - 新增"🔁 重试失败"按钮。背景: 浮窗白屏那段时间里整套题请求失败, 失败结果被写进缓存; 批量预取看到"已有缓存"就跳过(日志: 缓存的错误响应, 不重试), 导致怎么点批处理都没反应, 只能一道道手动点"重新请求"。新按钮一次性扫出当前试卷所有 status=error 的题, 清掉它们的 request+response 缓存并重新入队, 带二次确认和数量提示; 没有失败题时给出提示不做任何操作。
 // v0.15.0 - 【白屏根治】把浮窗整体迁入 <iframe>。决定性实测: 用浮窗的真实 HTML + 真实 CSS 在 iframe 里原样重建 → 完整深色渲染, 而同一时刻宿主页面里的真实浮窗仍是白的。机制报告排除了合成层超限(动画元素 1 / will-change 0 / fixed 10)、水印层干扰(pointer-events:none, 无混合/滤镜/变换)、浮窗过复杂(139 节点) —— 根因是 Chromium 在该页面上的合成缺陷, 页面内无法规避。iframe 是浏览器里唯一真正独立的渲染单元, 宿主的合成状态影响不到它内部。改造: 面板 DOM 与样式全部写入 iframe 文档; 新增 PD() 统一取面板文档, 全部面板 DOM 调用改走 PD(); 拖动与键盘拦截同时监听宿主与 iframe 两个文档; sidebar 状态灯仍注入 iLearning 自身 DOM。
 // v0.14.3 - 【白屏缓解】实测证明浮窗在问题页面上【能】正常渲染: 运行七变体诊断脚本(一次创建 7 个 fixed 容器 + 克隆大量 DOM)之后, 真实浮窗自己恢复了深色显示。同时变体的黑白状态几秒内会互相变化, 说明这不是某个 CSS 属性的固定缺陷, 而是该页面上合成器状态不稳定(谁先画、谁卡住取决于时序), 此前想找'那一个属性'的方向是错的。对策: 把实测有效的动作(大规模重排)做成自动机制 forceRepaintStorm() —— 反复创建/移除屏幕外的临时 fixed 元素并强制同步布局, 在浮窗建好后的 2s/5s/10s/20s 各跑一次; 另提供 __ilhKick() 手动触发。对正常页面无副作用(临时元素在屏幕外, 毫秒级)。
 // v0.14.2 - 【白屏真正修复】四探针对照实测: 新建独立 fixed 容器 (只有内容那么大) 里的块全部正常渲染 (P2 绿 187080px / P3 蓝 890766px / P4 橙 34320px), 而放进 v0.14.0 引入的 #ilh-root 里的块只剩 277px 边缘轮廓 = 没渲染。元凶是 #ilh-root 用了 width:100vw; height:100vh 【铺满整个视口】—— Chromium 对这种全屏透明遮罩层的合成优化会导致其子元素不绘制 (此前 100vw×210px 的实验条里的块全部正常, 印证了'铺满全屏'才是触发条件)。改法: 根容器改为只包住浮窗 (right/bottom 定位, 尺寸由内容决定), 去掉 100vw/100vh、pointer-events:none 和 flex 对齐; 拖动改为移动根容器的 transform, 浮窗自身不带任何变换, 完全等同于实测通过的 P2/P4 形态。同时纠正 v0.14.0 的一个错误结论: '偏移定位的 fixed 元素画不出背景' 是错的 (当时实验 B 用了过期 rect 导致定位错乱), P2/P4 已证伪。
@@ -1307,6 +1308,42 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       }
     }
 
+    /* v0.15.1: 批量重试所有失败的题。
+     * 为什么需要: 失败结果也会进缓存, 批量预取遇到缓存就跳过, 于是失败的题永远不会被重发。
+     * 这里主动把它们的 request + response 缓存清掉, 再走一次正常的请求流程。 */
+    function retryFailedQuestions() {
+      const positions = Array.from(batchState.identifiedPositions || []).sort((a, b) => a - b);
+      const failed = [];
+      for (const [qId, pos] of state.qIdToPosition.entries()) {
+        const resp = GM_getValue(`ilh:response:${qId}`, null);
+        if (resp && resp.status === 'error') failed.push({ qId, pos });
+      }
+      if (failed.length === 0) {
+        log('✓ 没有失败的题, 无需重试', 'info');
+        alert('没有找到失败的题目。\n\n(只统计本次已识别的题; 如果状态灯是红的但这里说没有, 请先让自动遍历把题目识别完)');
+        return;
+      }
+      failed.sort((a, b) => a.pos - b.pos);
+      const preview = failed.slice(0, 12).map((f) => f.pos).join(', ') + (failed.length > 12 ? ' …' : '');
+      if (!confirm(`找到 ${failed.length} 道失败的题:\n第 ${preview} 题\n\n将清除它们的错误缓存并重新发给 NotebookLM。\n(NotebookLM 标签页需要保持打开)\n\n继续?`)) {
+        log('🔁 用户取消了批量重试', 'info');
+        return;
+      }
+      let cleared = 0;
+      for (const f of failed) {
+        try {
+          GM_deleteValue(`ilh:response:${f.qId}`);
+          GM_deleteValue(`ilh:request:${f.qId}`);
+          cleared++;
+          StatusDot.updateOne(f.pos, f.qId);
+        } catch (e) { /* ignore */ }
+      }
+      log(`🔁 已清除 ${cleared} 道失败题的缓存, 重新发送…`, 'info');
+      batchState.batchStarted = false;      // 允许重新发批
+      BatchManager.flushAll();
+      showExplain('waiting', `🔁 已重试 ${cleared} 道失败的题\n\n正在分批发给 NotebookLM, 请保持 NotebookLM 标签页打开。\n处理完会自动同步回来。`, '重试中');
+    }
+
     function startBatchProcessing() {
       if (batchState.batchStarted) return;
       // v0.10.2: 直接调 BatchManager 真正发批次
@@ -2320,6 +2357,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
             <span style="flex:1"></span>
             <button class="ilh-mini-btn" id="ilh-btn-csv" title="导出全部题目和解析为 CSV (Excel 可打开)">📤 导出题库</button>
             <button class="ilh-mini-btn" id="ilh-btn-import" title="从 CSV 文件导入题库 (会完全清空当前缓存!)">📂 导入题库</button>
+            <button class="ilh-mini-btn" id="ilh-btn-retry-failed" title="清除所有失败题的错误缓存并重新发送 (批量预取会跳过已有缓存的题, 包括失败的)">🔁 重试失败</button>
 
           </div>
           <div class="ilh-explain-actions" id="ilh-actions-edit" style="display:none">
@@ -2398,6 +2436,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       // v0.11.0: CSV 导出
       PD().getElementById('ilh-btn-csv').addEventListener('click', () => exportCSV());
       PD().getElementById('ilh-btn-import').addEventListener('click', () => importCsvAsBank());
+      PD().getElementById('ilh-btn-retry-failed').addEventListener('click', () => retryFailedQuestions());
 
 
       // v0.6.0: 批量面板事件
