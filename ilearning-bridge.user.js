@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.14.0
+// @version      0.14.1
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.14.1 - 逃出水印层: 页面有一个防截屏水印 div (随机数字 id, 铺满全屏, z-index 最大, 挂在 body 里, 带防篡改自动重挂)。它与浮窗同 z-index 且在 DOM 里更靠后 → 画在浮窗上方; 若其带 backdrop-filter, Chromium 会对其下方的独立合成层做快照过滤, 已知会导致下方 fixed 元素渲染成空白 (对照实验中排在它后面的元素全部正常, 排在它前面的全部空白, 完全吻合)。水印是公司安全功能不可移除, 改为逃逸: 根容器 #ilh-root/#nlh-root 从挂 body 改为挂 <html> 上 (排在 <body> 之后) —— 同 z-index 下 DOM 靠后者画在上面, 且不在水印防篡改脚本监视的 body 里, 不会发生互相抢位。看门狗同步改为保证根容器始终是 <html> 的最后一个子节点。诊断日志补充打印遮挡元素的 backgroundImage / backdropFilter。
 // v0.14.0 - 【修复白屏】根因: 在带 examResultId 的考试回顾页上, 偏移定位的 position:fixed 元素不绘制背景 (实测对照: 普通 div ✅ / flex+半透明子元素 ✅ / 再加 overflow+圆角+阴影 ✅ / 但 position:fixed 独立小方块 ❌ 画不出背景)。改法: 浮窗不再自己做 fixed 定位, 改成挂在一个【铺满视口的透明 fixed 容器 #ilh-root】里, 用 flex 靠右下角对齐, 浮窗本身回归普通流 —— 这正是实测中能正常渲染的结构。容器 pointer-events:none 不吃鼠标事件, 浮窗自身 pointer-events:auto。同时撤销 v0.13.6 的 popover 顶层方案 (对照实测同样画不出背景, 且从未解决问题); 拖动从改 left/top 改为改 transform (不破坏新的绘制结构)。
 // v0.13.7 - 找到"白屏"真凶: 浮窗是【透明】的, 看到的白色是背景页面 div#app (rgb(246,246,246)) 透过来的。原因是 background 简写会把 background-color 重置为 transparent, 深色全靠那层 linear-gradient, 渐变一旦没画出来浮窗就全透明。修复: (1) 拆成 background-color (实心深色) + background-image (渐变) 两条声明, 渐变失效也还有实心底色兜底; (2) 撤掉 v0.13.5 误加的 '#ilh-panel span/label/div:not() { background-color: transparent !important }' —— 状态灯是 <span>, JS 设的内联背景打不过 !important, 导致 28 个状态灯全部变透明(这也是为什么白屏时连数字方块都看不见); (3) 诊断补盲区: 之前只扫浮窗外部元素, 现在也扫子元素; 过滤掉画在我们下面的静态元素(div#app 那种误报); 补充报告 background-color/background-image/forced-colors 等; (4) 新增 __ilhPaintTest(): 把浮窗刷成纯红 3 秒, 一眼区分"背景没画出来"还是"被别的东西盖住"。
 // v0.13.6 - 彻底解决"白屏"(浮窗被别的悬浮层盖住): v0.13.5 的样式自检已证明我们自己的样式是好的, 问题是有东西画在我们上面。z-index 已是最大值 2147483647, 再拼数字没用, 所以改用浏览器原生的 Top Layer (Popover API): 浮窗用 popover=manual + showPopover() 提升到顶层, 顶层元素永远画在所有普通页面内容之上, 且不受祖先 filter/transform/opacity 造成的层叠上下文限制。同时配套: (1) 覆盖 popover 的 UA 默认样式 (background-color:Canvas / border:solid / padding / margin:auto / inset:0) 否则浮窗会变白框; (2) ::backdrop 设为全透明, 不遮挡页面; (3) 看门狗每 3 秒检查一次, 掉出顶层自动重新提升 (SPA 路由切换会重建 DOM); (4) 浏览器不支持 Popover 时自动降级到原方案并在日志说明。新增遮挡诊断 __ilhDiagnose(): 扫描全文档找出覆盖浮窗超过 40% 且带不透明背景的元素, 报告 tag/id/class/z-index/背景色, 并检查祖先链上的 filter/opacity/transform/mix-blend-mode; 启动 6 秒后自动跑一次, 发现可疑遮挡会在日志告警。
@@ -87,11 +88,16 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
    * 所以浮窗不再自己做 fixed 定位, 改为挂在这个容器里用 flex 靠右下对齐。
    */
   function ensureRootContainer(rootId) {
+    const host = document.documentElement;   // v0.14.1: 挂 <html>, 排在 <body> 之后
     let root = document.getElementById(rootId);
-    if (root && root.isConnected) return root;
+    if (root && root.isConnected) {
+      // 保证始终是 <html> 的最后一个子节点 (同 z-index 下, DOM 靠后者画在上面)
+      if (root.parentElement !== host || host.lastElementChild !== root) host.appendChild(root);
+      return root;
+    }
     root = document.createElement('div');
     root.id = rootId;
-    document.body.appendChild(root);
+    host.appendChild(root);
     return root;
   }
 
@@ -173,6 +179,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         position: cs.position,
         backgroundColor: cs.backgroundColor,
         backgroundImage: hasImg ? String(cs.backgroundImage).slice(0, 40) + '…' : 'none',
+        backdropFilter: cs.backdropFilter || cs.webkitBackdropFilter || 'none',
         pointerEvents: cs.pointerEvents,
       };
 
@@ -3365,6 +3372,15 @@ injectStylesRobust('ilh', `
     // === INIT ===
     buildPanel();
     log(`✅ iLearning 端 v${VERSION} 已加载`, 'success');
+    setTimeout(() => {
+      try {
+        const root = document.getElementById('ilh-root');
+        const isLast = root && root.parentElement === document.documentElement
+          && document.documentElement.lastElementChild === root;
+        log(isLast ? '🛡 根容器已挂到 <html> 末位 (画在 body 内所有内容之上, 含水印层)'
+                   : '⚠️ 根容器不在 <html> 末位, 看门狗会持续纠正', isLast ? 'success' : 'warn');
+      } catch (e) { /* ignore */ }
+    }, 1000);
 
     /* v0.13.5: 样式自检 —— 有些页面 (如带 examResultId 的考试回顾页) 有满屏水印层,
        用户也可能装了别的浏览器扩展注入全局 !important CSS, 会把浮窗刷成"白屏"。
@@ -3409,7 +3425,9 @@ injectStylesRobust('ilh', `
     setTimeout(() => ilhStyleSelfCheck('1.5s'), 1500);
     setTimeout(() => ilhStyleSelfCheck('5s'), 5000);
 
-    /* v0.14.0: 根容器看门狗 —— SPA 路由切换可能把容器或浮窗摘掉, 定期检查并挂回 */
+    /* v0.14.1: 根容器看门狗 —— ① SPA 路由切换可能摘掉容器/浮窗, 挂回;
+       ② ensureRootContainer 内部会保证容器始终是 <html> 的最后一个子节点
+          (逃出 body 里水印层的绘制影响, 同 z-index 下我们永远画在它上面) */
     setInterval(() => {
       try {
         const p = document.getElementById('ilh-panel');
@@ -3435,7 +3453,7 @@ injectStylesRobust('ilh', `
       const badKid = (d['浮窗内部大块不透明子元素'] || [])[0];
       if (d.suspects.length) {
         const top = d.suspects[0];
-        log(`⚠️ 检测到遮挡: ${top.el} 覆盖了浮窗 ${top.cover} (z-index=${top.zIndex}, 背景=${top.backgroundColor})`, 'warn');
+        log(`⚠️ 检测到遮挡: ${top.el} 覆盖了浮窗 ${top.cover} (z-index=${top.zIndex}, 背景=${top.backgroundColor}, 背景图=${top.backgroundImage}, backdrop=${top.backdropFilter || 'none'})`, 'warn');
         log('   详情见 F12 Console 的"浮窗遮挡诊断"分组; 也可随时手动运行 __ilhDiagnose()', 'debug');
       } else if (badKid) {
         log(`⚠️ 浮窗内部有大块不透明子元素: ${badKid.el} (${badKid.cover}, ${badKid.backgroundColor})`, 'warn');
@@ -4630,8 +4648,14 @@ injectStylesRobust('nlh', `
           <div id="nlh-log"></div>
         </div>
       `);
-      // v0.14.0: 同上
+      // v0.14.1: 同 iLearning 端, 挂到 <html> 上的根容器
       ensureRootContainer('nlh-root').appendChild(panel);
+      setInterval(() => {
+        try {
+          const r = ensureRootContainer('nlh-root');
+          if (panel.parentElement !== r) r.appendChild(panel);
+        } catch (e) { /* ignore */ }
+      }, 3000);
 
       document.getElementById('nlh-toggle-panel').addEventListener('click', () => {
         state.panelCollapsed = !state.panelCollapsed;
