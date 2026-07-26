@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.13.6
+// @version      0.13.7
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.13.7 - 找到"白屏"真凶: 浮窗是【透明】的, 看到的白色是背景页面 div#app (rgb(246,246,246)) 透过来的。原因是 background 简写会把 background-color 重置为 transparent, 深色全靠那层 linear-gradient, 渐变一旦没画出来浮窗就全透明。修复: (1) 拆成 background-color (实心深色) + background-image (渐变) 两条声明, 渐变失效也还有实心底色兜底; (2) 撤掉 v0.13.5 误加的 '#ilh-panel span/label/div:not() { background-color: transparent !important }' —— 状态灯是 <span>, JS 设的内联背景打不过 !important, 导致 28 个状态灯全部变透明(这也是为什么白屏时连数字方块都看不见); (3) 诊断补盲区: 之前只扫浮窗外部元素, 现在也扫子元素; 过滤掉画在我们下面的静态元素(div#app 那种误报); 补充报告 background-color/background-image/forced-colors 等; (4) 新增 __ilhPaintTest(): 把浮窗刷成纯红 3 秒, 一眼区分"背景没画出来"还是"被别的东西盖住"。
 // v0.13.6 - 彻底解决"白屏"(浮窗被别的悬浮层盖住): v0.13.5 的样式自检已证明我们自己的样式是好的, 问题是有东西画在我们上面。z-index 已是最大值 2147483647, 再拼数字没用, 所以改用浏览器原生的 Top Layer (Popover API): 浮窗用 popover=manual + showPopover() 提升到顶层, 顶层元素永远画在所有普通页面内容之上, 且不受祖先 filter/transform/opacity 造成的层叠上下文限制。同时配套: (1) 覆盖 popover 的 UA 默认样式 (background-color:Canvas / border:solid / padding / margin:auto / inset:0) 否则浮窗会变白框; (2) ::backdrop 设为全透明, 不遮挡页面; (3) 看门狗每 3 秒检查一次, 掉出顶层自动重新提升 (SPA 路由切换会重建 DOM); (4) 浏览器不支持 Popover 时自动降级到原方案并在日志说明。新增遮挡诊断 __ilhDiagnose(): 扫描全文档找出覆盖浮窗超过 40% 且带不透明背景的元素, 报告 tag/id/class/z-index/背景色, 并检查祖先链上的 filter/opacity/transform/mix-blend-mode; 启动 6 秒后自动跑一次, 发现可疑遮挡会在日志告警。
 // v0.13.5 - 修复考试回顾页 (examResultId) 浮窗"白屏": (1) z-index 提到 2147483647, 不再被页面满屏水印层压住; (2) 关键视觉属性 (background/color/position/z-index/border/font) 全部加 !important, 抵抗页面和其它浏览器扩展 (如 YouMind) 注入的全局 CSS; (3) 新增透明基线规则, 防止 div{background:#fff!important} 类规则把浮窗内部刷白; (4) 样式注入改为 injectStylesRobust: GM_addStyle 失败自动降级到手动 <style>, 并在 1s/3s/8s 重新注入 (让我们的样式表永远排在页面后加载的样式表之后); (5) 启动 1.5s/5s 做样式自检, 发现被覆盖自动启用内联 !important 兜底并在日志里告警; (6) 自动遍历改为轮询等待 sidebar 最多 15 秒 (原固定 2 秒, 回顾页渲染慢会漏)。
 // v0.13.4 - 紧急修复 v0.13.0 引入的导入 bug: doImportFromCsvText 里 const qId = computeQId(stem, options) 写在 options 声明之前, 触发 temporal dead zone ReferenceError, 被 try-catch 捕获导致每行 skip. 现在调整顺序: 先解析 options 再算 qId. 同时加 Excel 大数字兼容: 导出 examId 用 \"=\"123...\"\" 包裹 (Excel 识别为文本公式不会科学计数法), 导入去壳.
@@ -131,6 +132,21 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         : '';
       return el.tagName.toLowerCase() + id + cls;
     };
+    const isOpaqueBg = (cs) => {
+      const bg = cs.backgroundColor || '';
+      const m = bg.match(/rgba?\(([^)]+)\)/);
+      if (!m) return false;
+      const parts = m[1].split(',').map((s) => parseFloat(s));
+      const a = parts.length > 3 ? parts[3] : 1;
+      return a > 0.5;
+    };
+
+    // 浮窗自己在不在顶层? 在顶层的话, 只有同样在顶层的元素才可能盖住我们
+    let panelInTopLayer = false;
+    try { panelInTopLayer = panel.matches(':popover-open'); } catch (e) { /* ignore */ }
+    const inTopLayer = (el) => {
+      try { return el.matches(':popover-open, :modal, :fullscreen'); } catch (e) { return false; }
+    };
 
     // 1) 祖先链上会新建层叠上下文 / 影响绘制的属性
     const ancestorIssues = [];
@@ -147,8 +163,11 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       if (bad.length) ancestorIssues.push(desc(p) + ' → ' + bad.join(', '));
     }
 
-    // 2) 覆盖浮窗的可疑元素
+    // 2) 外部遮挡: 只保留"真的可能画在我们上面"的
+    //    v0.13.7: 之前会把 div#app 这类 position:static / z-index:auto 的背景板误报成遮挡,
+    //    它们其实画在我们下面。浮窗在顶层时更简单 —— 只有同在顶层的元素才可能压住我们。
     const suspects = [];
+    const underneath = [];
     let all = [];
     try { all = document.querySelectorAll('*'); } catch (e) { all = []; }
     for (const el of all) {
@@ -164,50 +183,136 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       const iy = Math.max(0, Math.min(r.bottom, b.bottom) - Math.max(r.top, b.top));
       const cover = (ix * iy) / area;
       if (cover < 0.4) continue;
-      const bg = cs.backgroundColor || '';
-      const transparentBg = !bg || bg === 'transparent' || /rgba\([^)]*,\s*0\s*\)/.test(bg);
       const hasImg = cs.backgroundImage && cs.backgroundImage !== 'none';
       const hasBackdrop = cs.backdropFilter && cs.backdropFilter !== 'none';
-      if (transparentBg && !hasImg && !hasBackdrop) continue;
-      suspects.push({
+      if (!isOpaqueBg(cs) && !hasImg && !hasBackdrop) continue;
+
+      const row = {
         el: desc(el),
         cover: Math.round(cover * 100) + '%',
         zIndex: cs.zIndex,
         position: cs.position,
-        background: bg,
+        backgroundColor: cs.backgroundColor,
         backgroundImage: hasImg ? String(cs.backgroundImage).slice(0, 40) + '…' : 'none',
-        backdropFilter: cs.backdropFilter,
-        opacity: cs.opacity,
         pointerEvents: cs.pointerEvents,
-      });
+      };
+
+      // 能不能画在我们上面?
+      let above;
+      if (panelInTopLayer) {
+        above = inTopLayer(el);
+      } else {
+        const z = parseInt(cs.zIndex, 10);
+        above = cs.position !== 'static' && !isNaN(z) && z >= 2147483646;
+      }
+      (above ? suspects : underneath).push(row);
     }
     suspects.sort((a, b) => parseInt(b.cover) - parseInt(a.cover));
+    underneath.sort((a, b) => parseInt(b.cover) - parseInt(a.cover));
 
-    // 3) 中心点上到底命中了谁
-    let stack = [];
+    // 3) v0.13.7 新增: 扫浮窗【内部】—— 之前完全没查, 是盲区。
+    //    子元素如果有大面积不透明背景, 一样会把浮窗自己的背景盖掉。
+    const bigChildren = [];
+    let kids = [];
+    try { kids = panel.querySelectorAll('*'); } catch (e) { kids = []; }
+    for (const el of kids) {
+      let cs;
+      try { cs = getComputedStyle(el); } catch (e) { continue; }
+      if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+      const b = el.getBoundingClientRect();
+      const cover = (b.width * b.height) / area;
+      if (cover < 0.5) continue;
+      if (!isOpaqueBg(cs)) continue;
+      bigChildren.push({
+        el: desc(el),
+        cover: Math.round(cover * 100) + '%',
+        backgroundColor: cs.backgroundColor,
+      });
+    }
+
+    // 4) 多点采样: 浏览器自己的命中测试才是真相
+    const probes = [];
     try {
-      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-      stack = (document.elementsFromPoint(cx, cy) || []).slice(0, 6).map(desc);
+      const pts = [
+        ['中心', r.left + r.width / 2, r.top + r.height / 2],
+        ['左上', r.left + 8, r.top + 8],
+        ['右上', r.right - 8, r.top + 8],
+        ['左下', r.left + 8, r.bottom - 8],
+        ['右下', r.right - 8, r.bottom - 8],
+      ];
+      for (const [name, x, y] of pts) {
+        const top = (document.elementsFromPoint(x, y) || [])[0];
+        probes.push({
+          点: name,
+          最上层元素: top ? desc(top) : '(无)',
+          是我们的吗: top ? (top === panel || panel.contains(top)) : false,
+        });
+      }
     } catch (e) { /* ignore */ }
 
+    // 5) 浮窗自身的绘制相关属性 (v0.13.7: 补 background-color / 系统显示模式)
     let panelCs = {};
     try {
       const cs = getComputedStyle(panel);
       panelCs = {
-        position: cs.position, zIndex: cs.zIndex, opacity: cs.opacity,
-        background: String(cs.backgroundImage).slice(0, 50), filter: cs.filter,
-        inTopLayer: (() => { try { return panel.matches(':popover-open'); } catch (e) { return 'n/a'; } })(),
+        position: cs.position,
+        zIndex: cs.zIndex,
+        opacity: cs.opacity,
+        backgroundColor: cs.backgroundColor,
+        backgroundImage: String(cs.backgroundImage).slice(0, 60),
+        filter: cs.filter,
+        mixBlendMode: cs.mixBlendMode,
+        colorScheme: cs.colorScheme,
+        forcedColorAdjust: cs.forcedColorAdjust,
+        inTopLayer: panelInTopLayer,
+      };
+    } catch (e) { /* ignore */ }
+
+    let media = {};
+    try {
+      media = {
+        强制颜色模式: matchMedia('(forced-colors: active)').matches,
+        高对比度: matchMedia('(prefers-contrast: more)').matches,
+        深色偏好: matchMedia('(prefers-color-scheme: dark)').matches,
+        减少透明度: matchMedia('(prefers-reduced-transparency: reduce)').matches,
       };
     } catch (e) { /* ignore */ }
 
     return {
       panelRect: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
       panelStyle: panelCs,
+      系统显示模式: media,
       ancestorIssues,
-      suspects: suspects.slice(0, 6),
-      elementsAtCenter: stack,
+      suspects,
+      画在我们下面的背景板: underneath,
+      浮窗内部大块不透明子元素: bigChildren,
+      多点命中测试: probes,
+      elementsAtCenter: probes.length ? [probes[0].最上层元素] : [],
     };
   }
+
+  /* v0.13.7: 一眼定性测试 —— 把浮窗刷成纯红 3 秒。
+   * 变红 = 我们的背景本来就没画出来 (透明, 看到的是背景页面);
+   * 不变 = 真的被别的东西盖住了。 */
+  function paintTestPanel(panelId, ms) {
+    const el = document.getElementById(panelId);
+    if (!el) { console.warn('[ILH-BRIDGE] 找不到浮窗'); return false; }
+    const prevColor = el.style.getPropertyValue('background-color');
+    const prevPrio = el.style.getPropertyPriority('background-color');
+    const prevImg = el.style.getPropertyValue('background-image');
+    el.style.setProperty('background-color', '#ff0000', 'important');
+    el.style.setProperty('background-image', 'none', 'important');
+    console.log('%c[ILH-BRIDGE] 浮窗已刷成纯红, ' + ((ms || 3000) / 1000) + ' 秒后恢复。变红=背景没画出来; 没变=被别的东西盖住了。',
+      'color:#fff;background:#c00;padding:2px 6px');
+    setTimeout(() => {
+      el.style.removeProperty('background-color');
+      el.style.removeProperty('background-image');
+      if (prevColor) el.style.setProperty('background-color', prevColor, prevPrio);
+      if (prevImg) el.style.setProperty('background-image', prevImg);
+    }, ms || 3000);
+    return true;
+  }
+
 
   /* ═══════════ v0.13.5: 健壮样式注入 (对抗页面/其它扩展的全局 CSS) ═══════════
    * 背景: 部分 iLearning 页面 (如带 examResultId 的考试回顾页) 有满屏水印层 (z-index 最大值),
@@ -1196,19 +1301,23 @@ injectStylesRobust('ilh', `
       #ilh-panel .ilh-overview-legend,
       #ilh-panel #ilh-overview-grid-content,
       #ilh-panel #ilh-question,
-      #ilh-panel .ilh-log-entry,
-      #ilh-panel span,
-      #ilh-panel label,
-      #ilh-panel div:not([id]):not([class]) {
+      #ilh-panel .ilh-log-entry {
         background-color: transparent !important;
       }
+      /* v0.13.7: 这里原本还有 "#ilh-panel span / label / div:not([id]):not([class])",
+         已删除 —— 状态灯 .ilh-grid-dot 是 <span>, 它的颜色由 JS 内联设置,
+         内联样式优先级打不过带强制标记的规则, 结果 28 个状态灯全变透明了。 */
 
       #ilh-panel {
         position: fixed !important; bottom: 24px; right: 24px;
         width: ${CONFIG.panelWidth}px;
         /* v0.12.8: 固定高度, 不随内容变化伸缩 */
         height: min(${CONFIG.panelMaxHeight}px, calc(100vh - 48px));
-        background: linear-gradient(135deg, #1a1d2e 0%, #232842 100%) !important;
+        /* v0.13.7: 必须拆成两条 —— background 简写会把 background-color 重置成 transparent,
+           渐变一旦没画出来浮窗就全透明, 背景页面直接透上来 (这就是"白屏"的真因)。
+           实心底色放在下面兜底, 渐变只是锦上添花。 */
+        background-color: #1a1d2e !important;
+        background-image: linear-gradient(135deg, #1a1d2e 0%, #232842 100%) !important;
         color: #e8eaf6 !important;
         font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif !important;
         font-size: 13px;
@@ -3277,7 +3386,8 @@ injectStylesRobust('ilh', `
        用户也可能装了别的浏览器扩展注入全局 !important CSS, 会把浮窗刷成"白屏"。
        这里在 1.5s / 5s 各查一次, 真被覆盖就上内联兜底并告警。 */
     const ILH_FALLBACK_STYLES = [
-      ['#ilh-panel', 'position:fixed;background:linear-gradient(135deg,#1a1d2e 0%,#232842 100%);background-color:#1a1d2e;color:#e8eaf6;border-radius:12px;overflow:hidden;z-index:2147483647;box-shadow:0 12px 40px rgba(0,0,0,0.45)'],
+      // v0.13.7: 实心底色写在前面单列一条, 绝不能只靠 background 简写+渐变 (简写会把底色重置成透明)
+      ['#ilh-panel', 'position:fixed;background-color:#1a1d2e;background-image:linear-gradient(135deg,#1a1d2e 0%,#232842 100%);color:#e8eaf6;border-radius:12px;overflow:hidden;z-index:2147483647;box-shadow:0 12px 40px rgba(0,0,0,0.45)'],
       ['#ilh-header', 'background-color:#12141f;color:#e8eaf6;border-bottom:1px solid rgba(255,255,255,0.08)'],
       ['#ilh-batch-panel', 'background-color:#1b2136;color:#e8eaf6;border-bottom:1px solid rgba(255,255,255,0.08)'],
       ['#ilh-overview-grid', 'background-color:#20253c;color:#b0bec5;border:1px solid rgba(255,255,255,0.08)'],
@@ -3342,10 +3452,15 @@ injectStylesRobust('ilh', `
       console.log('中心点元素栈:', d.elementsAtCenter);
       console.groupEnd();
 
+      const badKid = (d['浮窗内部大块不透明子元素'] || [])[0];
       if (d.suspects.length) {
         const top = d.suspects[0];
-        log(`⚠️ 检测到遮挡: ${top.el} 覆盖了浮窗 ${top.cover} (z-index=${top.zIndex}, 背景=${top.background})`, 'warn');
+        log(`⚠️ 检测到遮挡: ${top.el} 覆盖了浮窗 ${top.cover} (z-index=${top.zIndex}, 背景=${top.backgroundColor})`, 'warn');
         log('   详情见 F12 Console 的"浮窗遮挡诊断"分组; 也可随时手动运行 __ilhDiagnose()', 'debug');
+      } else if (badKid) {
+        log(`⚠️ 浮窗内部有大块不透明子元素: ${badKid.el} (${badKid.cover}, ${badKid.backgroundColor})`, 'warn');
+      } else if (d.panelStyle && /rgba\(0,\s*0,\s*0,\s*0\)|transparent/.test(String(d.panelStyle.backgroundColor)) && d.panelStyle.backgroundImage === 'none') {
+        log('⚠️ 浮窗背景是透明的 —— 你看到的颜色其实是背景页面透上来的。运行 __ilhPaintTest() 可确认', 'warn');
       } else if (d.ancestorIssues.length) {
         log(`⚠️ 祖先元素影响层叠: ${d.ancestorIssues[0]}`, 'warn');
       } else if (verbose) {
@@ -3358,6 +3473,7 @@ injectStylesRobust('ilh', `
     if (typeof unsafeWindow !== 'undefined') {
       unsafeWindow.__ilhDiagnose = () => ilhRunDiagnose(true);
       unsafeWindow.__ilhTopLayer = () => promoteToTopLayer(document.getElementById('ilh-panel'));
+      unsafeWindow.__ilhPaintTest = (ms) => paintTestPanel('ilh-panel', ms);
     }
 
     // v0.13.3: 启动时静默执行 qId 迁移 + 去重 (修复 v0.13.2 留下的孤儿)
@@ -3496,9 +3612,7 @@ injectStylesRobust('nlh', `
       #nlh-panel .nlh-current-title,
       #nlh-panel .nlh-stat-label,
       #nlh-panel .nlh-log-entry,
-      #nlh-panel #nlh-current,
-      #nlh-panel span,
-      #nlh-panel label {
+      #nlh-panel #nlh-current {
         background-color: transparent !important;
       }
 
@@ -3506,7 +3620,9 @@ injectStylesRobust('nlh', `
         position: fixed !important; bottom: 24px; right: 24px;
         width: ${CONFIG.panelWidth}px;
         max-height: ${CONFIG.panelMaxHeight}px;
-        background: linear-gradient(135deg, #1a2e2a 0%, #1f3a3f 100%) !important;
+        /* v0.13.7: 同 iLearning 端, 实心底色兜底 */
+        background-color: #1a2e2a !important;
+        background-image: linear-gradient(135deg, #1a2e2a 0%, #1f3a3f 100%) !important;
         color: #e0f2f1 !important;
         font-family: -apple-system, "Segoe UI", "PingFang SC", sans-serif !important;
         font-size: 13px;
