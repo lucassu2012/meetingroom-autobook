@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.14.2
+// @version      0.14.3
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,7 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.14.3 - 【白屏缓解】实测证明浮窗在问题页面上【能】正常渲染: 运行七变体诊断脚本(一次创建 7 个 fixed 容器 + 克隆大量 DOM)之后, 真实浮窗自己恢复了深色显示。同时变体的黑白状态几秒内会互相变化, 说明这不是某个 CSS 属性的固定缺陷, 而是该页面上合成器状态不稳定(谁先画、谁卡住取决于时序), 此前想找'那一个属性'的方向是错的。对策: 把实测有效的动作(大规模重排)做成自动机制 forceRepaintStorm() —— 反复创建/移除屏幕外的临时 fixed 元素并强制同步布局, 在浮窗建好后的 2s/5s/10s/20s 各跑一次; 另提供 __ilhKick() 手动触发。对正常页面无副作用(临时元素在屏幕外, 毫秒级)。
 // v0.14.2 - 【白屏真正修复】四探针对照实测: 新建独立 fixed 容器 (只有内容那么大) 里的块全部正常渲染 (P2 绿 187080px / P3 蓝 890766px / P4 橙 34320px), 而放进 v0.14.0 引入的 #ilh-root 里的块只剩 277px 边缘轮廓 = 没渲染。元凶是 #ilh-root 用了 width:100vw; height:100vh 【铺满整个视口】—— Chromium 对这种全屏透明遮罩层的合成优化会导致其子元素不绘制 (此前 100vw×210px 的实验条里的块全部正常, 印证了'铺满全屏'才是触发条件)。改法: 根容器改为只包住浮窗 (right/bottom 定位, 尺寸由内容决定), 去掉 100vw/100vh、pointer-events:none 和 flex 对齐; 拖动改为移动根容器的 transform, 浮窗自身不带任何变换, 完全等同于实测通过的 P2/P4 形态。同时纠正 v0.14.0 的一个错误结论: '偏移定位的 fixed 元素画不出背景' 是错的 (当时实验 B 用了过期 rect 导致定位错乱), P2/P4 已证伪。
 // v0.14.1 - 逃出水印层: 页面有一个防截屏水印 div (随机数字 id, 铺满全屏, z-index 最大, 挂在 body 里, 带防篡改自动重挂)。它与浮窗同 z-index 且在 DOM 里更靠后 → 画在浮窗上方; 若其带 backdrop-filter, Chromium 会对其下方的独立合成层做快照过滤, 已知会导致下方 fixed 元素渲染成空白 (对照实验中排在它后面的元素全部正常, 排在它前面的全部空白, 完全吻合)。水印是公司安全功能不可移除, 改为逃逸: 根容器 #ilh-root/#nlh-root 从挂 body 改为挂 <html> 上 (排在 <body> 之后) —— 同 z-index 下 DOM 靠后者画在上面, 且不在水印防篡改脚本监视的 body 里, 不会发生互相抢位。看门狗同步改为保证根容器始终是 <html> 的最后一个子节点。诊断日志补充打印遮挡元素的 backgroundImage / backdropFilter。
 // v0.14.0 - 【修复白屏】根因: 在带 examResultId 的考试回顾页上, 偏移定位的 position:fixed 元素不绘制背景 (实测对照: 普通 div ✅ / flex+半透明子元素 ✅ / 再加 overflow+圆角+阴影 ✅ / 但 position:fixed 独立小方块 ❌ 画不出背景)。改法: 浮窗不再自己做 fixed 定位, 改成挂在一个【铺满视口的透明 fixed 容器 #ilh-root】里, 用 flex 靠右下角对齐, 浮窗本身回归普通流 —— 这正是实测中能正常渲染的结构。容器 pointer-events:none 不吃鼠标事件, 浮窗自身 pointer-events:auto。同时撤销 v0.13.6 的 popover 顶层方案 (对照实测同样画不出背景, 且从未解决问题); 拖动从改 left/top 改为改 transform (不破坏新的绘制结构)。
@@ -81,6 +82,45 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     }
     return null;
   })();
+
+  /* ═══════════ v0.14.3: 重排风暴 ═══════════
+   * 背景: 在带 examResultId 的考试回顾页上, 浮窗有时会卡住不绘制(白屏且无法拖动),
+   *       但这不是固定的 CSS 缺陷 —— 实测中运行诊断脚本(一次创建 7 个 fixed 容器
+   *       并克隆大量 DOM)之后, 浮窗自己就恢复了正常显示。
+   * 做法: 把那个"大规模重排"复刻成一个可重复调用的动作。临时元素放在屏幕外,
+   *       创建后立即强制同步布局再移除, 整个过程毫秒级, 对正常页面无影响。
+   */
+  function forceRepaintStorm(rounds) {
+    const n = rounds || 3;
+    for (let i = 0; i < n; i++) {
+      try {
+        const t = document.createElement('div');
+        t.style.cssText = 'position:fixed;left:-99999px;top:0;width:420px;height:800px;'
+          + 'background:#000;z-index:2147483647;display:flex;flex-direction:column';
+        for (let k = 0; k < 6; k++) {
+          const c = document.createElement('div');
+          c.style.cssText = 'flex:1;background:rgba(0,0,0,0.2)';
+          t.appendChild(c);
+        }
+        document.documentElement.appendChild(t);
+        void t.offsetHeight;        // 强制同步布局
+        void t.getBoundingClientRect();
+        t.remove();
+      } catch (e) { /* ignore */ }
+    }
+    // 再轻推浮窗自己一下 (不改变外观)
+    try {
+      const p = document.getElementById('ilh-panel') || document.getElementById('nlh-panel');
+      if (p) {
+        const had = p.hasAttribute('style');
+        p.style.setProperty('opacity', '0.999');
+        void p.offsetHeight;
+        p.style.removeProperty('opacity');
+        // 原本没有 style 属性的话, 别留下一个空的
+        if (!had && p.getAttribute('style') === '') p.removeAttribute('style');
+      }
+    } catch (e) { /* ignore */ }
+  }
 
   /* ═══════════ v0.14.0: 铺满视口的透明根容器 ═══════════
    * 为什么要这一层: 实测在带 examResultId 的考试回顾页上, 偏移定位的
@@ -3431,6 +3471,14 @@ injectStylesRobust('ilh', `
     }
     setTimeout(() => ilhStyleSelfCheck('1.5s'), 1500);
     setTimeout(() => ilhStyleSelfCheck('5s'), 5000);
+
+    /* v0.14.3: 重排风暴 —— 按节奏跑几次, 把可能卡住的绘制推过去 */
+    [2000, 5000, 10000, 20000].forEach((ms) => setTimeout(() => {
+      try { forceRepaintStorm(3); } catch (e) { /* ignore */ }
+    }, ms));
+    if (typeof unsafeWindow !== 'undefined') {
+      unsafeWindow.__ilhKick = () => { forceRepaintStorm(5); console.log('[ILH] 已触发重排风暴'); };
+    }
 
     /* v0.14.1: 根容器看门狗 —— ① SPA 路由切换可能摘掉容器/浮窗, 挂回;
        ② ensureRootContainer 内部会保证容器始终是 <html> 的最后一个子节点
