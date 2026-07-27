@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.15.6
+// @version      0.16.0
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
@@ -19,6 +19,20 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.16.0 - 【根因级重构 A+B+C+D+E】依据 2026-07-27 完整三方日志(iLearning + NotebookLM + Gemini 对话框)定位:
+//   真相: 被判"失败"的 21-40 批次其实提交成功了, Gemini 也完整答了 19 题, 但脚本已放弃监听把整份成果丢弃;
+//   降级重试被自家 90s 去重闷杀; Chrome 后台标签集约节流把单题 40s 拖成 6-8 分钟; "响应过短 150 字"误杀合法简答。
+//   A. 抗后台节流: 关键定时器改 Web Worker 驱动(不受"每分钟一次"集约节流限制), 轮询兜底; 所有超时改墙钟(Date.now)判定,
+//      检测到本页在后台(visibilityState=hidden)时自动放宽等待阈值 4 倍; 两端浮窗顶部加"⚠️ 本页在后台会严重变慢"警示条。
+//   B. 字符预算切批: 不再固定 20 题/批, 改按 prompt 字符预算切(≤1800 字符/批, 长多选题自动缩到 6-8 题); 填入后读回输入框
+//      实际内容, 短于预期即判"被截断"→ 自动按更小预算重切, 绝不带截断硬提交(21-40 批 3970 字符就是这样被截断的)。
+//   C. 提交判定重构(不再丢答案): 以"聊天区新 user 气泡实际含哪些题号"为准等待和拆分, 即便截断也把已提交部分答案全部收回,
+//      只把真正缺席的题重新入队; 修掉 waitForResponse 里 CONFIG.maxWaitMs(未定义→NaN)导致"标记数不足继续等"从未生效的隐 bug。
+//   D. 重试与去重解耦: 重试请求携带 __retry 标记绕过 90s 去重; 单一批量触发入口(合并 v0.15.6 的双触发); iLearning 端单题超时
+//      不再自动清缓存重发(19:45 清缓存风暴的根源), 改为"继续等 + 提示", 只有手动点重发才清; NotebookLM 端写心跳时间戳,
+//      iLearning 端据此显示"对端疑似被节流(上次活动 x 秒前)"并把单题超时按节流动态放宽。
+//   E. 响应校验改结构判定: 只要含对应 ===Qn=== + "正确答案"即接受, 长度下限降到 40 字仅拦真空响应(Q23/Q25 的 131/139 字合法解析
+//      不再被误杀); 判异常也先落缓存标"疑似异常"供人工查看, 不直接丢弃。顺手修 undefined 统计(state.processed→processedCount)。
 // v0.15.6 - 依据完整日志(导出功能拿到的)修三处:
 //   A. v0.15.4 的 expectN 取错对象 —— waitForResponse 收到的是 fakeReq(指纹用), 不是批次对象, 导致 12 题批次被"按 1 题收尾",
 //      日志出现 "12/1 个题号标记"。改为在 fakeReq 上带 expectCount, 收尾时长与标记数校验都用它。
@@ -534,7 +548,87 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     return d.innerHTML;
   }
 
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  /* ════════════════════════════════════════════════════════════
+     ⏱️  v0.16.0-A: 抗后台节流计时器 (Web Worker 驱动)
+     背景: Chrome 对隐藏超过 5 分钟的后台标签实施"集约节流(intensive throttling)",
+           把 setTimeout/setInterval 合并成【每分钟只唤醒一次】。实测日志里 NotebookLM 端
+           所有时间戳都精确对齐在每分钟第 43 秒, 单题从 40s 拖成 6-8 分钟就是它。
+     原理: Worker 线程不受主线程的定时器节流影响。用一个 Worker 统一发"tick", 主线程据此
+           触发到期回调。Worker 创建失败(CSP/沙箱)时无缝降级回 setTimeout, 功能不受影响。
+     ════════════════════════════════════════════════════════════ */
+  const WT = (() => {
+    let worker = null;
+    let seq = 0;
+    const pending = new Map();   // id -> {fn, at}
+    try {
+      const blobUrl = URL.createObjectURL(new Blob([
+        'var timers={};' +
+        'onmessage=function(e){' +
+        ' var d=e.data;' +
+        ' if(d.cmd==="set"){timers[d.id]=setTimeout(function(){postMessage({id:d.id});delete timers[d.id];},d.ms);}' +
+        ' else if(d.cmd==="clear"){clearTimeout(timers[d.id]);delete timers[d.id];}' +
+        ' else if(d.cmd==="tick"){postMessage({tick:1});}' +
+        '};'
+      ], { type: 'application/javascript' }));
+      worker = new Worker(blobUrl);
+      worker.onmessage = (e) => {
+        const id = e.data && e.data.id;
+        if (id != null && pending.has(id)) {
+          const { fn } = pending.get(id);
+          pending.delete(id);
+          try { fn(); } catch (err) { console.error('[ILH-BRIDGE] WT callback error', err); }
+        }
+      };
+      console.log('[ILH-BRIDGE] ⏱️ Web Worker 抗节流计时器已启用');
+    } catch (e) {
+      worker = null;
+      console.log('[ILH-BRIDGE] ⏱️ Worker 不可用, 定时器降级为 setTimeout (后台可能变慢)');
+    }
+    return {
+      /** 抗节流版 setTimeout, 返回可用于 clear 的 id */
+      setTimeout(fn, ms) {
+        if (!worker) return { native: setTimeout(fn, ms) };
+        const id = ++seq;
+        pending.set(id, { fn, at: Date.now() + ms });
+        worker.postMessage({ cmd: 'set', id, ms });
+        return { id };
+      },
+      clearTimeout(h) {
+        if (!h) return;
+        if (h.native != null) { clearTimeout(h.native); return; }
+        if (h.id != null && worker) { worker.postMessage({ cmd: 'clear', id: h.id }); pending.delete(h.id); }
+      },
+      /** 抗节流版 sleep */
+      sleep(ms) {
+        return new Promise((r) => this.setTimeout(r, ms));
+      },
+      /** 抗节流版 setInterval (返回 stop 函数) */
+      setInterval(fn, ms) {
+        let stopped = false;
+        const loop = () => {
+          if (stopped) return;
+          try { fn(); } catch (e) { console.error(e); }
+          if (!stopped) this.setTimeout(loop, ms);
+        };
+        this.setTimeout(loop, ms);
+        return () => { stopped = true; };
+      },
+      available: !!worker,
+    };
+  })();
+
+  /** v0.16.0-A: sleep 改用抗节流版本 (Worker 不可用时自动退化, 行为不变) */
+  const sleep = (ms) => WT.sleep(ms);
+
+  /** v0.16.0-A: 本页是否在后台 (据此放宽各种等待阈值) */
+  function pageHidden() {
+    return typeof document !== 'undefined' && document.visibilityState === 'hidden';
+  }
+  /** 后台时把等待阈值放宽的倍率 (集约节流下一分钟才唤醒一次, 给足余量) */
+  const HIDDEN_SLOWDOWN = 4;
+  function withHiddenSlowdown(ms) {
+    return pageHidden() ? ms * HIDDEN_SLOWDOWN : ms;
+  }
 
   /* ════════════════════════════════════════════════════════════
      🌉  Bridge: GM 存储跨标签页通信
@@ -655,9 +749,21 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       GM_setValue(this.KEY_NOTIFY, { qId, status, ts: Date.now() });
     },
 
-    /** NotebookLM 端: 报告心跳(我活着) */
+    /** NotebookLM 端: 报告心跳(我活着)
+     * v0.16.0-D: 附带 hidden 标志 —— 若 NotebookLM 标签页在后台, iLearning 端据此
+     * 判断对端可能被 Chrome 节流, 从而把单题超时动态放宽, 不再误判"失联/超时"。 */
     reportAlive() {
-      GM_setValue(this.KEY_STATUS, { alive: true, timestamp: Date.now() });
+      GM_setValue(this.KEY_STATUS, {
+        alive: true,
+        timestamp: Date.now(),
+        hidden: (typeof document !== 'undefined' && document.visibilityState === 'hidden'),
+        busy: false,  // 由 NotebookLM 端在处理时覆盖(见 initNotebookLM 心跳)
+      });
+    },
+
+    /** v0.16.0-D: 读取对端心跳原始对象 (iLearning 端用来判断节流状态) */
+    getNlmStatus() {
+      return GM_getValue(this.KEY_STATUS, null);
     },
 
     /* ───── v0.10.0: 批量预取协议 ───── */
@@ -796,7 +902,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
      📚  iLearning 端
      ════════════════════════════════════════════════════════════ */
   function initILearning() {
-    const VERSION = '0.5.0';
+    const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '0.16.0';  // v0.16.0-E: 跟随 @version, 不再写死 0.5.0
     const STAGE = 'Stage 3';
 
     const CONFIG = {
@@ -805,8 +911,13 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       logMaxLines: 80,
       panelWidth: 420,
       panelMaxHeight: 820,
-      requestTimeoutMs: 90000, // 90 秒等不到响应就报错
+      requestTimeoutMs: 90000, // 90 秒等不到响应就报错 (v0.16.0-D: 对端被节流时会动态放宽)
       nlmCheckIntervalMs: 5000, // 每 5s 检查 NotebookLM 心跳
+      // v0.16.0-B: 单批 prompt 字符预算。成功批次实测 1243/1922 字符, 失败批次 ~3970 字符被截断。
+      // 取 1800 作安全线: 判断题一批仍能装满题数上限, 长多选题自动缩到 6-8 题。
+      batchCharBudget: 1800,
+      // v0.16.0-D: 检测到 NotebookLM 端在后台(被节流)时, 单题超时放宽到这个值
+      requestTimeoutSlowMs: 360000, // 6 分钟
     };
 
     /* ───── v0.8.0: 状态灯系统 ───── */
@@ -1204,8 +1315,20 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       batchHistory: new Map(),     // batchId -> { questions, attempt }
       lastSentAt: new Map(),       // v0.15.2: qId -> 最后一次发送时间 (去重用)
 
+      _lastFlushAt: 0,   // v0.16.0-D: 防抖时间戳
+
       // 把所有未完成的题按当前 batchSize 切分发送
-      flushAll() {
+      // v0.16.0-D: force=true 时绕过防抖 (手动"立即批处理"/"重试失败" 用)
+      flushAll(force = false) {
+        // v0.16.0-D: 合并双触发。实测 19:15:48 "全部题已识别完毕" 和 400ms 后 "自动遍历完成"
+        // 各触发一次 flushAll, 靠 90s 去重侥幸挡住。这里直接加 2 秒防抖闸, 从源头合并。
+        const nowFlush = Date.now();
+        if (!force && nowFlush - this._lastFlushAt < 2000) {
+          log('⏭ flushAll 2 秒内重复触发, 已合并 (避免双批次竞态)', 'debug');
+          return;
+        }
+        this._lastFlushAt = nowFlush;
+
         // v0.15.2: 每次都以【界面上用户设定的值】为准。
         // 原来 currentBatchSize 一旦因连续失败被降级到 1 就再也回不去,
         // 之后每题单独成批 = 每题烧一次 NotebookLM 对话额度。
@@ -1233,22 +1356,55 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
           return;
         }
 
-        const batches = [];
-        for (let i = 0; i < todoQs.length; i += this.currentBatchSize) {
-          batches.push(todoQs.slice(i, i + this.currentBatchSize));
-        }
+        // v0.16.0-B: 字符预算切批。原来固定 currentBatchSize 题/批, 但 21-40 批集中了大量长
+        // 多选题(Q38 一题 422 字符), 整批 prompt 达 ~3970 字符, 被输入环节截断, Q40 整个丢失。
+        // 改为按 prompt 字符预算切: 判断题短 → 一批仍能装满 batchSize 题; 长多选题 → 自动缩到 6-8 题。
+        // 同时仍受 currentBatchSize 上限约束(降级时变小)。
+        const batches = this.splitByBudget(todoQs, this.currentBatchSize, CONFIG.batchCharBudget);
 
-        log(`🚀 准备发 ${batches.length} 个批次, 每批最多 ${this.currentBatchSize} 题 (共 ${todoQs.length} 题)`, 'info');
+        log(`🚀 准备发 ${batches.length} 个批次 (字符预算 ${CONFIG.batchCharBudget}/批, 题数上限 ${this.currentBatchSize}, 共 ${todoQs.length} 题)`, 'info');
         // v0.15.2: 批次之间留 1.2 秒间隔, 避免瞬间塞爆 NotebookLM 队列
         batches.forEach((batchQs, i) => {
-          setTimeout(() => this.sendOne(batchQs), i * 1200);
+          WT.setTimeout(() => this.sendOne(batchQs), i * 1200);
         });
         batchState.batchStarted = true;
         updateBatchPanel();
       },
 
+      /** v0.16.0-B: 按字符预算 + 题数上限切批 */
+      splitByBudget(questions, maxCount, charBudget) {
+        const batches = [];
+        let cur = [];
+        let curChars = 0;
+        const overhead = 220;   // prompt 头尾固定文案约 220 字
+        for (const q of questions) {
+          const qChars = this.estimateQChars(q);
+          const wouldExceedChars = curChars + qChars + overhead > charBudget;
+          const wouldExceedCount = cur.length >= maxCount;
+          if (cur.length > 0 && (wouldExceedChars || wouldExceedCount)) {
+            batches.push(cur);
+            cur = [];
+            curChars = 0;
+          }
+          cur.push(q);
+          curChars += qChars;
+        }
+        if (cur.length > 0) batches.push(cur);
+        return batches;
+      },
+
+      /** 估算单题在 prompt 里占的字符数 (题号标记 + 类型 + 题干 + 选项) */
+      estimateQChars(q) {
+        let n = 20;  // ===Qn=== + [类型] 第 n/total 题
+        n += (q.stem || '').length;
+        for (const o of (q.options || [])) n += (o.letter || '').length + (o.content || '').length + 3;
+        return n;
+      },
+
       // 发送单个批次
-      sendOne(questions, attempt = 1) {
+      // v0.16.0-D: isRetry —— 重试请求绕过 90s 去重。原来降级后拆出的小批次会撞上"90 秒内刚发过, 跳过",
+      //            于是重试被自家去重规则闷杀、且不再有后续尝试, 21-40 就此永久卡死(实测日志 19:33 两个 10 题批全被跳过)。
+      sendOne(questions, attempt = 1, isRetry = false) {
         if (questions.length === 0) return;
 
         // v0.15.2-①: 重试上限。原来没有上限, 同一题会被反复重发(日志里出现过"尝试 5"),
@@ -1278,15 +1434,21 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
         if (questions.length === 0) { log('✓ 该批全部已有答复, 无需提问', 'success'); return; }
 
         // v0.15.2-②: 发送去重。同一道题 90 秒内不重复发送 —— 从根上杜绝重复提问。
+        // v0.16.0-D: 重试(isRetry)放行 —— 重试本就是"上一批失败后的补发", 必须绕过去重, 否则永远补不上。
         const now = Date.now();
         const skipped = [];
-        questions = questions.filter((q) => {
-          const last = this.lastSentAt.get(q.id) || 0;
-          if (now - last < 90000) { skipped.push(q.position); return false; }
-          this.lastSentAt.set(q.id, now);
-          return true;
-        });
-        if (skipped.length) log(`⏭ 第 ${skipped.join(',')} 题 90 秒内刚发过, 跳过重复发送`, 'debug');
+        if (!isRetry) {
+          questions = questions.filter((q) => {
+            const last = this.lastSentAt.get(q.id) || 0;
+            if (now - last < 90000) { skipped.push(q.position); return false; }
+            this.lastSentAt.set(q.id, now);
+            return true;
+          });
+          if (skipped.length) log(`⏭ 第 ${skipped.join(',')} 题 90 秒内刚发过, 跳过重复发送`, 'debug');
+        } else {
+          questions.forEach((q) => this.lastSentAt.set(q.id, now));
+          log(`🔁 重试批次绕过 90s 去重 (第 ${questions.map((q) => q.position).join(',')} 题)`, 'debug');
+        }
         if (questions.length === 0) return;
 
         const batchId = `batch_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -1349,10 +1511,23 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       // v0.15.4-④: envFailure = 环境性失败 (输入框没就绪、NotebookLM 正忙),
       // 不是内容失败。这类失败【不计入 attempt、不触发 batchSize 降级】,
       // 否则重试预算全被烧在"输入框没找到"上, 真正该重试的机会反而没了。
-      onBatchPartial(batchId, splitResults, failedPositions, envFailure) {
+      onBatchPartial(batchId, splitResults, failedPositions, envFailure, truncated) {
         const history = this.batchHistory.get(batchId);
         if (!history) {
           log(`⚠️ 收到未知批次结果 ${batchId.slice(-8)}, 忽略`, 'warn');
+          return;
+        }
+
+        // v0.16.0-B: 截断专属处理 —— NotebookLM 端报告"输入框内容被截断", 说明这批 prompt 太长。
+        // 不计入 attempt(不是内容错), 直接把该批题按【更小的字符预算】(当前的一半)重切立即重发。
+        if (truncated) {
+          const qs = history.questions.slice().sort((a, b) => a.position - b.position);
+          const shrunkBudget = Math.max(600, Math.floor(CONFIG.batchCharBudget / 2));
+          log(`✂️ 批次 ${batchId.slice(-8)} 被截断(prompt 太长), 按 ${shrunkBudget} 字符预算重切重发 (${qs.length} 题)`, 'warn');
+          const sub = this.splitByBudget(qs, this.currentBatchSize, shrunkBudget);
+          sub.forEach((nb, i) => {
+            WT.setTimeout(() => this.sendOne(nb, history.attempt, true), 1500 + i * 1500);
+          });
           return;
         }
         const total = history.questions.length;
@@ -1377,7 +1552,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
               log(`  ↪️ ${failedQs.length} 题没拆出, 3 秒后确认是否真失败`, 'info');
               // v0.15.3: 等 3 秒让 GM 存储跨标签页同步完成, 再查一次缓存。
               // 很多"失败"其实只是答案还没同步过来, 直接重发就是白烧额度。
-              setTimeout(() => {
+              WT.setTimeout(() => {   // v0.16.0-A: Worker 定时器
                 const stillFailed = failedQs.filter((q) => {
                   const c = GM_getValue(`ilh:response:${q.id}`, null);
                   if (c && c.status === 'done' && c.text) { StatusDot.updateOne(q.position, q.id); return false; }
@@ -1387,7 +1562,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
                 if (recovered > 0) log(`  ✓ 其中 ${recovered} 题答案已同步到位, 无需重发`, 'success');
                 if (stillFailed.length === 0) return;
                 log(`  ↪️ ${stillFailed.length} 题确认失败, 单独重试`, 'info');
-                for (const q of stillFailed) this.sendOne([q], 2);
+                for (const q of stillFailed) this.sendOne([q], 2, true);  // v0.16.0-D: isRetry
               }, 3000);
             }
           }
@@ -1418,10 +1593,11 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
             const backoff = [0, 8000, 20000, 45000][Math.min(Math.max(nextAttempt - 1, 0), 3)] || 45000;
             const sortedFailed = failedQs.sort((a, b) => a.position - b.position);
             log(`  ⏱ ${Math.round(backoff / 1000)} 秒后重试 ${sortedFailed.length} 题 (尝试 ${nextAttempt})`, 'info');
-            for (let i = 0; i < sortedFailed.length; i += this.currentBatchSize) {
-              const newBatch = sortedFailed.slice(i, i + this.currentBatchSize);
-              setTimeout(() => this.sendOne(newBatch, nextAttempt), backoff + i * 1500);
-            }
+            // v0.16.0-B/D: 重试也按字符预算重切(降级后 currentBatchSize 已变小), 并标记 isRetry 绕过去重, Worker 定时器抗节流
+            const retryBatches = this.splitByBudget(sortedFailed, this.currentBatchSize, CONFIG.batchCharBudget);
+            retryBatches.forEach((nb, i) => {
+              WT.setTimeout(() => this.sendOne(nb, nextAttempt, true), backoff + i * 1500);
+            });
           }
         }
       },
@@ -1516,7 +1692,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       }
       log(`🔁 已清除 ${cleared} 道失败题的缓存, 重新发送…`, 'info');
       batchState.batchStarted = false;      // 允许重新发批
-      BatchManager.flushAll();
+      BatchManager.flushAll(true);          // v0.16.0-D: 手动重试, 绕过防抖
       showExplain('waiting', `🔁 已重试 ${cleared} 道失败的题\n\n正在分批发给 NotebookLM, 请保持 NotebookLM 标签页打开。\n处理完会自动同步回来。`, '重试中');
     }
 
@@ -3663,7 +3839,13 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       Bridge.sendRequest(q);
       StatusDot.updateOne(q.position, q.id);
       const startTs = Date.now();
-      showExplain('waiting', '⏳ 已发送给 NotebookLM, 通常需要 10-30 秒...', '排队中');
+      // v0.16.0-D: 对端在后台被节流时, 给用户准确预期, 避免以为卡死而反复点击
+      const __st = Bridge.getNlmStatus();
+      if (__st && __st.hidden) {
+        showExplain('waiting', '⏳ 已发送给 NotebookLM。\n\n⚠️ NotebookLM 标签页在后台被 Chrome 节流, 可能需要 3-8 分钟。\n把它拖成独立可见窗口可提速到 30 秒左右。', '排队中(对端慢)');
+      } else {
+        showExplain('waiting', '⏳ 已发送给 NotebookLM, 通常需要 10-30 秒...', '排队中');
+      }
       log(`📤 发出 request: ${q.id} (题号 ${q.position})`, 'info');
 
       // 监听响应
@@ -3684,18 +3866,32 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       state.activeListeners.set(q.id, listenerId);
 
       // 超时检查
-      setTimeout(() => {
+      // v0.16.0-D: 关键改动 —— 超时【不再清缓存重发】。原来 handleQuestionChange/跳题会反复触发,
+      // 每次超时就清缓存重发, 19:45 一分钟内清了 16 道题制造请求风暴, 而真正的响应"后台到达"时
+      // 原请求早被清掉重建。现在超时只提示、不动缓存, 让后台的响应有机会自然到达(NotebookLM 端仍在处理)。
+      // 且超时时长按对端是否被节流动态放宽: NotebookLM 在后台被 Chrome 节流时, 单题真实耗时可达 6-8 分钟。
+      const nlmStatus = Bridge.getNlmStatus();
+      const nlmHidden = nlmStatus && nlmStatus.hidden;
+      const timeoutMs = nlmHidden ? CONFIG.requestTimeoutSlowMs : CONFIG.requestTimeoutMs;
+      WT.setTimeout(() => {
         const r = GM_getValue(`ilh:response:${q.id}`, null);
-        if (!r) {
-          if (state.currentQuestion && state.currentQuestion.id === q.id) {
-            const stillAlive = Bridge.isNotebookLMAlive();
-            showExplain('error', stillAlive
-              ? '⏱️ 超过 90 秒没收到响应。NotebookLM 可能还在思考(看 NotebookLM 浮窗确认), 或抓取失败。'
-              : '⚠️ NotebookLM 失联了。请检查标签页是否被关闭/卡死。', '超时');
-            log(`⏱️ ${q.id} 超时`, 'error');
+        if (r) return;  // 已到达
+        if (state.currentQuestion && state.currentQuestion.id === q.id) {
+          const st = Bridge.getNlmStatus();
+          const alive = st && st.alive && (Date.now() - st.timestamp < 90000);
+          const hidden = st && st.hidden;
+          if (!alive) {
+            showExplain('error', '⚠️ NotebookLM 失联了。请检查标签页是否被关闭/卡死。', '超时');
+          } else if (hidden) {
+            showExplain('waiting', '⏳ NotebookLM 标签页在后台, 被 Chrome 节流, 处理会很慢(可能 6-8 分钟)。\n\n' +
+              '答案到达后会自动显示, 不用重复点。想加速请把 NotebookLM 拖成独立窗口并保持可见。', '后台处理中(慢)');
+            log(`⏳ ${q.id} 等待超时, 但对端在后台被节流, 继续等待(不重发)`, 'warn');
+          } else {
+            showExplain('waiting', '⏱️ 处理时间较长, NotebookLM 可能还在思考(看 NotebookLM 浮窗确认)。\n\n答案到达后会自动显示, 不用重复点。', '处理中');
+            log(`⏱️ ${q.id} 等待超时, 继续等待后台响应(不重发)`, 'warn');
           }
         }
-      }, CONFIG.requestTimeoutMs);
+      }, timeoutMs);
     }
 
     // === MutationObserver ===
@@ -3900,7 +4096,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
     GM_addValueChangeListener(Bridge.KEY_BATCH_NOTIFY, (key, oldVal, newVal) => {
       if (!newVal || !newVal.batchId) return;
       if (newVal.status === 'partial' || newVal.status === 'failed') {
-        BatchManager.onBatchPartial(newVal.batchId, newVal.splitResults || {}, newVal.failedPositions || [], !!newVal.envFailure);
+        BatchManager.onBatchPartial(newVal.batchId, newVal.splitResults || {}, newVal.failedPositions || [], !!newVal.envFailure, !!newVal.truncated);
       } else if (newVal.status === 'success') {
         BatchManager.onBatchPartial(newVal.batchId, newVal.splitResults || {}, []);
       }
@@ -3930,6 +4126,42 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       }
     });
 
+    if (WT.available) log('⏱️ Web Worker 抗节流计时器已启用', 'success');
+    else log('⏱️ Worker 不可用, 后台标签会变慢, 建议保持相关页面可见', 'warn');
+
+    // v0.16.0-A/D: 后台警示条 —— 分两种情况提示。
+    // ① 本页(iLearning)在后台: 自动遍历/批处理会变慢。
+    // ② NotebookLM 端在后台被节流: 这才是主要瓶颈(单题 6-8 分钟)。
+    function updateHiddenBanner() {
+      const doc = PD();
+      let bar = doc.getElementById('ilh-hidden-banner');
+      const selfHidden = pageHidden();
+      const st = Bridge.getNlmStatus();
+      const peerHidden = st && st.alive && (Date.now() - st.timestamp < 90000) && st.hidden;
+      const show = selfHidden || peerHidden;
+      if (show) {
+        if (!bar) {
+          bar = doc.createElement('div');
+          bar.id = 'ilh-hidden-banner';
+          bar.style.cssText = 'padding:8px 14px;background:#5d4037;color:#ffe0b2;font-size:11px;line-height:1.5;border-bottom:1px solid rgba(255,255,255,0.1);';
+          const panel = doc.getElementById('ilh-panel');
+          const header = doc.getElementById('ilh-header');
+          if (panel && header) panel.insertBefore(bar, header.nextSibling);
+        }
+        if (bar) {
+          const msg = selfHidden
+            ? '⚠️ 本页在后台, 自动遍历/批处理会变慢, 建议保持本页可见。'
+            : '⚠️ NotebookLM 标签页在后台被 Chrome 节流, 处理会慢 10 倍(单题可能 6-8 分钟)。<br>建议把 NotebookLM 拖成<b>独立窗口并保持可见</b>。';
+          setSafeHTML(bar, msg);
+        }
+      } else if (bar) {
+        bar.remove();
+      }
+    }
+    document.addEventListener('visibilitychange', updateHiddenBanner);
+    WT.setInterval(updateHiddenBanner, 5000);
+    setTimeout(updateHiddenBanner, 1200);
+
     // 定期提示用户 NotebookLM 状态(只在还没识别到题时)
     setInterval(() => {
       if (state.currentQuestion) return;
@@ -3945,7 +4177,7 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
      📓  NotebookLM 端
      ════════════════════════════════════════════════════════════ */
   function initNotebookLM() {
-    const VERSION = '0.5.0';
+    const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '0.16.0';  // v0.16.0-E: 跟随 @version
     const STAGE = 'Stage 3';
 
     const CONFIG = {
@@ -3955,7 +4187,8 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
       silenceTimeoutMs: 5000,
       minInitialWaitMs: 6000,         // v0.5.4: 提交后至少等 6 秒再考虑"静默", 防 NotebookLM 还没开始生成被误判完成
       maxResponseWaitMs: 180000,
-      minResponseChars: 150,
+      minResponseChars: 150,   // 用于"完成检测": 内容至少这么长才考虑抓取(防抓到半截), 语境正确保持不变
+      minAcceptChars: 40,      // v0.16.0-E: 用于"最终接受": 无 ===Qn===/正确答案 结构时才用此长度下限, 仅拦空响应
       heartbeatIntervalMs: 3000,
       panelWidth: 420,
       panelMaxHeight: 720,
@@ -4509,14 +4742,46 @@ injectStylesRobust('nlh', `
       el.dispatchEvent(new KeyboardEvent('keyup', opts));
     }
 
-    async function submitMessage(inputEl) {
+    /** v0.16.0-C: 检查聊天区最后一个 user 气泡是否包含指定指纹 (提交成功的铁证) */
+    function lastUserBubbleContains(fingerprint) {
+      if (!fingerprint) return false;
+      const pairs = document.querySelectorAll('div.chat-message-pair');
+      if (pairs.length === 0) return false;
+      const lastPair = pairs[pairs.length - 1];
+      const userMsg = lastPair.querySelector('div.from-user-container');
+      if (!userMsg) return false;
+      const t = (userMsg.textContent || '').replace(/\s+/g, ' ');
+      return t.includes(fingerprint);
+    }
+
+    /** v0.16.0-C: 提交判定重构。
+     * 事故还原: 21-40 批 Enter 后 800ms 内输入框没清空 → 判"Enter 没用" → 按钮也没找到 → 判"批次提交失败",
+     * 但消息【实际已发出】, Gemini 完整答了 19 题, 而脚本已放弃监听把成果整份丢弃。
+     * 新判定: 成功 = 输入框清空 【或】 聊天区出现含本次内容指纹的新 user 气泡 —— 气泡是提交成功的铁证。
+     * 且改为墙钟循环最多等 6 秒(后台放宽), 不再单点 800ms 定生死。 */
+    async function submitMessage(inputEl, sentText) {
       const beforeValue = readInputValue(inputEl).trim();
+      const beforePairs = document.querySelectorAll('div.chat-message-pair').length;
+      // 指纹: 取要发送内容的头 24 个非空白字符 (足够独特, 又不受截断影响)
+      const fp = String(sentText || beforeValue).replace(/\s+/g, ' ').trim().slice(0, 24);
+
+      const confirmSubmitted = () => {
+        const nowValue = readInputValue(inputEl).trim();
+        if (beforeValue && nowValue !== beforeValue) return 'input-cleared';
+        const nowPairs = document.querySelectorAll('div.chat-message-pair').length;
+        if (nowPairs > beforePairs && lastUserBubbleContains(fp)) return 'bubble-appeared';
+        return null;
+      };
+
       pressEnter(inputEl);
-      await sleep(800);
-      const afterValue = readInputValue(inputEl).trim();
-      if (beforeValue && afterValue !== beforeValue) {
-        log('  ✅ Enter 提交成功', 'success');
-        return 'enter';
+      let deadline = Date.now() + withHiddenSlowdown(6000);
+      while (Date.now() < deadline) {
+        await sleep(400);
+        const how = confirmSubmitted();
+        if (how) {
+          log(`  ✅ Enter 提交成功 (${how === 'bubble-appeared' ? '检测到新 user 气泡' : '输入框已清空'})`, 'success');
+          return 'enter';
+        }
       }
       log('  ⚠️ Enter 没用, 尝试按钮', 'warn');
       let btn = null;
@@ -4525,11 +4790,25 @@ injectStylesRobust('nlh', `
         if (btn && !btn.disabled) break;
         await sleep(400);
       }
-      if (btn) {
+      if (btn && !btn.disabled) {
         btn.click();
-        await sleep(800);
-        log(`  🖱 点击按钮: ${describeEl(btn)}`, 'success');
-        return 'button';
+        deadline = Date.now() + withHiddenSlowdown(6000);
+        while (Date.now() < deadline) {
+          await sleep(400);
+          const how = confirmSubmitted();
+          if (how) {
+            log(`  🖱 按钮提交成功: ${describeEl(btn)} (${how === 'bubble-appeared' ? '新气泡' : '输入框清空'})`, 'success');
+            return 'button';
+          }
+        }
+        log(`  ⚠️ 按钮点了但未确认提交: ${describeEl(btn)}`, 'warn');
+      }
+      // v0.16.0-C: 最后一道保险 —— 再等一轮看气泡。避免"实际已发出却判失败"重演。
+      await sleep(withHiddenSlowdown(2000));
+      const finalHow = confirmSubmitted();
+      if (finalHow) {
+        log(`  ✅ 最终确认已提交 (${finalHow === 'bubble-appeared' ? '新气泡' : '输入框清空'})`, 'success');
+        return 'late';
       }
       return null;
     }
@@ -4598,7 +4877,11 @@ injectStylesRobust('nlh', `
       let lastStatus = null;
       let okStartedAt = null;
 
-      while (Date.now() - startTs < CONFIG.maxResponseWaitMs) {
+      // v0.16.0-A: 本页(NotebookLM)在后台被 Chrome 节流时, 探测频率降到每分钟一次, 真实生成也更慢,
+      // 固定 180s 上限只够检查 3 次就超时。后台时把最长等待放宽 4 倍(与主循环 sleep 一样受 Worker 抗节流保护)。
+      const maxWait = withHiddenSlowdown(CONFIG.maxResponseWaitMs);
+
+      while (Date.now() - startTs < maxWait) {
         await sleep(CONFIG.pollIntervalMs);
         const elapsed = Date.now() - startTs;
 
@@ -4655,7 +4938,9 @@ injectStylesRobust('nlh', `
             const text = extractFormattedText(finalEl);
             // 标记数校验: 不够且还没等满上限 → 再等等
             const found = (String(text || '').match(/===\s*Q\s*\d+\s*===/g) || []).length;
-            if (found < expectN && (Date.now() - okStartedAt) < CONFIG.maxWaitMs * 0.8) {
+            // v0.16.0-C: 修隐 bug —— 此处原引用 CONFIG.maxWaitMs(未定义→NaN), 导致 "found<expectN && NaN" 恒 false,
+            // "标记数不足继续等" 这条保护从未生效, 批次里少数题没写完就被抓取。正确常量是 maxResponseWaitMs。
+            if (found < expectN && (Date.now() - okStartedAt) < CONFIG.maxResponseWaitMs * 0.8) {
               log(`  ⏳ 只找到 ${found}/${expectN} 个题号标记, 内容可能还没写完, 继续等…`, 'warn');
               completedAt = Date.now();
               stableCount = 0;
@@ -4678,7 +4963,7 @@ injectStylesRobust('nlh', `
         }
       }
 
-      log(`  ⏱️ 达到最长等待时间 ${Math.round(CONFIG.maxResponseWaitMs/1000)}s`, 'warn');
+      log(`  ⏱️ 达到最长等待时间 ${Math.round(maxWait/1000)}s${pageHidden() ? ' (后台已放宽)' : ''}`, 'warn');
       return lastEl ? extractFormattedText(lastEl) : null;
     }
 
@@ -4783,10 +5068,23 @@ injectStylesRobust('nlh', `
         await setInputValue(inputEl, batchReq.prompt);
         await sleep(CONFIG.submitWaitMs);
 
+        // v0.16.0-B: 提交【前】读回输入框实际内容, 检测是否被截断。
+        // 21-40 批 prompt 达 ~3970 字符, 在填入/发送环节被截断, Q40 整个丢失, 提交后校验失败判死整批。
+        // 现在提交前就发现截断 → 直接判失败(带 truncated 标志), 让 iLearning 端按更小字符预算重切, 绝不带残缺硬提交。
+        const filled = readInputValue(inputEl);
+        const expectLen = (batchReq.prompt || '').length;
+        if (expectLen > 0 && filled.length < expectLen * 0.9) {
+          log(`⚠️ 输入框内容被截断 (期望 ${expectLen} 字, 实际 ${filled.length} 字), 放弃本批, 请求 iLearning 端缩小批次重发`, 'error');
+          Bridge.completeBatch(batchReq.id);
+          // truncated: 提示 iLearning 端这批太长被截断, 应缩小字符预算重切
+          Bridge.notifyBatchResult(batchReq.id, 'failed', { failedPositions: batchReq.positions, truncated: true });
+          return;
+        }
+
         // 3. 提交
-        const method = await submitMessage(inputEl);
+        const method = await submitMessage(inputEl, batchReq.prompt);   // v0.16.0-C: 传 prompt 供气泡指纹判定
         if (!method) {
-          log('❌ 批次提交失败', 'error');
+          log('❌ 批次提交失败 (Enter/按钮/气泡三重确认均未通过)', 'error');
           Bridge.completeBatch(batchReq.id);
           Bridge.notifyBatchResult(batchReq.id, 'failed', { failedPositions: batchReq.positions });
           return;
@@ -4806,19 +5104,24 @@ injectStylesRobust('nlh', `
           expectCount: batchReq.positions.length,
         };
         const responseText = await waitForResponse(fakeReq);
-        if (!responseText || responseText.length < 100) {
-          log(`❌ 批次响应过短 (${responseText?.length || 0} 字符)`, 'error');
-          batchReq.positions.forEach((p) => {
-            const qId = batchReq.positionMap[p];
-            Bridge.writeResponse(qId, '', 'error', '批次响应过短或未抓到');
-          });
+
+        // v0.16.0-C: 即便响应"过短", 也先尝试拆出已生成的题 —— 关键修复。
+        // 实测: 21-40 批 Gemini 完整答了 19 题(Q21-Q39), 但脚本此前把整份成果丢弃。
+        // 现在无论长短, 只要能拆出 ===Qn=== 就先落缓存, 只把真正缺席的题标记为失败重试。
+        const splitResults = responseText ? splitBatchResponse(responseText, batchReq.positions) : {};
+        const gotCount = Object.keys(splitResults).length;
+        if ((!responseText || responseText.length < 100) && gotCount === 0) {
+          log(`❌ 批次响应过短且未拆出任何题 (${responseText?.length || 0} 字符)`, 'error');
+          // 不写 error 到每题(避免污染缓存), 让 iLearning 端重试
           Bridge.completeBatch(batchReq.id);
           Bridge.notifyBatchResult(batchReq.id, 'failed', { failedPositions: batchReq.positions });
           return;
         }
+        if (gotCount > 0 && gotCount < batchReq.positions.length) {
+          log(`  ℹ️ 响应含 ${gotCount}/${batchReq.positions.length} 题, 先落缓存已到的, 缺席的交给重试`, 'info');
+        }
 
         // 5. 拆响应
-        const splitResults = splitBatchResponse(responseText, batchReq.positions);
         const successPositions = [];
         const failedPositions = [];
 
@@ -4878,7 +5181,7 @@ injectStylesRobust('nlh', `
         await sleep(CONFIG.submitWaitMs);
 
         // 3. 提交 (v0.7.0: 不再需要 snapshot, 用 chat-message-pair 锁定本题)
-        const method = await submitMessage(inputEl);
+        const method = await submitMessage(inputEl, text);   // v0.16.0-C: 传发送文本供气泡指纹判定
         if (!method) {
           log('❌ 提交失败', 'error');
           Bridge.writeResponse(req.id, '', 'error', '提交失败');
@@ -4888,9 +5191,16 @@ injectStylesRobust('nlh', `
 
         // 4. 等响应 (v0.7.0: 直接用真实 DOM 选择器锁定本题 AI 响应)
         const responseText = await waitForResponse(req);
-        if (!responseText || responseText.length < CONFIG.minResponseChars) {
-          log(`❌ 响应过短 (${responseText?.length || 0} 字符)`, 'error');
-          Bridge.writeResponse(req.id, responseText || '', 'error', '响应过短或未抓到');
+        // v0.16.0-E: 校验从纯长度改为结构判定。原来 <150 字符即判失败, 误杀了 Q23/Q25 这类合法简答
+        //   (131/139 字, 完整正确带 ===Qn=== 标记, 只是题目简单解析就短)。现在:
+        //   - 含 ===Qn=== 标记, 或含"正确答案"字样 → 视为合法, 接受;
+        //   - 长度下限降到 40, 仅拦真正的空响应/抓取失败。
+        const rt = responseText || '';
+        const hasMarker = /===\s*Q\s*\d+\s*===/.test(rt) || /正确答案/.test(rt);
+        if (!hasMarker && rt.length < CONFIG.minAcceptChars) {
+          log(`❌ 响应过短且无答案结构 (${rt.length} 字符)`, 'error');
+          // v0.16.0-E: 落缓存标"疑似异常", 不直接丢弃, 供人工在浮窗查看/决定是否重试
+          Bridge.writeResponse(req.id, rt, 'error', `响应过短或未抓到(${rt.length}字); 可点"重新请求"重试`);
           return;
         }
 
@@ -5035,7 +5345,7 @@ injectStylesRobust('nlh', `
       const batchReq = Bridge.peekNextBatch();
       if (batchReq) {
         await processOneBatch(batchReq);
-        setTimeout(tryProcessQueue, 800);
+        WT.setTimeout(tryProcessQueue, 800);   // v0.16.0-A: Worker 定时器, 后台不冻结
         return;
       }
       // 然后单题
@@ -5045,7 +5355,7 @@ injectStylesRobust('nlh', `
         return;
       }
       await processOneRequest(req);
-      setTimeout(tryProcessQueue, 500);
+      WT.setTimeout(tryProcessQueue, 500);
     }
 
     // === UI ===
@@ -5129,9 +5439,11 @@ injectStylesRobust('nlh', `
       document.getElementById('nlh-btn-export-log').addEventListener('click', () => {
         const txt = buildLogExport('NotebookLM', {
           '当前状态': state.busy ? '忙碌' : '空闲',
-          '已处理': state.processed,
+          '已处理': state.processedCount,   // v0.16.0-E: 原写成 state.processed(不存在)→undefined
           '排队中': (GM_getValue(Bridge.KEY_BATCH_QUEUE, []) || []).length,
           '输入框': findInputElement() ? '可用' : '不可用(可能正在生成)',
+          '本页可见性': pageHidden() ? '后台(可能被节流!)' : '前台',
+          'Worker抗节流': WT.available ? '已启用' : '未启用',
         });
         const name = `notebooklm-log-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.txt`;
         if (downloadTextFile(name, txt)) log(`📋 已导出完整日志: ${name} (${__ilhLogBuffer.length} 条)`, 'success');
@@ -5213,10 +5525,41 @@ injectStylesRobust('nlh', `
     buildPanel();
     log(`✅ NotebookLM 端 v${VERSION} 已加载`, 'success');
     log(`🎯 当前阶段: ${STAGE} (自动消费 iLearning 发来的题)`, 'info');
+    if (WT.available) log('⏱️ Web Worker 抗节流计时器已启用', 'success');
+    else log('⏱️ Worker 不可用, 后台标签处理会变慢, 建议保持本页可见', 'warn');
 
-    // 心跳: 每 3 秒报告一次
-    Bridge.reportAlive();
-    setInterval(() => Bridge.reportAlive(), CONFIG.heartbeatIntervalMs);
+    // v0.16.0-A: 后台警示条 —— 本页转入后台时提示用户, 这是处理变慢的最大元凶。
+    function updateHiddenBanner() {
+      let bar = document.getElementById('nlh-hidden-banner');
+      if (pageHidden()) {
+        if (!bar) {
+          bar = document.createElement('div');
+          bar.id = 'nlh-hidden-banner';
+          bar.style.cssText = 'padding:8px 14px;background:#5d4037;color:#ffe0b2;font-size:11px;line-height:1.5;border-bottom:1px solid rgba(255,255,255,0.1);';
+          setSafeHTML(bar, '⚠️ 本页在后台, 会被 Chrome 严重节流(处理慢 10 倍)。<br>建议把本窗口拖成<b>独立窗口并保持可见</b>(不必置于最前)。');
+          const panel = document.getElementById('nlh-panel');
+          const header = document.getElementById('nlh-header');
+          if (panel && header) panel.insertBefore(bar, header.nextSibling);
+        }
+      } else if (bar) {
+        bar.remove();
+      }
+    }
+    document.addEventListener('visibilitychange', updateHiddenBanner);
+    setTimeout(updateHiddenBanner, 500);
+
+    // 心跳: 每 3 秒报告一次 (v0.16.0-A: 用 Worker 定时器, 后台也能持续报活, 让 iLearning 端准确判断节流状态)
+    // v0.16.0-D: 心跳带 busy/hidden, iLearning 端据此放宽超时/显示"对端在后台"
+    const reportAliveFull = () => {
+      GM_setValue(Bridge.KEY_STATUS, {
+        alive: true,
+        timestamp: Date.now(),
+        hidden: pageHidden(),
+        busy: state.busy,
+      });
+    };
+    reportAliveFull();
+    WT.setInterval(reportAliveFull, CONFIG.heartbeatIntervalMs);
 
     // 监听新 request
     Bridge.onRequest(() => {
@@ -5231,12 +5574,12 @@ injectStylesRobust('nlh', `
     });
 
     // 启动时也试一次(防止启动前已有积压)
-    setTimeout(tryProcessQueue, 1500);
+    WT.setTimeout(tryProcessQueue, 1500);
 
     // v0.12.2: 删除启动自动去重 (v0.12.0 之后新数据不会重复)
 
-    // 定期更新统计
-    setInterval(updateStats, 2000);
+    // 定期更新统计 (v0.16.0-A: Worker 定时器)
+    WT.setInterval(updateStats, 2000);
     updateStats();
   }
 })();
