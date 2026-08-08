@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         iLearning 学习助手 (Stage 3 桥接版)
 // @namespace    https://github.com/lucassu2012/
-// @version      0.16.0
+// @version      0.16.1
 // @description  iLearning 习题页和 NotebookLM 联动: 开题自动出解析
 // @author       Lucas
 // @match        https://ilearning.huawei.com/iexam/*
 // @match        https://notebooklm.google.com/*
+// @match        https://notebook.google.com/*
 // @grant        GM_addStyle
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -19,6 +20,8 @@
 // ==/UserScript==
 
 // CHANGELOG
+// v0.16.1 - 适配 Google 域名迁移: 2026-07-16 NotebookLM 更名 Gemini Notebook, 7 月底应用地址迁至
+//   notebook.google.com(旧域名 302 重定向)。@match 与路由判定同时支持新旧两个域名, 修复"打开网页脚本不启动"。
 // v0.16.0 - 【根因级重构 A+B+C+D+E】依据 2026-07-27 完整三方日志(iLearning + NotebookLM + Gemini 对话框)定位:
 //   真相: 被判"失败"的 21-40 批次其实提交成功了, Gemini 也完整答了 19 题, 但脚本已放弃监听把整份成果丢弃;
 //   降级重试被自家 90s 去重闷杀; Chrome 后台标签集约节流把单题 40s 拖成 6-8 分钟; "响应过短 150 字"误杀合法简答。
@@ -893,8 +896,10 @@ console.log('[ILH-BRIDGE] 🔔 脚本加载, hostname=', location.hostname, 'pat
   if (location.hostname === 'ilearning.huawei.com') {
     console.log('[ILH-BRIDGE] iLearning 域, 等待答题页路由...');
     watchForRoute(/\/examContent/, 'iLearning examContent', initILearning);
-  } else if (location.hostname === 'notebooklm.google.com') {
-    console.log('[ILH-BRIDGE] NotebookLM 域, 等待笔记本页路由...');
+  } else if (['notebooklm.google.com', 'notebook.google.com'].includes(location.hostname)) {
+    // v0.16.1: 2026-07 底 Google 把 NotebookLM(现名 Gemini Notebook) 迁到 notebook.google.com,
+    // 旧域名 302 重定向过去。两个域名都路由, 旧域名保留以防回滚/分区放量差异。
+    console.log('[ILH-BRIDGE] NotebookLM/Gemini Notebook 域, 等待笔记本页路由...');
     watchForRoute(/^\/notebook\//, 'NotebookLM /notebook/', initNotebookLM);
   }
 
